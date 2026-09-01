@@ -1,0 +1,69 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "duckview",
+  "version": "0.1.0",
+  "identifier": "com.pnk.duckview",
+  "build": {
+    "frontendDist": "../src"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "DuckView",
+        "width": 1240,
+        "height": 820,
+        "minWidth": 720,
+        "minHeight": 480,
+        "dragDropEnabled": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": [
+      "icons/icon_128x128.png",
+      "icons/icon_128x128@2x.png",
+      "icons/icon_16x16.png",
+      "icons/icon_16x16@2x.png",
+      "icons/icon_256x256.png",
+      "icons/icon_256x256@2x.png",
+      "icons/icon_32x32.png",
+      "icons/icon_32x32@2x.png",
+      "icons/icon_48x48.png",
+      "icons/icon_48x48@2x.png",
+      "icons/icon_512x512.png",
+      "icons/icon_512x512@2x.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
+    ],
+    "category": "DeveloperTool",
+    "copyright": "© 2026 pnk",
+    "shortDescription": "Parquet file viewer and SQL editor.",
+    "longDescription": "DuckView is a powerful, modern Parquet file viewer and SQL editor built with Tauri and DuckDB.",
+    "fileAssociations": [
+      {
+        "ext": ["parquet"],
+        "name": "Apache Parquet File",
+        "description": "Apache Parquet columnar data file",
+        "role": "Viewer",
+        "rank": "Owner"
+      },
+      {
+        "ext": ["csv"],
+        "name": "CSV File",
+        "description": "Comma-separated values file",
+        "role": "Viewer",
+        "rank": "Alternate"
+      }
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "signingIdentity": "-"
+    }
+  }
+}

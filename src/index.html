@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DuckView</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- Toolbar -->
+    <header id="toolbar">
+      <div class="tb-left">
+        <span class="app-title">DuckView</span>
+        <span id="fileName" class="file-name"></span>
+      </div>
+
+      <div class="tb-right">
+        <button id="advBtn" class="btn ghost hidden" title="Filter">
+          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+            <path fill="currentColor" d="M3 5h18v2l-7 7v5l-4 2v-7L3 7z"/>
+          </svg>
+          Filter
+          <span id="advBadge" class="badge hidden">0</span>
+        </button>
+        <button id="metaBtn" class="btn ghost hidden" title="File metadata">
+          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+            <path fill="currentColor" d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9a10 10 0 1 0 0 20 10 10 0 0 0 0 -20z"/>
+          </svg>
+          Info
+        </button>
+        <button id="appMenuBtn" class="icon-btn app-menu-btn" title="Menu" aria-label="Menu">•••</button>
+      </div>
+    </header>
+
+    <div id="appMenu" class="app-menu hidden" role="menu">
+      <button id="menuOpenBtn" class="app-menu-item" type="button" role="menuitem">
+        <span>Open File…</span>
+        <kbd>⌘O</kbd>
+      </button>
+      <button id="menuSettingsBtn" class="app-menu-item" type="button" role="menuitem">
+        <span>Settings…</span>
+        <kbd>⌘,</kbd>
+      </button>
+    </div>
+    <div id="appMenuBackdrop" class="app-menu-backdrop"></div>
+
+    <nav id="tabBar" class="tab-bar hidden" aria-label="Open files"></nav>
+
+    <!-- SQL workspace -->
+    <main id="sqlWorkspace" class="sql-workspace hidden">
+      <section class="sql-editor-pane">
+        <aside class="sql-tables-pane">
+          <div class="sql-pane-title">Tables</div>
+          <div id="sqlTables" class="sql-tables">
+            <div class="sql-empty-tables">Open a Parquet file to query it.</div>
+          </div>
+        </aside>
+
+        <section class="sql-editor-area">
+          <div class="sql-editor-head">
+            <span id="sqlTitle" class="sql-pane-title">SQL</span>
+            <div class="sql-editor-actions">
+              <span id="sqlReadOnly" class="sql-read-only">READ ONLY</span>
+              <button
+                      id="sqlRunBtn"
+                      class="btn primary"
+                      type="button"
+                      title="Execute SQL at cursor position（⌘↵）"
+              >Run</button>
+              <button id="sqlExportBtn" class="btn ghost" type="button" disabled>Export…</button>
+            </div>
+          </div>
+          <textarea
+                  id="sqlInput"
+                  class="sql-input"
+                  aria-label="SQL query"
+                  spellcheck="false"
+                  placeholder="SELECT * FROM your_table LIMIT 100;"
+          ></textarea>
+          <div id="sqlError" class="sql-error hidden"></div>
+        </section>
+      </section>
+
+      <section class="sql-result-pane">
+        <div class="sql-result-head">
+          <span id="sqlResultTitle" class="sql-pane-title">Result</span>
+          <div class="sql-result-actions">
+            <span id="sqlResultStatus" class="sql-result-status">Run a query to see results.</span>
+          </div>
+        </div>
+        <nav
+                id="sqlResultTabs"
+                class="sql-result-tabs hidden"
+                aria-label="SQL query results"
+        ></nav>
+        <div id="sqlResultBody" class="sql-result-body">
+          <div class="sql-result-empty">
+            Write a query above, then press <kbd>⌘</kbd><kbd>↵</kbd>.
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Advanced filter popover -->
+    <div id="advPanel" class="adv-panel hidden">
+      <div class="adv-head">
+        <span class="adv-title">Advanced filter</span>
+        <div class="adv-match">
+          Match
+          <select id="advCombine" class="select">
+            <option value="and">all</option>
+            <option value="or">any</option>
+          </select>
+          of:
+        </div>
+      </div>
+      <div id="advConditions" class="adv-conditions"></div>
+      <button id="advAdd" class="adv-add">+ Add condition</button>
+      <div class="adv-actions">
+        <button id="advClear" class="btn ghost">Clear</button>
+        <button id="advApply" class="btn primary">Apply filter</button>
+      </div>
+    </div>
+    <div id="advBackdrop" class="popover-backdrop"></div>
+
+    <!-- Empty state / drop zone -->
+    <section id="empty" class="empty">
+      <div class="empty-card">
+        <div class="empty-icon">
+          <svg width="98" height="98" version="1.1" viewBox="0 0 25.929 25.929" xml:space="preserve" xmlns="http://www.w3.org/2000/svg"><defs><clipPath id="clipPath3-9"><rect x="52.699" y="20.037" width="95.219" height="95.219" fill="#fff" stroke-width=".26458"/></clipPath></defs><rect x="4.5288" y="5.0887" width="16.973" height="17.04" fill="#fff" stroke="#000" stroke-width=".016672"/><g transform="matrix(.062892 0 0 .062892 3.7246 5.0139)"><path transform="translate(-52.699,-20.037)" d="m246.36 189.27c52.892 61.416 44.104 5.022 54.685 29.057 8.1348 18.479-0.8965 70.87-4.4824 90.004-12.485 51.046-107.17 59.439-103.09 9.2131 4.0715-50.226 3.1377-49.609 0.89649-65.2-2.2412-15.591-8.9647-35.435-16.136-52.444 23.308 26.222 68.132-10.63 68.132-10.63z" fill="#fc0" stroke-width="1.1816"/><path transform="translate(-52.699,-20.037)" d="m198.69 236.92s-3.8493 1.8532-0.98614 8.5504c1.9383 4.534 3.8764 3.7102 3.8764 3.7102z" fill="#4d4d4d"/><path transform="translate(-52.699,-20.037)" d="m234.27 231.59s-1.7782 2.4717-1.2349 7.6212c0.54335 5.1495 1.3337 6.7287 3.6552 6.1794 2.3215-0.54929 2.7166-5.3555 2.0251-7.6213s-1.2843-5.4241-4.4454-6.1794z" fill="#4d4d4d"/><g transform="matrix(.099596 -1.637 1.637 .099596 -58.436 368.31)" fill="#fc0"><path d="m175.85 81.079c1.1487 31.81 40.582 40.489 51.404 23.203l36.768-31.413-32.841 1.0709 7.1394-29.629-35.697 17.135-4.2837-25.702z"/><ellipse cx="197.99" cy="32.888" rx="6.7825" ry="5.7115"/><ellipse cx="241.54" cy="40.741" rx="7.1394" ry="6.7825"/><ellipse cx="269.02" cy="69.834" rx="7.8534" ry="7.3179"/></g></g><g transform="matrix(.062818 0 0 .062818 12.543 11.054)" stroke="#000"><path transform="matrix(3.416 0 0 1.5992 -380.09 -62.807)" d="m97.479 51.775c-1.8629-10.017-5.1028 2.3512 0.14608 15.744 3.4013 8.6786 6.0542 9.246 6.0542 9.246s-4.3374-14.973-6.2002-24.99z" clip-path="url(#clipPath3-9)" stroke-width="1.5454"/><path d="m43.795 4.3776c2.0548 17.307 15.305 31.471 29.968 29.524 14.662-1.9465 22.884-14.495 20.184-34.107-2.7001-19.611-12.095-29.631-25.426-29.596-13.331 0.03525-27.083 14.329-24.726 34.178z" stroke-width="2.3103"/></g></svg>
+        </div>
+
+        <p>Drag &amp; drop a <code>.parquet</code> or <code>.csv</code> file here.</p>
+        <button id="openBtn2" class="btn primary lg">Choose File…</button>
+      </div>
+    </section>
+
+    <!-- Data table -->
+    <main id="tableWrap" class="hidden">
+      <div id="viewport" class="viewport">
+        <div id="grid" class="grid">
+          <div id="headerRow" class="header-row"></div>
+          <div id="spacer" class="spacer">
+            <div id="rows" class="rows"></div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Status bar -->
+    <footer id="statusBar" class="status-bar hidden">
+      <span id="statLeft"></span>
+      <span id="statCenter"></span>
+      <span id="statRight"></span>
+    </footer>
+
+    <!-- Metadata drawer -->
+    <aside id="metaPanel" class="meta-panel">
+      <div class="meta-header">
+        <h2>File Info</h2>
+        <button id="metaClose" class="icon-btn" title="Close">✕</button>
+      </div>
+      <div id="metaBody" class="meta-body"></div>
+    </aside>
+    <div id="metaBackdropEl" class="meta-backdrop"></div>
+
+    <!-- Settings window -->
+    <div id="settingsBackdrop" class="modal-backdrop"></div>
+    <div id="settingsWin" class="settings-win" role="dialog" aria-label="Settings">
+      <div class="win-head">
+        <h2>Settings</h2>
+        <button id="settingsClose" class="icon-btn" title="Close">✕</button>
+      </div>
+      <div class="win-body">
+        <div class="set-row">
+          <div class="set-label"><span>Appearance</span><small>App color theme</small></div>
+          <select id="setTheme" class="select">
+            <option value="auto">Automatic</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </div>
+        <div class="set-row">
+          <div class="set-label"><span>Row density</span><small>Height of table rows</small></div>
+          <select id="setDensity" class="select">
+            <option value="compact">Compact</option>
+            <option value="default">Default</option>
+            <option value="comfortable">Comfortable</option>
+          </select>
+        </div>
+        <div class="set-row">
+          <div class="set-label"><span>Cell font size</span><small>Text size in cells</small></div>
+          <select id="setFont" class="select">
+            <option value="small">Small</option>
+            <option value="default">Default</option>
+            <option value="large">Large</option>
+          </select>
+        </div>
+        <div class="set-row">
+          <div class="set-label"><span>Fit columns to window</span><small>Stretch columns to fill width</small></div>
+          <label class="switch"><input type="checkbox" id="setAutoFit" /><span class="track"></span></label>
+        </div>
+        <div class="set-note">Preferences are saved on this Mac.</div>
+      </div>
+    </div>
+
+    <div id="exportFormatBackdrop" class="modal-backdrop"></div>
+    <div
+            id="exportFormatWin"
+            class="settings-win export-format-win"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Export format"
+    >
+      <div class="win-head">
+        <h2>Export result</h2>
+        <button
+                id="exportFormatClose"
+                class="icon-btn"
+                type="button"
+                title="Close"
+                aria-label="Close"
+        >✕</button>
+      </div>
+      <div class="win-body">
+        <p class="export-format-description">
+          Please select the file format to output.
+        </p>
+        <div class="export-format-options">
+          <button
+                  id="exportParquetBtn"
+                  class="btn primary"
+                  type="button"
+          >Parquet</button>
+          <button
+                  id="exportCsvBtn"
+                  class="btn ghost"
+                  type="button"
+          >CSV</button>
+        </div>
+      </div>
+    </div>
+
+    <div
+            id="csvImportWin"
+            class="settings-win csv-import-win"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="csvImportTitle"
+    >
+      <div class="win-head">
+        <h2 id="csvImportTitle">Import CSV</h2>
+        <button
+                id="csvImportClose"
+                class="icon-btn"
+                type="button"
+                title="Cancel"
+                aria-label="Cancel"
+        >✕</button>
+      </div>
+      <div class="win-body">
+        <p class="csv-import-description">
+          CSV files are imported as Parquet so they can be opened efficiently
+          and saved in a future workspace.
+        </p>
+        <div id="csvImportPath" class="csv-import-path"></div>
+        <div class="csv-import-actions">
+          <button id="csvImportCancelBtn" class="btn ghost" type="button">Cancel</button>
+          <button id="csvImportSaveBtn" class="btn primary" type="button">
+            Save as Parquet…
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Drop overlay -->
+    <div id="dropOverlay" class="drop-overlay">
+      <div class="drop-inner">Drop to open .parquet or .csv</div>
+    </div>
+
+    <!-- Loading overlay -->
+    <div id="loading" class="loading hidden">
+      <div class="spinner"></div>
+      <div id="loadingText" class="loading-text">Reading…</div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="main.js"></script>
+  </body>
+</html>

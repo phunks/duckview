@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Rust / Tauri build output
+src-tauri/target/
+src-tauri/gen/
+
+# Build / distribution artifacts (release assets only — never committed)
+build/
+dist/
+DerivedData/
+*.app
+*.dmg
+
+# macOS cruft
+.DS_Store
+*.xcuserstate
+
+# Claude Code local config
+.claude/
+
+# Local publish helpers (not part of the public repo)
+PUBLISH.md
+RELEASE_NOTES.md

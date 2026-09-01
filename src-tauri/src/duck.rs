@@ -1,0 +1,619 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Mutex;
+use arrow::datatypes::SchemaRef;
+use duckdb::Connection;
+use serde::Serialize;
+use tauri::State;
+use crate::{is_numeric, normalize_read_only_sql, Condition, FileCache, FilterSpec, SortSpec, MAX_PAGE, SEARCH_CAP};
+
+#[derive(Serialize, Clone)]
+pub(crate) struct DuckTable {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) is_view: bool,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct QueryColumn {
+    pub(crate) name: String,
+    #[serde(rename = "type")]
+    pub(crate) type_name: String,
+    pub(crate) numeric: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct QueryStartResponse {
+    pub(crate) query_id: String,
+    pub(crate) columns: Vec<QueryColumn>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct QueryRowsResponse {
+    rows: Vec<Vec<Option<String>>>,
+    offset: usize,
+    has_more: bool,
+}
+
+pub(crate) struct QuerySession {
+    pub(crate) sql: String,
+    pub(crate) column_count: usize,
+}
+
+pub(crate) struct DuckDbState {
+    pub(crate) connection: Mutex<Connection>,
+    pub(crate) tables_by_path: Mutex<HashMap<String, DuckTable>>,
+    pub(crate) queries: Mutex<HashMap<String, QuerySession>>,
+    pub(crate) next_query_id: AtomicU64,
+}
+
+impl DuckDbState {
+    pub(crate) fn new() -> Result<Self, String> {
+        let connection = Connection::open_in_memory()
+            .map_err(|e| format!("Could not start DuckDB: {e}"))?;
+
+        connection
+            .execute_batch(
+                "
+                SET memory_limit = '2GB';
+                SET preserve_insertion_order = false;
+                ",
+            )
+            .map_err(|e| format!("Could not configure DuckDB: {e}"))?;
+
+        Ok(Self {
+            connection: Mutex::new(connection),
+            tables_by_path: Mutex::new(HashMap::new()),
+            queries: Mutex::new(HashMap::new()),
+            next_query_id: AtomicU64::new(1),
+        })
+    }
+}
+
+fn display_duck_value(value: duckdb::types::ValueRef<'_>) -> Option<String> {
+    use duckdb::types::ValueRef;
+
+    match value {
+        ValueRef::Null => None,
+
+        ValueRef::Boolean(value) => Some(value.to_string()),
+
+        ValueRef::TinyInt(value) => Some(value.to_string()),
+        ValueRef::SmallInt(value) => Some(value.to_string()),
+        ValueRef::Int(value) => Some(value.to_string()),
+        ValueRef::BigInt(value) => Some(value.to_string()),
+        ValueRef::HugeInt(value) => Some(value.to_string()),
+
+        ValueRef::UTinyInt(value) => Some(value.to_string()),
+        ValueRef::USmallInt(value) => Some(value.to_string()),
+        ValueRef::UInt(value) => Some(value.to_string()),
+        ValueRef::UBigInt(value) => Some(value.to_string()),
+        ValueRef::UHugeInt(value) => Some(value.to_string()),
+
+        ValueRef::Float(value) => Some(value.to_string()),
+        ValueRef::Double(value) => Some(value.to_string()),
+        ValueRef::Decimal(value) => Some(value.to_string()),
+
+        ValueRef::Text(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+
+        ValueRef::Blob(bytes) | ValueRef::Geometry(bytes) => Some(format!(
+            "0x{}",
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )),
+
+        ValueRef::Date32(days) => Some(format!("Date32({days})")),
+        ValueRef::Time64(unit, value) => Some(format!("Time64({unit:?}, {value})")),
+        ValueRef::Timestamp(unit, value) => Some(format!("Timestamp({unit:?}, {value})")),
+
+        other => Some(format!("{other:?}")),
+    }
+}
+
+fn quote_sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[allow(unused)]
+fn escape_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn condition_to_duckdb_sql(schema: &SchemaRef, cond: &Condition) -> Result<String, String> {
+    if cond.column >= schema.fields().len() {
+        return Err("Condition references an invalid column".to_string());
+    }
+
+    let field = schema.field(cond.column);
+    let col = quote_sql_identifier(field.name());
+    let col_text = format!("CAST({col} AS VARCHAR)");
+    let value_lit = quote_sql_string(&cond.value);
+
+    let sql = match cond.op.as_str() {
+        "contains" => {
+            if cond.case_sensitive {
+                format!("contains({col_text}, {value_lit})")
+            } else {
+                format!("contains(lower({col_text}), lower({value_lit}))")
+            }
+        }
+        "not_contains" => {
+            if cond.case_sensitive {
+                format!("NOT contains({col_text}, {value_lit})")
+            } else {
+                format!("NOT contains(lower({col_text}), lower({value_lit}))")
+            }
+        }
+        "starts_with" => {
+            if cond.case_sensitive {
+                format!("starts_with({col_text}, {value_lit})")
+            } else {
+                format!("starts_with(lower({col_text}), lower({value_lit}))")
+            }
+        }
+        "ends_with" => {
+            if cond.case_sensitive {
+                format!("ends_with({col_text}, {value_lit})")
+            } else {
+                format!("ends_with(lower({col_text}), lower({value_lit}))")
+            }
+        }
+        "equals" => {
+            if cond.case_sensitive {
+                format!("{col_text} = {value_lit}")
+            } else {
+                format!("LOWER({col_text}) = LOWER({value_lit})")
+            }
+        }
+        "not_equals" => {
+            if cond.case_sensitive {
+                format!("{col_text} <> {value_lit}")
+            } else {
+                format!("LOWER({col_text}) <> LOWER({value_lit})")
+            }
+        }
+        "regex" => {
+            let pattern = if cond.case_sensitive {
+                cond.value.clone()
+            } else {
+                format!("(?i){}", cond.value)
+            };
+            regex::Regex::new(&pattern).map_err(|e| format!("Invalid regex: {e}"))?;
+            format!("REGEXP_MATCHES({col_text}, {})", quote_sql_string(&pattern))
+        }
+        "gt" | "gte" | "lt" | "lte" => {
+            let op = match cond.op.as_str() {
+                "gt" => ">",
+                "gte" => ">=",
+                "lt" => "<",
+                _ => "<=",
+            };
+            if is_numeric(field.data_type()) {
+                format!("TRY_CAST({col} AS DOUBLE) {op} TRY_CAST({value_lit} AS DOUBLE)")
+            } else {
+                format!("{col_text} {op} {value_lit}")
+            }
+        }
+        "is_null" | "is_empty" => format!("{col} IS NULL"),
+        "is_not_null" | "is_not_empty" => format!("{col} IS NOT NULL"),
+        other => return Err(format!("Unknown operator: {other}")),
+    };
+
+    Ok(sql)
+}
+
+fn numbered_projection_sql(schema: &SchemaRef, conditions: &[Condition]) -> Result<String, String> {
+    let mut cols: Vec<usize> = conditions.iter().map(|c| c.column).collect();
+    cols.sort_unstable();
+    cols.dedup();
+
+    let mut projection = Vec::with_capacity(cols.len() + 1);
+    projection.push("row_number() OVER () - 1 AS idx".to_string());
+
+    for col_idx in cols {
+        if col_idx >= schema.fields().len() {
+            return Err("Condition references an invalid column".to_string());
+        }
+        let field = schema.field(col_idx);
+        projection.push(quote_sql_identifier(field.name()));
+    }
+
+    Ok(projection.join(", "))
+}
+
+pub(crate) fn run_filter_duckdb(
+    duckdb: &DuckDbState,
+    cache: &FileCache,
+    path: &str,
+    filter: &FilterSpec,
+) -> Result<(Vec<u32>, bool), String> {
+    let (conditions, any) = match filter {
+        FilterSpec::Advanced { conditions, combine } => {
+            (conditions, combine.eq_ignore_ascii_case("or"))
+        }
+    };
+
+    if conditions.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+
+    let predicates: Vec<String> = conditions
+        .iter()
+        .map(|c| condition_to_duckdb_sql(&cache.schema, c))
+        .collect::<Result<_, _>>()?;
+
+    let joiner = if any { " OR " } else { " AND " };
+    let where_sql = predicates.join(joiner);
+
+    let table_sql = duckdb
+        .tables_by_path
+        .lock()
+        .unwrap()
+        .get(path)
+        .map(|t| quote_sql_identifier(&t.name))
+        .unwrap_or_else(|| format!("read_parquet({})", quote_sql_string(path)));
+
+    let projection_sql = numbered_projection_sql(&cache.schema, conditions)?;
+
+    let sql = format!(
+        "SELECT idx FROM (
+            SELECT {projection_sql}
+            FROM {table_sql}
+         ) duckview_rows
+         WHERE {where_sql}
+         LIMIT {}",
+        SEARCH_CAP + 1
+    );
+
+    let connection = duckdb.connection.lock().unwrap();
+    let mut stmt = connection
+        .prepare(&sql)
+        .map_err(|e| format!("DuckDB filter SQL error: {e}"))?;
+
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| format!("DuckDB filter SQL error: {e}"))?;
+
+    let mut out = Vec::<u32>::new();
+    while let Some(row) = rows.next().map_err(|e| format!("DuckDB filter SQL error: {e}"))? {
+        let idx: i64 = row
+            .get(0)
+            .map_err(|e| format!("Could not read filter row index: {e}"))?;
+        if !(0..=u32::MAX as i64).contains(&idx) {
+            return Err("Row index out of supported range".to_string());
+        }
+        out.push(idx as u32);
+    }
+
+    let truncated = out.len() > SEARCH_CAP;
+    if truncated {
+        out.truncate(SEARCH_CAP);
+    }
+
+    Ok((out, truncated))
+}
+
+#[allow(unused)]
+pub(crate) fn run_sort_duckdb(
+    duckdb: &DuckDbState,
+    cache: &FileCache,
+    path: &str,
+    spec: &SortSpec,
+) -> Result<Vec<u32>, String> {
+    if spec.column >= cache.schema.fields().len() {
+        return Err("Sort column is out of range".to_string());
+    }
+
+    let field = cache.schema.field(spec.column);
+    let sort_col = quote_sql_identifier(field.name());
+
+    let table_sql = duckdb
+        .tables_by_path
+        .lock()
+        .unwrap()
+        .get(path)
+        .map(|t| quote_sql_identifier(&t.name))
+        .unwrap_or_else(|| format!("read_parquet({})", quote_sql_string(path)));
+
+    let direction = if spec.ascending { "ASC" } else { "DESC" };
+
+    let sql = format!(
+        "SELECT idx FROM (
+            SELECT row_number() OVER () - 1 AS idx, {sort_col}
+            FROM {table_sql}
+         ) duckview_rows
+         ORDER BY {sort_col} {direction} NULLS LAST"
+    );
+
+    let connection = duckdb.connection.lock().unwrap();
+    let mut stmt = connection
+        .prepare(&sql)
+        .map_err(|e| format!("DuckDB sort SQL error: {e}"))?;
+
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| format!("DuckDB sort SQL error: {e}"))?;
+
+    let mut out = Vec::<u32>::with_capacity(cache.num_rows);
+    while let Some(row) = rows.next().map_err(|e| format!("DuckDB sort SQL error: {e}"))? {
+        let idx: i64 = row
+            .get(0)
+            .map_err(|e| format!("Could not read sort row index: {e}"))?;
+        if !(0..=u32::MAX as i64).contains(&idx) {
+            return Err("Row index out of supported range".to_string());
+        }
+        out.push(idx as u32);
+    }
+
+    if out.len() != cache.num_rows {
+        return Err(format!(
+            "Unexpected sorted index count: expected {}, got {}",
+            cache.num_rows,
+            out.len()
+        ));
+    }
+
+    Ok(out)
+}
+
+#[tauri::command]
+pub(crate) async fn export_duckdb_query(
+    app: tauri::AppHandle,
+    duckdb: State<'_, DuckDbState>,
+    query_id: String,
+    format: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (extension, copy_options) = match format.as_str() {
+        "csv" => ("csv", "FORMAT CSV, HEADER TRUE"),
+        "parquet" => ("parquet", "FORMAT PARQUET, COMPRESSION ZSTD"),
+        "json" => ("json", "FORMAT JSON"),
+        _ => return Err("Unsupported export format.".to_string()),
+    };
+
+    let sql = duckdb
+        .queries
+        .lock()
+        .unwrap()
+        .get(&query_id)
+        .map(|query| query.sql.clone())
+        .ok_or("Query result is no longer available. Run the query again.")?;
+
+    let output_path = app
+        .dialog()
+        .file()
+        .add_filter(format.to_uppercase(), &[extension])
+        .set_file_name(format!("query-result.{extension}"))
+        .blocking_save_file()
+        .and_then(|file| file.into_path().ok());
+
+    let Some(output_path) = output_path else {
+        return Ok(None);
+    };
+
+    let output_path = output_path.to_string_lossy().to_string();
+    let copy_sql = format!(
+        "COPY ({sql}) TO {} WITH ({copy_options})",
+        quote_sql_string(&output_path)
+    );
+
+    duckdb
+        .connection
+        .lock()
+        .unwrap()
+        .execute_batch(&copy_sql)
+        .map_err(|error| format!("Export failed: {error}"))?;
+
+    Ok(Some(output_path))
+}
+
+fn quote_sql_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+#[tauri::command]
+pub(crate) fn register_duckdb_query_as_table(
+    duckdb: State<'_, DuckDbState>,
+    query_id: String,
+    table_name: String,
+) -> Result<DuckTable, String> {
+    let table_name = table_name.trim().to_string();
+    if table_name.is_empty() {
+        return Err("A table name is required.".to_string());
+    }
+
+    let sql = duckdb
+        .queries
+        .lock()
+        .unwrap()
+        .get(&query_id)
+        .map(|query| query.sql.clone())
+        .ok_or("Query result is no longer available. Run the query again.")?;
+
+    let table = DuckTable {
+        name: table_name.clone(),
+        path: "SQL result".to_string(),
+        is_view: true,
+    };
+
+    {
+        let mut tables = duckdb.tables_by_path.lock().unwrap();
+
+        if tables.values().any(|existing| existing.name == table_name) {
+            return Err(format!("A table named \"{table_name}\" already exists."));
+        }
+
+        let create_view = format!(
+            "CREATE TEMP VIEW {} AS {sql}",
+            quote_sql_identifier(&table_name),
+        );
+
+        duckdb
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(&create_view)
+            .map_err(|error| format!("Could not save query result: {error}"))?;
+
+        tables.insert(format!("sql-result:{table_name}"), table.clone());
+    }
+
+    Ok(table)
+}
+
+#[tauri::command]
+pub(crate) fn remove_duckdb_result_table(
+    duckdb: State<'_, DuckDbState>,
+    table_name: String,
+) -> Result<(), String> {
+    let key = format!("sql-result:{table_name}");
+
+    {
+        let tables = duckdb.tables_by_path.lock().unwrap();
+        if !tables.contains_key(&key) {
+            return Ok(());
+        }
+    }
+
+    let drop_view = format!(
+        "DROP VIEW IF EXISTS {}",
+        quote_sql_identifier(&table_name),
+    );
+
+    duckdb
+        .connection
+        .lock()
+        .unwrap()
+        .execute_batch(&drop_view)
+        .map_err(|error| format!("Could not remove result view: {error}"))?;
+
+    duckdb.tables_by_path.lock().unwrap().remove(&key);
+
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn list_duckdb_tables(duckdb: State<'_, DuckDbState>) -> Vec<DuckTable> {
+    duckdb
+        .tables_by_path
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect()
+}
+
+#[tauri::command]
+pub(crate) fn execute_duckdb_query(
+    duckdb: State<'_, DuckDbState>,
+    sql: String,
+) -> Result<QueryStartResponse, String> {
+    let sql = normalize_read_only_sql(&sql)?;
+    let probe_sql = format!("SELECT * FROM ({sql}) AS duckview_result LIMIT 0");
+
+    let connection = duckdb.connection.lock().unwrap();
+    let mut statement = connection
+        .prepare(&probe_sql)
+        .map_err(|e| format!("SQL error: {e}"))?;
+
+    {
+        let rows = statement
+            .query([])
+            .map_err(|e| format!("SQL error: {e}"))?;
+        drop(rows);
+    }
+
+    let columns: Vec<_> = statement
+        .column_names()
+        .iter()
+        .map(|name| QueryColumn {
+            name: name.to_string(),
+            type_name: "value".to_string(),
+            numeric: false,
+        })
+        .collect();
+
+    drop(statement);
+    drop(connection);
+
+    let query_id = format!(
+        "query-{}",
+        duckdb.next_query_id.fetch_add(1, AtomicOrdering::Relaxed)
+    );
+
+    let column_count = columns.len();
+
+    duckdb
+        .queries
+        .lock()
+        .unwrap()
+        .insert(
+            query_id.clone(),
+            QuerySession {
+                sql,
+                column_count,
+            },
+        );
+
+    Ok(QueryStartResponse { query_id, columns })
+}
+
+#[tauri::command]
+pub(crate) fn get_duckdb_query_rows(
+    duckdb: State<'_, DuckDbState>,
+    query_id: String,
+    offset: usize,
+    limit: usize,
+) -> Result<QueryRowsResponse, String> {
+    let limit = limit.min(MAX_PAGE);
+
+    let (sql, column_count) = duckdb
+        .queries
+        .lock()
+        .unwrap()
+        .get(&query_id)
+        .map(|query| (query.sql.clone(), query.column_count))
+        .ok_or("Query result is no longer available.")?;
+
+    let page_sql = format!(
+        "SELECT * FROM ({sql}) AS duckview_result LIMIT {limit} OFFSET {offset}"
+    );
+
+    let connection = duckdb.connection.lock().unwrap();
+    let mut statement = connection
+        .prepare(&page_sql)
+        .map_err(|e| format!("SQL error: {e}"))?;
+
+    let mut result = statement
+        .query([])
+        .map_err(|e| format!("SQL error: {e}"))?;
+
+    let mut rows = Vec::with_capacity(limit);
+    while let Some(row) = result.next().map_err(|e| format!("SQL error: {e}"))? {
+        let mut values = Vec::with_capacity(column_count);
+
+        for column in 0..column_count {
+            let value = row
+                .get_ref(column)
+                .map_err(|e| format!("Could not read SQL result: {e}"))?;
+
+            values.push(display_duck_value(value));
+        }
+
+        rows.push(values);
+    }
+
+    let has_more = rows.len() == limit;
+
+    Ok(QueryRowsResponse {
+        rows,
+        offset,
+        has_more,
+    })
+}

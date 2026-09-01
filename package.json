@@ -1,0 +1,16 @@
+{
+  "name": "duckview",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Parquet file viewer and SQL editor.",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "stylelint": "^17.14.1",
+    "stylelint-config-standard": "^40.0.0"
+  }
+}

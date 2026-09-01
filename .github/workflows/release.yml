@@ -1,0 +1,146 @@
+name: Release
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { os: ubuntu-latest  , target: x86_64-unknown-linux-gnu        , extension: ""   }
+#          - { os: ubuntu-latest  , target: x86_64-unknown-linux-musl       , extension: ""   }
+#          - { os: ubuntu-latest  , target: aarch64-unknown-linux-gnu       , extension: ""   }
+#          - { os: ubuntu-latest  , target: aarch64-unknown-linux-musl      , extension: ""   }
+#          - { os: macos-15-intel , target: x86_64-apple-darwin             , extension: ""   }
+          - { os: macos-26       , target: aarch64-apple-darwin            , extension: ""   }
+          - { os: windows-latest , target: x86_64-pc-windows-msvc          , extension: .exe }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          lfs: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - name: Extract crate information
+        shell: bash
+        run: |
+          echo "PROJECT_NAME=$(sed -n 's/^name = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -n1)" >> $GITHUB_ENV
+
+      - run: rustup override unset
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.job.target }}
+
+      - name: Build macOS application
+        shell: bash
+        run: npm run tauri build -- --target ${{ matrix.job.target }}
+
+      - name: Rename artifacts
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          mv src-tauri/target/${{ matrix.job.target }}/release/${{ env.PROJECT_NAME }}{,-${{ github.ref_name }}-${{ matrix.job.target }}${{ matrix.job.extension }}}
+
+      - name: Package macOS application
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          release_name="${PROJECT_NAME}-${GITHUB_REF_NAME}-${{ matrix.job.target }}"
+          bundle_dir="src-tauri/target/${{ matrix.job.target }}/release/bundle/macos/${PROJECT_NAME}.app"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$bundle_dir" \
+            "src-tauri/target/${{ matrix.job.target }}/release/${release_name}.zip"
+
+      - name: Package Linux release
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          release_name="${PROJECT_NAME}-${GITHUB_REF_NAME}-${{ matrix.job.target }}"
+          release_directory="src-tauri/target/${{ matrix.job.target }}/release"
+          archive_path="$GITHUB_WORKSPACE/$release_directory/$release_name.tar.gz"
+          
+          tar -C "$release_directory" -czf "$archive_path" \
+            "$release_name" \
+            -C "$GITHUB_WORKSPACE" LICENSE
+
+      - name: Package Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $releaseName = "${{ env.PROJECT_NAME }}-${{ github.ref_name }}-${{ matrix.job.target }}"
+          $releaseDirectory = "src-tauri/target/${{ matrix.job.target }}/release"
+          
+          Compress-Archive `
+          -Path "$releaseDirectory/$releaseName.exe", "LICENSE" `
+          -DestinationPath "$releaseDirectory/$releaseName.zip"
+
+      - name: Upload Linux release archive
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.job.target }}
+          path: src-tauri/target/${{ matrix.job.target }}/release/${{ env.PROJECT_NAME }}-${{ github.ref_name }}-${{ matrix.job.target }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload macOS release archive
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.job.target }}
+          path: src-tauri/target/${{ matrix.job.target }}/release/${{ env.PROJECT_NAME }}-${{ github.ref_name }}-${{ matrix.job.target }}.zip
+          if-no-files-found: error
+
+      - name: Upload Windows release archive
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.job.target }}
+          path: src-tauri/target/${{ matrix.job.target }}/release/${{ env.PROJECT_NAME }}-${{ github.ref_name }}-${{ matrix.job.target }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: release/*

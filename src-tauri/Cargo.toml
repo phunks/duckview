@@ -1,0 +1,24 @@
+[package]
+name = "duckview"
+version = "0.1.0"
+description = "Parquet file viewer and SQL editor"
+authors = ["pnk"]
+edition = "2024"
+rust-version = "1.98"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["custom-protocol"] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+regex = "1"
+arrow = "59"
+parquet = "59"
+duckdb = { version = "1", features = ["bundled", "parquet"] }
+
+[profile.release]
+opt-level = 2
+strip = true
+panic = "abort"
