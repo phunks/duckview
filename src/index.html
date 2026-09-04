@@ -10,7 +10,7 @@
     <!-- Toolbar -->
     <header id="toolbar">
       <div class="tb-left">
-        <span class="app-title">DuckView</span>
+        <span id="appTitle" class="app-title">DuckView</span>
         <span id="fileName" class="file-name"></span>
       </div>
 
@@ -37,6 +37,22 @@
         <span>Open File…</span>
         <kbd>⌘O</kbd>
       </button>
+      <div class="app-menu-separator"></div>
+      <div class="app-menu-workspaces">
+        <span class="app-menu-label">Open Workspace</span>
+        <div id="menuWorkspaceList" class="app-menu-workspace-list"></div>
+      </div>
+      <div class="app-menu-separator"></div>
+      <button id="menuNewWorkspaceBtn" class="app-menu-item" type="button" role="menuitem">
+        <span>New Workspace…</span>
+      </button>
+      <button id="menuSaveWorkspaceAsBtn" class="app-menu-item" type="button" role="menuitem">
+        <span>Save Workspace As…</span>
+      </button>
+      <button id="menuDeleteWorkspaceBtn" class="app-menu-item danger" type="button" role="menuitem">
+        <span>Delete Workspace…</span>
+      </button>
+      <div class="app-menu-separator"></div>
       <button id="menuSettingsBtn" class="app-menu-item" type="button" role="menuitem">
         <span>Settings…</span>
         <kbd>⌘,</kbd>
@@ -48,7 +64,7 @@
 
     <!-- SQL workspace -->
     <main id="sqlWorkspace" class="sql-workspace hidden">
-      <section class="sql-editor-pane">
+      <section id="sqlEditorPane" class="sql-editor-pane">
         <aside class="sql-tables-pane">
           <div class="sql-pane-title">Tables</div>
           <div id="sqlTables" class="sql-tables">
@@ -70,16 +86,23 @@
               <button id="sqlExportBtn" class="btn ghost" type="button" disabled>Export…</button>
             </div>
           </div>
-          <textarea
-                  id="sqlInput"
-                  class="sql-input"
+          <div
+                  id="sqlEditor"
+                  class="sql-editor"
                   aria-label="SQL query"
-                  spellcheck="false"
-                  placeholder="SELECT * FROM your_table LIMIT 100;"
-          ></textarea>
+          ></div>
           <div id="sqlError" class="sql-error hidden"></div>
         </section>
       </section>
+
+      <div
+              id="sqlPaneSplitter"
+              class="sql-pane-splitter"
+              role="separator"
+              aria-label="Resize SQL editor and result panes"
+              aria-orientation="horizontal"
+              tabindex="0"
+      ></div>
 
       <section class="sql-result-pane">
         <div class="sql-result-head">
@@ -127,7 +150,7 @@
     <section id="empty" class="empty">
       <div class="empty-card">
         <div class="empty-icon">
-          <svg width="98" height="98" version="1.1" viewBox="0 0 25.929 25.929" xml:space="preserve" xmlns="http://www.w3.org/2000/svg"><defs><clipPath id="clipPath3-9"><rect x="52.699" y="20.037" width="95.219" height="95.219" fill="#fff" stroke-width=".26458"/></clipPath></defs><rect x="4.5288" y="5.0887" width="16.973" height="17.04" fill="#fff" stroke="#000" stroke-width=".016672"/><g transform="matrix(.062892 0 0 .062892 3.7246 5.0139)"><path transform="translate(-52.699,-20.037)" d="m246.36 189.27c52.892 61.416 44.104 5.022 54.685 29.057 8.1348 18.479-0.8965 70.87-4.4824 90.004-12.485 51.046-107.17 59.439-103.09 9.2131 4.0715-50.226 3.1377-49.609 0.89649-65.2-2.2412-15.591-8.9647-35.435-16.136-52.444 23.308 26.222 68.132-10.63 68.132-10.63z" fill="#fc0" stroke-width="1.1816"/><path transform="translate(-52.699,-20.037)" d="m198.69 236.92s-3.8493 1.8532-0.98614 8.5504c1.9383 4.534 3.8764 3.7102 3.8764 3.7102z" fill="#4d4d4d"/><path transform="translate(-52.699,-20.037)" d="m234.27 231.59s-1.7782 2.4717-1.2349 7.6212c0.54335 5.1495 1.3337 6.7287 3.6552 6.1794 2.3215-0.54929 2.7166-5.3555 2.0251-7.6213s-1.2843-5.4241-4.4454-6.1794z" fill="#4d4d4d"/><g transform="matrix(.099596 -1.637 1.637 .099596 -58.436 368.31)" fill="#fc0"><path d="m175.85 81.079c1.1487 31.81 40.582 40.489 51.404 23.203l36.768-31.413-32.841 1.0709 7.1394-29.629-35.697 17.135-4.2837-25.702z"/><ellipse cx="197.99" cy="32.888" rx="6.7825" ry="5.7115"/><ellipse cx="241.54" cy="40.741" rx="7.1394" ry="6.7825"/><ellipse cx="269.02" cy="69.834" rx="7.8534" ry="7.3179"/></g></g><g transform="matrix(.062818 0 0 .062818 12.543 11.054)" stroke="#000"><path transform="matrix(3.416 0 0 1.5992 -380.09 -62.807)" d="m97.479 51.775c-1.8629-10.017-5.1028 2.3512 0.14608 15.744 3.4013 8.6786 6.0542 9.246 6.0542 9.246s-4.3374-14.973-6.2002-24.99z" clip-path="url(#clipPath3-9)" stroke-width="1.5454"/><path d="m43.795 4.3776c2.0548 17.307 15.305 31.471 29.968 29.524 14.662-1.9465 22.884-14.495 20.184-34.107-2.7001-19.611-12.095-29.631-25.426-29.596-13.331 0.03525-27.083 14.329-24.726 34.178z" stroke-width="2.3103"/></g></svg>
+          <svg width="98" height="98" version="1.1" viewBox="0 0 25.929 25.929" xml:space="preserve" xmlns="http://www.w3.org/2000/svg"><defs><clipPath id="clipPath3-9"><rect x="52.699" y="20.037" width="95.219" height="95.219" fill="#fff" stroke-width=".26458"/></clipPath></defs><rect x="4.5288" y="5.0887" width="16.973" height="17.04" fill="#fff" stroke="#000" stroke-width=".016672"/><g transform="matrix(.063422 0 0 .063422 2.5469 4.9468)"><path transform="translate(-52.699,-20.037)" d="m246.36 189.27c52.892 61.416 44.104 5.022 54.685 29.057 8.1348 18.479-0.8965 70.87-4.4824 90.004-12.485 51.046-107.17 59.439-103.09 9.2131 4.0715-50.226 3.1377-49.609 0.89649-65.2-2.2412-15.591-8.9647-35.435-16.136-52.444 23.308 26.222 68.132-10.63 68.132-10.63z" fill="#fc0" stroke-width="1.1816"/><path transform="translate(-52.699,-20.037)" d="m198.69 236.92s-3.8493 1.8532-0.98614 8.5504c1.9383 4.534 3.8764 3.7102 3.8764 3.7102z" fill="#4d4d4d"/><path transform="translate(-52.699,-20.037)" d="m234.27 231.59s-1.7782 2.4717-1.2349 7.6212c0.54335 5.1495 1.3337 6.7287 3.6552 6.1794 2.3215-0.54929 2.7166-5.3555 2.0251-7.6213s-1.2843-5.4241-4.4454-6.1794z" fill="#4d4d4d"/><g transform="matrix(.099596 -1.637 1.637 .099596 -58.436 368.31)" fill="#fc0"><path d="m175.85 81.079c1.1487 31.81 40.582 40.489 51.404 23.203l36.768-31.413-32.841 1.0709 7.1394-29.629-35.697 17.135-4.2837-25.702z"/><ellipse cx="197.99" cy="32.888" rx="6.7825" ry="5.7115"/><ellipse cx="241.54" cy="40.741" rx="7.1394" ry="6.7825"/><ellipse cx="269.02" cy="69.834" rx="7.8534" ry="7.3179"/></g></g><g transform="matrix(.062818 0 0 .062818 11.433 11.054)" stroke="#000"><path transform="matrix(3.416,0,0,1.5992,-380.09,-62.807)" d="m97.479 51.775c-1.8629-10.017-5.1028 2.3512 0.14608 15.744 3.4013 8.6786 6.0542 9.246 6.0542 9.246s-4.3374-14.973-6.2002-24.99z" clip-path="url(#clipPath3-9)" stroke-width="1.5454"/><path d="m43.795 4.3776c2.0548 17.307 15.305 31.471 29.968 29.524 14.662-1.9465 22.884-14.495 20.184-34.107-2.7001-19.611-12.095-29.631-25.426-29.596-13.331 0.03525-27.083 14.329-24.726 34.178z" stroke-width="2.3103"/></g></svg>
         </div>
 
         <p>Drag &amp; drop a <code>.parquet</code> or <code>.csv</code> file here.</p>
@@ -204,6 +227,43 @@
       </div>
     </div>
 
+    <div id="workspaceDialogBackdrop" class="modal-backdrop"></div>
+    <div
+            id="workspaceDialog"
+            class="settings-win workspace-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="workspaceDialogTitle"
+    >
+      <div class="win-head">
+        <h2 id="workspaceDialogTitle">Workspace</h2>
+        <button
+                id="workspaceDialogClose"
+                class="icon-btn"
+                type="button"
+                title="Cancel"
+                aria-label="Cancel"
+        >✕</button>
+      </div>
+      <div class="win-body">
+        <p id="workspaceDialogDescription" class="workspace-dialog-description"></p>
+        <label id="workspaceDialogInputRow" class="workspace-dialog-input-row">
+          <span>Workspace name</span>
+          <input
+                  id="workspaceDialogInput"
+                  class="workspace-dialog-input"
+                  type="text"
+                  maxlength="100"
+                  autocomplete="off"
+          />
+        </label>
+        <div class="workspace-dialog-actions">
+          <button id="workspaceDialogCancelBtn" class="btn ghost" type="button">Cancel</button>
+          <button id="workspaceDialogConfirmBtn" class="btn primary" type="button">Create</button>
+        </div>
+      </div>
+    </div>
+
     <div id="exportFormatBackdrop" class="modal-backdrop"></div>
     <div
             id="exportFormatWin"
@@ -236,7 +296,12 @@
                   id="exportCsvBtn"
                   class="btn ghost"
                   type="button"
-          >CSV</button>
+          >CSV UTF-8</button>
+          <button
+                  id="exportExcelCsvBtn"
+                  class="btn ghost"
+                  type="button"
+          >CSV UTF-8 (Excel)</button>
         </div>
       </div>
     </div>
@@ -264,6 +329,21 @@
           and saved in a future workspace.
         </p>
         <div id="csvImportPath" class="csv-import-path"></div>
+        <div class="set-row">
+          <div class="set-label">
+            <span>Text encoding</span>
+            <small>Select this when UTF-8 import fails.</small>
+          </div>
+          <select id="csvImportEncoding" class="select">
+            <option value="utf-8">UTF-8</option>
+            <option value="shift_jis">Shift_JIS / CP932 (Excel)</option>
+            <option value="euc-jp">EUC-JP</option>
+            <option value="iso-2022-jp">ISO-2022-JP</option>
+            <option value="gbk">GBK</option>
+            <option value="big5">Big5</option>
+            <option value="windows-1252">Windows-1252</option>
+          </select>
+        </div>
         <div class="csv-import-actions">
           <button id="csvImportCancelBtn" class="btn ghost" type="button">Cancel</button>
           <button id="csvImportSaveBtn" class="btn primary" type="button">
@@ -287,6 +367,6 @@
     <!-- Toast -->
     <div id="toast" class="toast hidden"></div>
 
-    <script src="main.js"></script>
+    <script type="module" src="/main.js"></script>
   </body>
 </html>

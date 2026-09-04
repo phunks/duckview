@@ -1,3 +1,40 @@
+import * as monacoApi from "monaco-editor";
+import "monaco-editor/esm/vs/basic-languages/monaco.contribution";
+import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
+import {
+  LanguageIdEnum,
+  setupLanguageFeatures,
+} from "monaco-sql-languages";
+import "monaco-sql-languages/esm/languages/generic/generic.contribution";
+import GenericSqlWorker from "monaco-sql-languages/esm/languages/generic/generic.worker?worker";
+
+self.MonacoEnvironment = {
+  getWorker(_, label) {
+    if (label === LanguageIdEnum.GSQL) {
+      return new GenericSqlWorker();
+    }
+    return new EditorWorker();
+  },
+};
+
+setupLanguageFeatures(LanguageIdEnum.GSQL, {
+  completionItems: true,
+  diagnostics: true,
+});
+
+globalThis.MonacoEnvironment = {
+  getWorker(_, label) {
+    console.warn("Monaco worker requested:", label);
+
+    if (label === LanguageIdEnum.GENERIC) {
+      console.warn("Starting DTStack Generic SQL worker.");
+      return new GenericSqlWorker();
+    }
+
+    return new EditorWorker();
+  },
+};
+
 "use strict";
 
 // ---- Tauri bridge (withGlobalTauri) ----------------------------------------
@@ -25,12 +62,15 @@ const statusBar = $("statusBar");
 const statLeft = $("statLeft");
 const statCenter = $("statCenter");
 const statRight = $("statRight");
+const appTitleEl = $("appTitle");
 const fileNameEl = $("fileName");
 const tabBar = $("tabBar");
 const sqlWorkspace = $("sqlWorkspace");
 const sqlTitle = $("sqlTitle");
 const sqlTables = $("sqlTables");
-const sqlInput = $("sqlInput");
+const sqlEditorEl = $("sqlEditor");
+const sqlEditorPane = $("sqlEditorPane");
+const sqlPaneSplitter = $("sqlPaneSplitter");
 const sqlRunBtn = $("sqlRunBtn");
 const sqlExportBtn = $("sqlExportBtn");
 const sqlError = $("sqlError");
@@ -67,6 +107,7 @@ const exportFormatBackdrop = $("exportFormatBackdrop");
 const exportFormatClose = $("exportFormatClose");
 const exportParquetBtn = $("exportParquetBtn");
 const exportCsvBtn = $("exportCsvBtn");
+const exportExcelCsvBtn = $("exportExcelCsvBtn");
 const csvImportWin = $("csvImportWin");
 const csvImportPath = $("csvImportPath");
 const csvImportClose = $("csvImportClose");
@@ -77,6 +118,19 @@ const appMenu = $("appMenu");
 const appMenuBackdrop = $("appMenuBackdrop");
 const menuOpenBtn = $("menuOpenBtn");
 const menuSettingsBtn = $("menuSettingsBtn");
+const menuNewWorkspaceBtn = $("menuNewWorkspaceBtn");
+const menuWorkspaceList = $("menuWorkspaceList");
+const menuSaveWorkspaceAsBtn = $("menuSaveWorkspaceAsBtn");
+const menuDeleteWorkspaceBtn = $("menuDeleteWorkspaceBtn");
+const workspaceDialog = $("workspaceDialog");
+const workspaceDialogBackdrop = $("workspaceDialogBackdrop");
+const workspaceDialogTitle = $("workspaceDialogTitle");
+const workspaceDialogDescription = $("workspaceDialogDescription");
+const workspaceDialogInputRow = $("workspaceDialogInputRow");
+const workspaceDialogInput = $("workspaceDialogInput");
+const workspaceDialogClose = $("workspaceDialogClose");
+const workspaceDialogCancelBtn = $("workspaceDialogCancelBtn");
+const workspaceDialogConfirmBtn = $("workspaceDialogConfirmBtn");
 const setTheme = $("setTheme");
 const setDensity = $("setDensity");
 const setFont = $("setFont");
@@ -104,13 +158,704 @@ const tabs = new Map();
 const tabIdByPath = new Map();
 let activeTabId = null;
 
+const workspaceViews = new Map();
+
 let editingEl = null;
 let editingKey = null;
 let editingFileOrig = "";
 let rafPending = false;
-let sqlTabNumber = 0;
 let pendingCsvImportPath = null;
+let sqlPaneResizeState = null;
+let workspaceDialogResolve = null;
 
+let sqlEditor = null;
+let sqlCompletionTables = [];
+let pendingSqlEditorValue = null;
+const sqlTableColumns = new Map();
+const sqlTableColumnRequests = new Map();
+
+const SQL_KEYWORDS = [
+  "SELECT",
+  "FROM",
+  "WHERE",
+  "JOIN",
+  "LEFT JOIN",
+  "RIGHT JOIN",
+  "FULL JOIN",
+  "INNER JOIN",
+  "ON",
+  "GROUP BY",
+  "HAVING",
+  "ORDER BY",
+  "LIMIT",
+  "OFFSET",
+  "WITH",
+  "AS",
+  "DISTINCT",
+  "UNION",
+  "UNION ALL",
+  "INSERT INTO",
+  "UPDATE",
+  "DELETE FROM",
+  "CREATE TABLE",
+  "CREATE VIEW",
+  "DROP TABLE",
+  "CASE",
+  "WHEN",
+  "THEN",
+  "ELSE",
+  "END",
+  "AND",
+  "OR",
+  "NOT",
+  "NULL",
+  "IS NULL",
+  "COUNT",
+  "SUM",
+  "AVG",
+  "MIN",
+  "MAX",
+  "COALESCE",
+  "CAST",
+  "DATE_TRUNC",
+  "NOW",
+];
+
+const WORKSPACE_STORAGE_KEY = "duckview.workspaces.v1";
+const WORKSPACE_SNAPSHOT_KEY_PREFIX = "duckview.workspace.v1:";
+const LEGACY_WORKSPACE_STORAGE_KEY = "duckview.workspace.v1";
+const DEFAULT_WORKSPACE_NAME = "Default";
+
+let workspaceSaveTimer = null;
+let workspaceStore = null;
+let isSwitchingWorkspace = false;
+
+function workspaceSnapshotStorageKey(workspaceId) {
+  return `${WORKSPACE_SNAPSHOT_KEY_PREFIX}${workspaceId}`;
+}
+
+function emptyWorkspaceSnapshot() {
+  return {
+    parquetPaths: [],
+    sqlTabs: [],
+    savedViews: [],
+    activeTabRef: null,
+  };
+}
+
+function createWorkspaceId() {
+  return `workspace-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function createWorkspace(name) {
+  return {
+    id: createWorkspaceId(),
+    name,
+    updatedAt: Date.now(),
+  };
+}
+
+function readWorkspaceSnapshot(workspaceId) {
+  try {
+    const raw = localStorage.getItem(workspaceSnapshotStorageKey(workspaceId));
+    const snapshot = raw ? JSON.parse(raw) : null;
+
+    return snapshot && typeof snapshot === "object"
+        ? snapshot
+        : emptyWorkspaceSnapshot();
+  } catch (error) {
+    console.warn(`Could not read workspace "${workspaceId}":`, error);
+    return emptyWorkspaceSnapshot();
+  }
+}
+
+function writeWorkspaceSnapshot(workspaceId, snapshot) {
+  const safeSnapshot =
+      snapshot && typeof snapshot === "object"
+          ? snapshot
+          : emptyWorkspaceSnapshot();
+
+  try {
+    localStorage.setItem(
+        workspaceSnapshotStorageKey(workspaceId),
+        JSON.stringify(safeSnapshot)
+    );
+  } catch (error) {
+    console.warn(`Could not save workspace "${workspaceId}":`, error);
+  }
+}
+
+function persistWorkspaceStore() {
+  try {
+    localStorage.setItem(
+        WORKSPACE_STORAGE_KEY,
+        JSON.stringify({
+          activeWorkspaceId: workspaceStore.activeWorkspaceId,
+          workspaces: workspaceStore.workspaces,
+        })
+    );
+  } catch (error) {
+    console.warn("Could not save workspace list:", error);
+  }
+}
+
+function isWorkspaceMetadata(workspace) {
+  return (
+      workspace &&
+      typeof workspace.id === "string" &&
+      typeof workspace.name === "string"
+  );
+}
+
+function loadWorkspaceStore() {
+  try {
+    const stored = JSON.parse(
+        localStorage.getItem(WORKSPACE_STORAGE_KEY) || "null"
+    );
+
+    const hasWorkspaceList =
+        Array.isArray(stored?.workspaces) &&
+        stored.workspaces.length > 0 &&
+        stored.workspaces.every(isWorkspaceMetadata);
+
+    const hasEmbeddedSnapshots =
+        hasWorkspaceList &&
+        stored.workspaces.some(
+            (workspace) =>
+                workspace.snapshot &&
+                typeof workspace.snapshot === "object"
+        );
+
+    // Current format:
+    // - only id / name / updatedAt for list keys
+    // - save snapshot in individual workspace key
+    if (
+        hasWorkspaceList &&
+        !hasEmbeddedSnapshots &&
+        typeof stored.activeWorkspaceId === "string"
+    ) {
+      workspaceStore = {
+        activeWorkspaceId: stored.workspaces.some(
+            (workspace) => workspace.id === stored.activeWorkspaceId
+        )
+            ? stored.activeWorkspaceId
+            : stored.workspaces[0].id,
+        workspaces: stored.workspaces.map((workspace) => ({
+          id: workspace.id,
+          name: workspace.name,
+          updatedAt: Number.isFinite(workspace.updatedAt)
+              ? workspace.updatedAt
+              : Date.now(),
+        })),
+      };
+      return;
+    }
+
+    // Previous multiple workspace format:
+    // Since the snapshot is embedded in the list data, move to the individual key.
+    if (hasWorkspaceList && hasEmbeddedSnapshots) {
+      const workspaces = stored.workspaces.map((workspace) => ({
+        id: workspace.id,
+        name: workspace.name,
+        updatedAt: Number.isFinite(workspace.updatedAt)
+            ? workspace.updatedAt
+            : Date.now(),
+      }));
+
+      for (const workspace of stored.workspaces) {
+        if (workspace.snapshot && typeof workspace.snapshot === "object") {
+          writeWorkspaceSnapshot(workspace.id, workspace.snapshot);
+        }
+      }
+
+      workspaceStore = {
+        activeWorkspaceId: workspaces.some(
+            (workspace) => workspace.id === stored.activeWorkspaceId
+        )
+            ? stored.activeWorkspaceId
+            : workspaces[0].id,
+        workspaces,
+      };
+      persistWorkspaceStore();
+      return;
+    }
+
+    // The earliest single workspace format.
+    const legacySnapshot = JSON.parse(
+        localStorage.getItem(LEGACY_WORKSPACE_STORAGE_KEY) || "null"
+    );
+    const defaultWorkspace = createWorkspace(DEFAULT_WORKSPACE_NAME);
+
+    writeWorkspaceSnapshot(defaultWorkspace.id, legacySnapshot);
+    workspaceStore = {
+      activeWorkspaceId: defaultWorkspace.id,
+      workspaces: [defaultWorkspace],
+    };
+    persistWorkspaceStore();
+  } catch (error) {
+    console.warn("Could not load workspaces:", error);
+
+    const defaultWorkspace = createWorkspace(DEFAULT_WORKSPACE_NAME);
+    writeWorkspaceSnapshot(defaultWorkspace.id, emptyWorkspaceSnapshot());
+    workspaceStore = {
+      activeWorkspaceId: defaultWorkspace.id,
+      workspaces: [defaultWorkspace],
+    };
+    persistWorkspaceStore();
+  }
+}
+
+function activeWorkspace() {
+  return workspaceStore?.workspaces.find(
+      (workspace) => workspace.id === workspaceStore.activeWorkspaceId
+  ) || null;
+}
+
+function renderWorkspaceTitle() {
+  const name = activeWorkspace()?.name || "DuckView";
+  appTitleEl.textContent = name;
+  appTitleEl.title = `Workspace: ${name}`;
+}
+
+function closeWorkspaceDialog(result = null) {
+  workspaceDialog.classList.remove("open");
+  workspaceDialogBackdrop.classList.remove("open");
+
+  const resolve = workspaceDialogResolve;
+  workspaceDialogResolve = null;
+  resolve?.(result);
+}
+
+function requestWorkspaceDialog({
+                                  title,
+                                  description,
+                                  confirmLabel,
+                                  initialValue = "",
+                                  needsName = false,
+                                }) {
+  return new Promise((resolve) => {
+    workspaceDialogResolve = resolve;
+    workspaceDialogTitle.textContent = title;
+    workspaceDialogDescription.textContent = description;
+    workspaceDialogConfirmBtn.textContent = confirmLabel;
+    workspaceDialogInputRow.classList.toggle("hidden", !needsName);
+    workspaceDialogInput.value = initialValue;
+
+    workspaceDialog.classList.add("open");
+    workspaceDialogBackdrop.classList.add("open");
+
+    requestAnimationFrame(() => {
+      if (needsName) {
+        workspaceDialogInput.focus();
+        workspaceDialogInput.select();
+      } else {
+        workspaceDialogConfirmBtn.focus();
+      }
+    });
+  });
+}
+
+function requestWorkspaceName(title, initialValue, confirmLabel) {
+  return requestWorkspaceDialog({
+    title,
+    description: "Enter a name for this workspace.",
+    confirmLabel,
+    initialValue,
+    needsName: true,
+  });
+}
+
+function confirmWorkspaceAction(title, description, confirmLabel) {
+  return requestWorkspaceDialog({
+    title,
+    description,
+    confirmLabel,
+    needsName: false,
+  });
+}
+
+function workspaceSnapshot() {
+  const parquetPaths = [];
+  const sqlTabs = [];
+  let activeTabRef = null;
+
+  for (const tab of tabs.values()) {
+    if (tab.kind === "parquet") {
+      parquetPaths.push(tab.path);
+
+      if (tab.id === activeTabId) {
+        activeTabRef = { kind: "parquet", path: tab.path };
+      }
+    } else if (tab.kind === "sql") {
+      const index = sqlTabs.length;
+      sqlTabs.push({
+        number: tab.number,
+        title: tab.title,
+        sql: tab.sql,
+        editorPaneHeight: tab.editorPaneHeight,
+      });
+
+      if (tab.id === activeTabId) {
+        activeTabRef = { kind: "sql", index };
+      }
+    }
+  }
+
+  return {
+    parquetPaths,
+    sqlTabs,
+    savedViews: Array.from(workspaceViews.values()),
+    activeTabRef,
+  };
+}
+
+function queueWorkspaceSave() {
+  if (isSwitchingWorkspace) return;
+
+  clearTimeout(workspaceSaveTimer);
+  workspaceSaveTimer = setTimeout(saveWorkspace, 600);
+}
+
+function saveWorkspace() {
+  if (isSwitchingWorkspace) return;
+
+  const workspace = activeWorkspace();
+  if (!workspace) return;
+
+  workspace.updatedAt = Date.now();
+  writeWorkspaceSnapshot(workspace.id, workspaceSnapshot());
+  persistWorkspaceStore();
+}
+
+async function saveWorkspaceAs() {
+  const name = await requestWorkspaceName(
+      "Save Workspace As",
+      `${activeWorkspace()?.name || "Workspace"} copy`,
+      "Save"
+  );
+  const trimmedName = name?.trim();
+
+  if (!trimmedName) return;
+
+  if (
+      workspaceStore.workspaces.some(
+          (workspace) =>
+              workspace.name.toLocaleLowerCase() === trimmedName.toLocaleLowerCase()
+      )
+  ) {
+    showToast("A workspace with that name already exists.");
+    return;
+  }
+
+  saveWorkspace();
+
+  const workspace = createWorkspace(trimmedName);
+  writeWorkspaceSnapshot(workspace.id, workspaceSnapshot());
+
+  workspaceStore.workspaces.push(workspace);
+  workspaceStore.activeWorkspaceId = workspace.id;
+  persistWorkspaceStore();
+  renderWorkspaceTitle();
+
+  showToast(`Workspace “${workspace.name}” created.`);
+}
+
+function resetWorkspaceUi() {
+  activeTabId = null;
+  currentPath = null;
+  fileMeta = null;
+  totalRows = 0;
+  sortState = null;
+  filterState = null;
+  truncated = false;
+  cache = new Map();
+  pending = new Set();
+  edits = new Map();
+  sqlCompletionTables = [];
+  sqlTableColumns.clear();
+  sqlTableColumnRequests.clear();
+
+  rows.innerHTML = "";
+  headerRow.innerHTML = "";
+  spacer.style.height = "0";
+  fileNameEl.textContent = "";
+  document.title = "DuckView";
+
+  emptyEl.classList.remove("hidden");
+  tableWrap.classList.add("hidden");
+  sqlWorkspace.classList.add("hidden");
+  statusBar.classList.add("hidden");
+  tabBar.classList.add("hidden");
+  metaBtn.classList.add("hidden");
+  advBtn.classList.add("hidden");
+
+  closeAdvanced();
+  closeMeta();
+}
+
+async function clearCurrentWorkspace() {
+  for (const viewName of Array.from(workspaceViews.keys())) {
+    await invoke("remove_duckdb_result_table", { tableName: viewName })
+        .catch(() => {});
+  }
+  workspaceViews.clear();
+
+  for (const tabId of Array.from(tabs.keys())) {
+    await closeTab(tabId);
+  }
+
+  tabs.clear();
+  tabIdByPath.clear();
+  resetWorkspaceUi();
+}
+
+async function switchWorkspace(workspaceId) {
+  if (workspaceId === workspaceStore.activeWorkspaceId) return;
+
+  const target = workspaceStore.workspaces.find(
+      (workspace) => workspace.id === workspaceId
+  );
+  if (!target) return;
+
+  saveWorkspace();
+  clearTimeout(workspaceSaveTimer);
+
+  isSwitchingWorkspace = true;
+  try {
+    await clearCurrentWorkspace();
+
+    workspaceStore.activeWorkspaceId = target.id;
+    persistWorkspaceStore();
+    renderWorkspaceTitle();
+
+    await restoreWorkspaceSnapshot(readWorkspaceSnapshot(target.id));
+  } finally {
+    isSwitchingWorkspace = false;
+  }
+
+  showToast(`Opened workspace “${target.name}”.`);
+}
+
+async function newWorkspace() {
+  const name = await requestWorkspaceName(
+      "New Workspace",
+      "Untitled Workspace",
+      "Create"
+  );
+  const trimmedName = name?.trim();
+
+  if (!trimmedName) return;
+
+  if (
+      workspaceStore.workspaces.some(
+          (workspace) =>
+              workspace.name.toLocaleLowerCase() === trimmedName.toLocaleLowerCase()
+      )
+  ) {
+    showToast("A workspace with that name already exists.");
+    return;
+  }
+
+  saveWorkspace();
+
+  const workspace = createWorkspace(trimmedName);
+  writeWorkspaceSnapshot(workspace.id, emptyWorkspaceSnapshot());
+  workspaceStore.workspaces.push(workspace);
+  persistWorkspaceStore();
+
+  await switchWorkspace(workspace.id);
+}
+
+async function deleteActiveWorkspace() {
+  const workspace = activeWorkspace();
+  if (!workspace) return;
+
+  const confirmed = await confirmWorkspaceAction(
+      "Delete Workspace",
+      `Delete workspace “${workspace.name}”? This does not delete source files.`,
+      "Delete"
+  );
+  if (!confirmed) return;
+
+  const index = workspaceStore.workspaces.findIndex(
+      (item) => item.id === workspace.id
+  );
+  workspaceStore.workspaces.splice(index, 1);
+
+  if (!workspaceStore.workspaces.length) {
+    const replacement = createWorkspace("Untitled Workspace");
+    workspaceStore.workspaces.push(replacement);
+    writeWorkspaceSnapshot(replacement.id, emptyWorkspaceSnapshot());
+  }
+
+  const nextWorkspace =
+      workspaceStore.workspaces[Math.min(index, workspaceStore.workspaces.length - 1)];
+
+  isSwitchingWorkspace = true;
+  try {
+    await clearCurrentWorkspace();
+
+    localStorage.removeItem(workspaceSnapshotStorageKey(workspace.id));
+    workspaceStore.activeWorkspaceId = nextWorkspace.id;
+    persistWorkspaceStore();
+    renderWorkspaceTitle();
+
+    await restoreWorkspaceSnapshot(readWorkspaceSnapshot(nextWorkspace.id));
+  } finally {
+    isSwitchingWorkspace = false;
+  }
+
+  showToast(`Workspace “${workspace.name}” deleted.`);
+}
+
+async function restoreWorkspace() {
+  loadWorkspaceStore();
+  renderWorkspaceTitle();
+
+  const workspace = activeWorkspace();
+  if (!workspace) {
+    resetWorkspaceUi();
+    return;
+  }
+
+  await restoreWorkspaceSnapshot(readWorkspaceSnapshot(workspace.id));
+}
+
+async function restoreWorkspaceSnapshot(saved) {
+  const snapshot = saved && typeof saved === "object"
+      ? saved
+      : emptyWorkspaceSnapshot();
+
+  const parquetPaths = Array.isArray(snapshot.parquetPaths)
+      ? snapshot.parquetPaths.filter((path) => typeof path === "string")
+      : [];
+  const savedViews = Array.isArray(snapshot.savedViews)
+      ? snapshot.savedViews
+      : [];
+  const sqlTabsSaved = Array.isArray(snapshot.sqlTabs)
+      ? snapshot.sqlTabs
+      : [];
+  const activeRef = snapshot.activeTabRef;
+
+  resetWorkspaceUi();
+
+  const parquetTabIds = new Map();
+  for (const path of parquetPaths) {
+    const exists = await invoke("parquet_file_exists", { path })
+        .catch(() => false);
+
+    if (!exists) {
+      const tab = createTab(path, missingParquetMeta(path));
+      tab.missing = true;
+      tab.missingError = "The file no longer exists at its saved location.";
+      tabs.set(tab.id, tab);
+      tabIdByPath.set(path, tab.id);
+      parquetTabIds.set(path, tab.id);
+      continue;
+    }
+
+    try {
+      const meta = await invoke("open_file", { path });
+      const tab = createTab(path, meta);
+      tabs.set(tab.id, tab);
+      tabIdByPath.set(path, tab.id);
+      parquetTabIds.set(path, tab.id);
+    } catch (error) {
+      const tab = createTab(path, missingParquetMeta(path));
+      tab.missing = true;
+      tab.missingError = String(error);
+      tabs.set(tab.id, tab);
+      tabIdByPath.set(path, tab.id);
+      parquetTabIds.set(path, tab.id);
+    }
+  }
+
+  for (const view of savedViews) {
+    if (
+        typeof view?.name !== "string" ||
+        !view.name.trim() ||
+        typeof view?.sql !== "string" ||
+        !view.sql.trim()
+    ) {
+      continue;
+    }
+
+    const restoredView = { name: view.name.trim(), sql: view.sql };
+    workspaceViews.set(restoredView.name, restoredView);
+
+    try {
+      await invoke("restore_duckdb_view", {
+        viewName: restoredView.name,
+        sql: restoredView.sql,
+      });
+    } catch (error) {
+      console.warn(`Could not restore view "${restoredView.name}":`, error);
+    }
+  }
+
+  const sqlTabIds = [];
+  for (const item of sqlTabsSaved) {
+    if (typeof item?.sql !== "string") continue;
+
+    const tab = createSqlTab();
+    tab.number = Number.isInteger(item.number) && item.number > 0
+        ? item.number
+        : tab.number;
+    tab.title = typeof item.title === "string" && item.title.trim()
+        ? item.title
+        : `SQL ${tab.number}`;
+    tab.sql = item.sql;
+    tab.editorPaneHeight =
+        Number.isFinite(item.editorPaneHeight) && item.editorPaneHeight >= 180
+            ? item.editorPaneHeight
+            : null;
+
+    tabs.set(tab.id, tab);
+    sqlTabIds.push(tab.id);
+  }
+
+  let tabToActivate = null;
+  if (activeRef?.kind === "parquet") {
+    tabToActivate = tabs.get(parquetTabIds.get(activeRef.path) || "");
+  } else if (
+      activeRef?.kind === "sql" &&
+      Number.isInteger(activeRef.index) &&
+      activeRef.index >= 0
+  ) {
+    tabToActivate = tabs.get(sqlTabIds[activeRef.index] || "");
+  }
+
+  tabToActivate =
+      tabToActivate ||
+      tabs.get(parquetTabIds.values().next().value || "") ||
+      tabs.get(sqlTabIds[0] || "");
+
+  if (tabToActivate) {
+    restoreTabState(tabToActivate);
+
+    if (tabToActivate.kind === "parquet" && !tabToActivate.missing) {
+      await loadPage(0, true);
+      renderRows();
+      updateStatus();
+    }
+  }
+}
+
+function missingParquetMeta(path) {
+  const file_name = path.split(/[\\/]/).pop() || path;
+  return {
+    path,
+    file_name,
+    file_size: 0,
+    num_rows: 0,
+    num_columns: 0,
+    num_row_groups: 0,
+    compression: "—",
+    created_by: null,
+    version: 0,
+    columns: [],
+  };
+}
 
 function createTab(path, meta) {
   return {
@@ -118,6 +863,8 @@ function createTab(path, meta) {
     kind: "parquet",
     path,
     meta,
+    missing: false,
+    missingError: null,
     colWidths: null,
     sortState: null,
     filterState: null,
@@ -131,20 +878,36 @@ function createTab(path, meta) {
   };
 }
 
+function nextSqlTabNumber() {
+  const usedNumbers = new Set(
+      Array.from(tabs.values())
+          .filter((tab) => tab.kind === "sql")
+          .map((tab) => tab.number)
+  );
+
+  let number = 1;
+  while (usedNumbers.has(number)) {
+    number += 1;
+  }
+
+  return number;
+}
+
 function createSqlTab() {
-  sqlTabNumber += 1;
+  const number = nextSqlTabNumber();
 
   return {
     id: `sql-${Date.now()}-${Math.random().toString(36).slice(2)}`,
     kind: "sql",
-    number: sqlTabNumber,
-    title: `SQL ${sqlTabNumber}`,
+    number,
+    title: `SQL ${number}`,
     sql: "SELECT 1;",
     error: null,
     results: new Map(),
     activeResultKey: null,
     nextResultNumber: 1,
     resultStatus: "Run a query to see results.",
+    editorPaneHeight: null,
   };
 }
 
@@ -154,6 +917,10 @@ function sqlIdentifier(fileName) {
       .replace(/[^A-Za-z0-9_]/g, "_")
       .replace(/^[^A-Za-z_]/, "_")
       .toLowerCase();
+}
+
+function quoteSqlIdentifier(identifier) {
+  return `"${String(identifier).replace(/"/g, '""')}"`;
 }
 
 function sqlStatementAtCursor(sql, cursor) {
@@ -214,25 +981,458 @@ function sqlStatementAtCursor(sql, cursor) {
     }
   }
 
-  if (start < sql.length || !statements.length) {
+  if (start < sql.length) {
     statements.push({ start, end: sql.length });
   }
 
-  const statementIndex = statements.findIndex(
-      (statement, index) =>
+  if (!statements.length) {
+    return {
+      sql: "",
+      number: 1,
+      count: 0,
+    };
+  }
+
+  let statementIndex = statements.findIndex(
+      (statement) =>
           cursor >= statement.start &&
-          (cursor <= statement.end || index === statements.length - 1)
+          cursor <= statement.end
   );
 
-  const index = statementIndex >= 0 ? statementIndex : statements.length - 1;
-  const statement = statements[index];
+  if (statementIndex < 0) {
+    for (let index = statements.length - 1; index >= 0; index--) {
+      const statement = statements[index];
+
+      if (statement.end >= cursor) continue;
+
+      const gap = sql.slice(statement.end + 1, cursor);
+      if (!gap.trim()) {
+        statementIndex = index;
+        break;
+      }
+    }
+  }
+
+  if (statementIndex < 0) {
+    statementIndex = statements.findIndex(
+        (statement) => statement.start > cursor
+    );
+  }
+
+  if (statementIndex < 0) {
+    statementIndex = statements.length - 1;
+  }
+
+  const statement = statements[statementIndex];
   const text = sql.slice(statement.start, statement.end).trim();
 
   return {
     sql: text,
-    number: index + 1,
+    number: statementIndex + 1,
     count: statements.length,
   };
+}
+
+function isDarkSqlTheme() {
+  if (settings.theme === "dark") return true;
+  if (settings.theme === "light") return false;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches;
+}
+
+function sqlEditorThemeName() {
+  return isDarkSqlTheme() ? "duckview-dark" : "duckview-light";
+}
+
+function syncSqlEditorTheme() {
+  monacoApi.editor.setTheme(sqlEditorThemeName());
+}
+
+function sqlEditorValue() {
+  return sqlEditor ? sqlEditor.getValue() : "";
+}
+
+function sqlCursorOffset() {
+  if (!sqlEditor) return 0;
+
+  const position = sqlEditor.getPosition();
+  const model = sqlEditor.getModel();
+  return position && model ? model.getOffsetAt(position) : 0;
+}
+
+function setSqlEditorValue(value) {
+  const sql = String(value ?? "");
+
+  if (!sqlEditor) {
+    pendingSqlEditorValue = sql;
+    return;
+  }
+
+  if (sqlEditor.getValue() !== sql) {
+    sqlEditor.setValue(sql);
+  }
+}
+
+function completionInsertText(tableName) {
+  return /^[A-Za-z_][A-Za-z0-9_$]*$/.test(tableName)
+      ? tableName
+      : quoteSqlIdentifier(tableName);
+}
+
+function unquoteSqlIdentifier(value) {
+  const text = String(value || "").trim();
+
+  if (
+      text.length >= 2 &&
+      ((text.startsWith('"') && text.endsWith('"')) ||
+          (text.startsWith("`") && text.endsWith("`")))
+  ) {
+    return text.slice(1, -1).replace(/""/g, '"').replace(/``/g, "`");
+  }
+
+  return text;
+}
+
+function findSqlCompletionTable(name) {
+  const normalized = unquoteSqlIdentifier(name).toLowerCase();
+
+  return sqlCompletionTables.find(
+      (table) => table.name.toLowerCase() === normalized,
+  ) || null;
+}
+
+async function getSqlTableColumns(tableName) {
+  const table = findSqlCompletionTable(tableName);
+
+  if (!table) {
+    return [];
+  }
+
+  if (sqlTableColumns.has(table.name)) {
+    return sqlTableColumns.get(table.name);
+  }
+
+  if (!sqlTableColumnRequests.has(table.name)) {
+    const request = invoke("get_duckdb_table_columns", {
+      tableName: table.name,
+    })
+        .then((columns) => {
+          sqlTableColumns.set(table.name, columns);
+          return columns;
+        })
+        .catch((error) => {
+          console.warn(
+              `Could not load columns for "${table.name}":`,
+              error,
+          );
+          return [];
+        })
+        .finally(() => {
+          sqlTableColumnRequests.delete(table.name);
+        });
+
+    sqlTableColumnRequests.set(table.name, request);
+  }
+
+  return sqlTableColumnRequests.get(table.name);
+}
+
+function sqlAliasesFromEntities(entities, sql) {
+  const aliases = new Map();
+
+  for (const entity of entities || []) {
+    if (entity.entityContextType !== "table") {
+      continue;
+    }
+
+    const tableName = unquoteSqlIdentifier(entity.text);
+    const alias = unquoteSqlIdentifier(entity._alias?.text);
+
+    if (findSqlCompletionTable(tableName)) {
+      aliases.set(tableName.toLowerCase(), tableName);
+
+      if (alias) {
+        aliases.set(alias.toLowerCase(), tableName);
+      }
+    }
+  }
+
+  const relationPattern =
+      /\b(?:from|join)\s+("[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_$]*)(?:\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_$]*))?/gi;
+
+  for (const match of sql.matchAll(relationPattern)) {
+    const tableName = unquoteSqlIdentifier(match[1]);
+    const alias = match[2];
+
+    if (!findSqlCompletionTable(tableName)) {
+      continue;
+    }
+
+    aliases.set(tableName.toLowerCase(), tableName);
+
+    if (
+        alias &&
+        !["where", "join", "left", "right", "inner", "full", "on", "group",
+          "order", "limit", "having", "union"].includes(alias.toLowerCase())
+    ) {
+      aliases.set(alias.toLowerCase(), tableName);
+    }
+  }
+
+  return aliases;
+}
+
+function sqlColumnCompletionItems(columns, tableName) {
+  return columns.map((column) => ({
+    label: column.name,
+    kind: monacoApi.languages.CompletionItemKind.Field,
+    insertText: completionInsertText(column.name),
+    detail: `${tableName} · ${column.type}`,
+    sortText: `0_${column.name}`,
+  }));
+}
+
+function sqlCompletionService(
+    model,
+    position,
+    _context,
+    suggestions,
+    entities,
+    snippets,
+) {
+  const sql = model.getValue();
+  const cursorOffset = model.getOffsetAt(position);
+  const beforeCursor = sql.slice(0, cursorOffset);
+
+  const qualifierMatch =
+      /(?:"([^"]+)"|`([^`]+)`|([A-Za-z_][A-Za-z0-9_$]*))\.\s*[A-Za-z0-9_$]*$/
+          .exec(beforeCursor);
+
+  if (qualifierMatch) {
+    const qualifier =
+        qualifierMatch[1] || qualifierMatch[2] || qualifierMatch[3];
+    const aliases = sqlAliasesFromEntities(entities, sql);
+    const tableName = aliases.get(qualifier.toLowerCase());
+
+    if (!tableName) {
+      return Promise.resolve([]);
+    }
+
+    return getSqlTableColumns(tableName).then((columns) =>
+        sqlColumnCompletionItems(columns, tableName)
+    );
+  }
+
+  const tableContext =
+      /(?:\bfrom|\bjoin)\s+(?:"[^"]*"|`[^`]*`|[A-Za-z_][A-Za-z0-9_$]*)?$/i
+          .test(beforeCursor);
+
+  const tableItems = tableContext
+      ? sqlCompletionTables.map((table) => ({
+        label: table.name,
+        kind: monacoApi.languages.CompletionItemKind.Struct,
+        insertText: completionInsertText(table.name),
+        detail: table.is_view ? "DuckDB view" : "Open data table",
+        sortText: `0_${table.name}`,
+      }))
+      : [];
+
+  const keywordItems = (suggestions?.keywords || []).map((keyword) => ({
+    label: keyword,
+    kind: monacoApi.languages.CompletionItemKind.Keyword,
+    detail: "SQL keyword",
+    sortText: `1_${keyword}`,
+  }));
+
+  const snippetItems = (snippets || []).map((snippet) => ({
+    label: snippet.label || snippet.prefix,
+    kind: monacoApi.languages.CompletionItemKind.Snippet,
+    insertText: snippet.insertText,
+    insertTextRules:
+    monacoApi.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+    detail: snippet.description || "SQL snippet",
+    sortText: `2_${snippet.prefix}`,
+  }));
+
+  return Promise.resolve([
+    ...tableItems,
+    ...keywordItems,
+    ...snippetItems,
+  ]);
+}
+
+function initSqlEditor() {
+  const createEditor = () => {
+    const monaco = monacoApi;
+
+    monaco.editor.defineTheme("duckview-light", {
+      base: "vs",
+      inherit: true,
+      colors: {
+        "editor.background": "#FFFFFF",
+        "editor.foreground": "#1C1D21",
+        "editor.lineHighlightBackground": "#F5F6F8",
+        "editorLineNumber.foreground": "#9A9EA9",
+        "editorLineNumber.activeForeground": "#EA810D",
+        "editorCursor.foreground": "#EA810D",
+        "editor.selectionBackground": "#D3EA6A66",
+        "editor.inactiveSelectionBackground": "#3A748533",
+        "editorSuggestWidget.background": "#FFFFFF",
+        "editorSuggestWidget.border": "#D0D3DC",
+        "editorSuggestWidget.selectedBackground": "#EAEEFF",
+      },
+      rules: [
+        { token: "predefined", foreground: "0F766E", fontStyle: "bold" },
+        { token: "predefined.sql", foreground: "0F766E", fontStyle: "bold" },
+        { token: "string.sql", foreground: "087443" },
+        { token: "number", foreground: "A04E00" },
+        { token: "number.sql", foreground: "A04E00" },
+        { token: "comment", foreground: "7A7F8A", fontStyle: "italic" },
+        { token: "comment.sql", foreground: "7A7F8A", fontStyle: "italic" },
+      ],
+    });
+
+    monaco.editor.defineTheme("duckview-dark", {
+      base: "vs-dark",
+      inherit: true,
+      colors: {
+        "editor.background": "#26272C",
+        "editor.foreground": "#E8E9EC",
+        "editor.lineHighlightBackground": "#2C2E35",
+        "editorLineNumber.foreground": "#6F7480",
+        "editorLineNumber.activeForeground": "#FFA06D",
+        "editorCursor.foreground": "#FFA06D",
+        "editor.selectionBackground": "#4395A880",
+        "editor.inactiveSelectionBackground": "#43A8A04D",
+        "editorSuggestWidget.background": "#26272C",
+        "editorSuggestWidget.border": "#3F424B",
+        "editorSuggestWidget.selectedBackground": "#2A2F4A",
+      },
+      "rules": [
+        { token: 'type', foreground: '#577D99' },
+        { token: 'type.sql', foreground: '#577D99' },
+        { token: "predefined", foreground: "#7686A4", fontStyle: "bold" },
+        { token: "predefined.sql", foreground: "#7686A4", fontStyle: "bold" },
+        { token: 'keyword', foreground: '#acb3bc' },
+        { token: 'keyword.sql', foreground: '#acb3bc' },
+        { token: "string", foreground: "#83A0B7" },
+        { token: "string.sql", foreground: "#83A0B7" },
+        { token: "number", foreground: "#FFC66D" },
+        { token: "number.sql", foreground: "#FFC66D" },
+        { token: "comment", foreground: "#8C919E", fontStyle: "italic" },
+        { token: "comment.sql", foreground: "#8C919E", fontStyle: "italic" },
+        { token: 'operator', foreground: '#7E5151FF', fontStyle: "bold" },
+        { token: 'operator.sql', foreground: '#7E5151FF', fontStyle: "bold" }
+      ],
+    });
+
+    const languageReady = monaco.languages.onLanguage(
+      LanguageIdEnum.GENERIC,
+      () => {
+        console.warn("DTStack Generic SQL language loaded.");
+
+        setupLanguageFeatures(LanguageIdEnum.GENERIC, {
+          completionItems: {
+            enable: true,
+            triggerCharacters: [" ", "."],
+            completionService: sqlCompletionService,
+          },
+          diagnostics: false,
+          definitions: false,
+          references: false,
+          hover: false,
+        });
+
+        languageReady.dispose();
+      },
+    );
+
+    sqlEditor = monaco.editor.create(sqlEditorEl, {
+      value: pendingSqlEditorValue || "SELECT 1;",
+      language: LanguageIdEnum.GENERIC,
+      theme: sqlEditorThemeName(),
+      automaticLayout: true,
+      fixedOverflowWidgets: true,
+      fontFamily: "var(--mono)",
+      fontSize: 12,
+      lineHeight: 19,
+      minimap: { enabled: false },
+      scrollBeyondLastLine: false,
+      tabSize: 2,
+      insertSpaces: true,
+      wordWrap: "on",
+      quickSuggestions: {
+        other: true,
+        comments: false,
+        strings: false,
+      },
+      suggestOnTriggerCharacters: true,
+      padding: {
+        top: 12,
+        bottom: 12,
+      },
+    });
+
+    pendingSqlEditorValue = null;
+
+    sqlEditor.onDidChangeModelContent(() => {
+      const tab = activeTab();
+      if (tab?.kind === "sql") {
+        tab.sql = sqlEditor.getValue();
+        queueWorkspaceSave();
+      }
+    });
+
+    sqlEditor.addAction({
+      id: "duckview.run-sql",
+      label: "Run SQL at Cursor",
+      keybindings: [
+        monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter,
+      ],
+      run: () => runSql(),
+    });
+
+    sqlEditor.addAction({
+      id: "duckview.trigger-sql-completion",
+      label: "Trigger SQL Completion",
+      keybindings: [
+        monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyI,
+      ],
+      run: () => {
+        sqlEditor.focus();
+
+        const model = sqlEditor.getModel();
+        const action = sqlEditor.getAction("editor.action.triggerSuggest");
+
+        console.warn("SQL completion diagnostics:", {
+          modelLanguageId: model?.getLanguageId(),
+          expectedLanguageId: LanguageIdEnum.GENERIC,
+          modelUri: model?.uri.toString(),
+          hasSuggestAction: Boolean(action),
+          registeredGenericLanguage: monaco.languages
+              .getLanguages()
+              .some((language) => language.id === LanguageIdEnum.GENERIC),
+        });
+
+        if (!action) {
+          console.warn("Monaco Suggest action is unavailable.");
+          return;
+        }
+
+        Promise.resolve(action.run())
+            .then(() => console.warn("Monaco Suggest action completed."))
+            .catch((error) =>
+                console.warn("Monaco Suggest action failed:", error)
+            );
+      },
+    });
+
+    const tab = activeTab();
+    if (tab?.kind === "sql") {
+      setSqlEditorValue(tab.sql);
+    }
+  };
+
+  createEditor();
 }
 
 function sqlUsesDynamicResultShape(sql) {
@@ -245,16 +1445,15 @@ function sqlUsesDynamicResultShape(sql) {
   return false;
 }
 
-function runSql() {
+function runSql(sqlOverride = null, existingViewName = null) {
   const tab = activeTab();
-  if (!tab || tab.kind !== "sql") return;
+  if (!tab || tab.kind !== "sql" || !sqlEditor) return;
 
-  tab.sql = sqlInput.value;
+  tab.sql = sqlEditorValue();
 
-  const statement = sqlStatementAtCursor(
-      tab.sql,
-      sqlInput.selectionStart
-  );
+  const statement = sqlOverride
+      ? { sql: sqlOverride, number: 1, count: 1 }
+      : sqlStatementAtCursor(tab.sql, sqlCursorOffset());
 
   if (!statement.sql) {
     tab.error = "Place your cursor on the SQL statement you want to execute.";
@@ -264,23 +1463,24 @@ function runSql() {
   }
 
   const resultNumber = tab.nextResultNumber++;
+  const viewName = existingViewName || `_${Date.now()}`;
   const resultKey =
       `result-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const result = {
     id: resultKey,
     number: resultNumber,
-    title: `Result ${resultNumber}`,
+    title: viewName,
     sql: statement.sql,
     queryId: null,
-    tableName: null,
+    tableName: existingViewName || null,
     columns: null,
     rows: null,
     offset: 0,
     hasMore: false,
     error: null,
     closed: false,
-    transientOnly: sqlUsesDynamicResultShape(statement.sql),
-    status: `Result ${resultNumber} is running…`,
+    transientOnly: false,
+    status: `${viewName} is running…`,
   };
 
   tab.results.set(resultKey, result);
@@ -312,8 +1512,8 @@ function runSql() {
       result.offset = page.offset;
       result.hasMore = page.has_more;
       result.status = page.rows.length
-          ? `Showing rows 1–${page.rows.length}${page.has_more ? "+" : ""} · Saving table…`
-          : "No rows returned · Saving table…";
+          ? `Showing rows 1–${page.rows.length}${page.has_more ? "+" : ""}`
+          : "No rows returned.";
 
       if (activeTabId === tab.id && tab.activeResultKey === resultKey) {
         renderSqlResultTabs(tab);
@@ -326,10 +1526,10 @@ function runSql() {
         render: Math.round(renderedAt - rowsAt),
       });
 
-      if (result.transientOnly) {
+      if (existingViewName) {
         result.status = page.rows.length
-            ? `Showing rows 1–${page.rows.length}${page.hasMore ? "+" : ""} · Temporary result`
-            : "No rows returned · Temporary result";
+            ? `${existingViewName}: showing rows 1–${page.rows.length}${page.hasMore ? "+" : ""}`
+            : `${existingViewName}: no rows returned.`;
 
         if (activeTabId === tab.id && tab.activeResultKey === resultKey) {
           renderSqlResultTabs(tab);
@@ -338,47 +1538,40 @@ function runSql() {
         return;
       }
 
-      const tableName = `sql_${tab.number}_result_${result.number}`;
+      const tableName = viewName;
 
       try {
-        const table = await invoke("register_duckdb_query_as_table", {
+        const savedView = await invoke("register_duckdb_query_as_table", {
           queryId: result.queryId,
           tableName,
         });
-        const materializedAt = performance.now();
-        console.info("SQL result-table timing (ms)", {
-          createTempTable: Math.round(materializedAt - renderedAt),
-          total: Math.round(materializedAt - startedAt),
+
+        result.tableName = savedView.name;
+        workspaceViews.set(savedView.name, {
+          name: savedView.name,
+          sql: result.sql,
         });
+        queueWorkspaceSave();
 
-        result.tableName = table.name;
         result.status = page.rows.length
-            ? `${table.name}: showing rows 1–${page.rows.length}${page.has_more ? "+" : ""}`
-            : `${table.name}: no rows returned.`;
+            ? `${savedView.name}: showing rows 1–${page.rows.length}${page.hasMore ? "+" : ""}`
+            : `${savedView.name}: no rows returned.`;
 
-        if (result.closed) {
-          await invoke("remove_duckdb_result_table", {
-            tableName: result.tableName,
-          });
-          return;
-        }
+        queueWorkspaceSave();
 
         if (activeTab()?.kind === "sql") {
           await renderSqlTables();
         }
 
-        if (activeTabId !== tab.id || tab.activeResultKey !== resultKey) {
-          return;
+        if (activeTabId === tab.id && tab.activeResultKey === resultKey) {
+          renderSqlResultTabs(tab);
+          renderActiveSqlResult(tab);
         }
-
-        renderSqlResultTabs(tab);
-        renderActiveSqlResult(tab);
       } catch (error) {
         result.status = page.rows.length
-            ? `Showing rows 1–${page.rows.length}${page.hasMore ? "+" : ""} · Table save failed.`
-            : "No rows returned · Table save failed.";
+            ? `Showing rows 1–${page.rows.length}${page.has_more ? "+" : ""} · View creation failed.`
+            : "No rows returned · View creation failed.";
         result.tableError = String(error);
-        showToast(`Could not add ${tableName} to Views: ${error}`);
 
         if (activeTabId === tab.id && tab.activeResultKey === resultKey) {
           renderActiveSqlResult(tab);
@@ -402,11 +1595,6 @@ function runSql() {
   })();
 }
 
-sqlInput.addEventListener("input", () => {
-  const tab = activeTab();
-  if (tab?.kind === "sql") tab.sql = sqlInput.value;
-});
-
 function openExportFormatDialog() {
   const tab = activeTab();
   const result = activeSqlResult(tab);
@@ -425,6 +1613,7 @@ function closeExportFormatDialog() {
 function openCsvImportDialog(path) {
   pendingCsvImportPath = path;
   csvImportPath.textContent = path;
+  csvImportEncoding.value = "utf-8";
   csvImportWin.classList.add("open");
   exportFormatBackdrop.classList.add("open");
   csvImportSaveBtn.focus();
@@ -440,12 +1629,19 @@ async function saveCsvAsParquet() {
   const csvPath = pendingCsvImportPath;
   if (!csvPath) return;
 
-  closeCsvImportDialog();
+  const encoding = csvImportEncoding.value;
   setLoading(true, "Converting CSV to Parquet…");
 
   try {
-    const parquetPath = await invoke("import_csv_as_parquet", { path: csvPath });
-    if (parquetPath) await openParquetPath(parquetPath);
+    const parquetPath = await invoke("import_csv_as_parquet", {
+      path: csvPath,
+      encoding,
+    });
+
+    if (parquetPath) {
+      closeCsvImportDialog();
+      await openParquetPath(parquetPath);
+    }
   } catch (error) {
     showToast("Couldn’t import CSV: " + error);
   } finally {
@@ -506,6 +1702,7 @@ async function exportSql(format) {
 sqlExportBtn.addEventListener("click", openExportFormatDialog);
 exportParquetBtn.addEventListener("click", () => exportSql("parquet"));
 exportCsvBtn.addEventListener("click", () => exportSql("csv"));
+exportExcelCsvBtn.addEventListener("click", () => exportSql("csv_excel"));
 exportFormatClose.addEventListener("click", closeExportFormatDialog);
 exportFormatBackdrop.addEventListener("click", () => {
   closeExportFormatDialog();
@@ -515,13 +1712,34 @@ csvImportClose.addEventListener("click", closeCsvImportDialog);
 csvImportCancelBtn.addEventListener("click", closeCsvImportDialog);
 csvImportSaveBtn.addEventListener("click", saveCsvAsParquet);
 
-function openAppMenu() {
-  appMenu.classList.remove("hidden");
-  appMenuBackdrop.classList.add("open");
-}
 function closeAppMenu() {
   appMenu.classList.add("hidden");
   appMenuBackdrop.classList.remove("open");
+}
+
+function renderWorkspaceMenu() {
+  menuWorkspaceList.innerHTML = "";
+
+  for (const workspace of workspaceStore?.workspaces || []) {
+    const button = document.createElement("button");
+    button.className =
+        `app-menu-workspace${workspace.id === workspaceStore.activeWorkspaceId ? " active" : ""}`;
+    button.type = "button";
+    button.textContent = workspace.name;
+    button.title = `Open workspace “${workspace.name}”`;
+    button.addEventListener("click", async () => {
+      closeAppMenu();
+      await switchWorkspace(workspace.id);
+    });
+
+    menuWorkspaceList.appendChild(button);
+  }
+}
+
+function openAppMenu() {
+  renderWorkspaceMenu();
+  appMenu.classList.remove("hidden");
+  appMenuBackdrop.classList.add("open");
 }
 
 appMenuBtn.addEventListener("click", () => {
@@ -533,9 +1751,50 @@ menuOpenBtn.addEventListener("click", () => {
   closeAppMenu();
   pickFile();
 });
+menuNewWorkspaceBtn.addEventListener("click", async () => {
+  closeAppMenu();
+  await newWorkspace();
+});
+menuSaveWorkspaceAsBtn.addEventListener("click", async () => {
+  closeAppMenu();
+  await saveWorkspaceAs();
+});
+menuDeleteWorkspaceBtn.addEventListener("click", async () => {
+  closeAppMenu();
+  await deleteActiveWorkspace();
+});
 menuSettingsBtn.addEventListener("click", () => {
   closeAppMenu();
   openSettings();
+});
+
+workspaceDialogClose.addEventListener("click", () => closeWorkspaceDialog());
+workspaceDialogCancelBtn.addEventListener("click", () => closeWorkspaceDialog());
+workspaceDialogBackdrop.addEventListener("click", () => closeWorkspaceDialog());
+workspaceDialogConfirmBtn.addEventListener("click", () => {
+  const nameRequired = !workspaceDialogInputRow.classList.contains("hidden");
+
+  if (nameRequired) {
+    const name = workspaceDialogInput.value.trim();
+    if (!name) {
+      workspaceDialogInput.focus();
+      return;
+    }
+    closeWorkspaceDialog(name);
+    return;
+  }
+
+  closeWorkspaceDialog(true);
+});
+workspaceDialogInput.addEventListener("keydown", (event) => {
+  if (event.isComposing || event.keyCode === 229) {
+    return;
+  }
+
+  if (event.key === "Enter") {
+    event.preventDefault();
+    workspaceDialogConfirmBtn.click();
+  }
 });
 
 function activeTab() {
@@ -577,19 +1836,19 @@ function restoreParquetTab(tab) {
   sortState = tab.sortState;
   filterState = tab.filterState;
   truncated = tab.truncated;
-  totalRows = tab.totalRows;
+  totalRows = tab.missing ? 0 : tab.totalRows;
   cache = tab.cache;
   pending = tab.pending;
   edits = tab.edits;
   viewToken = tab.viewToken;
 
-  document.title = `DuckView — ${fileMeta.file_name}`;
+  document.title = `DuckView — ${fileMeta.file_name}${tab.missing ? " (Missing)" : ""}`;
   emptyEl.classList.add("hidden");
   sqlWorkspace.classList.add("hidden");
   tableWrap.classList.remove("hidden");
   statusBar.classList.remove("hidden");
   metaBtn.classList.remove("hidden");
-  advBtn.classList.remove("hidden");
+  advBtn.classList.toggle("hidden", tab.missing);
   tabBar.classList.remove("hidden");
 
   syncAdvancedUiFromFilterState();
@@ -600,7 +1859,7 @@ function restoreParquetTab(tab) {
 
   requestAnimationFrame(() => {
     viewport.scrollTop = tab.scrollTop;
-    renderRows();
+    if (!tab.missing) renderRows();
     updateStatus();
   });
 }
@@ -619,8 +1878,10 @@ function restoreSqlTab(tab) {
   sqlWorkspace.classList.remove("hidden");
   tabBar.classList.remove("hidden");
 
+  applySqlPaneHeight(tab);
+
   sqlTitle.textContent = tab.title;
-  sqlInput.value = tab.sql;
+  setSqlEditorValue(tab.sql);
   sqlError.textContent = "";
   sqlError.classList.add("hidden");
 
@@ -628,6 +1889,111 @@ function restoreSqlTab(tab) {
 
   renderSqlResultTabs(tab);
   renderActiveSqlResult(tab);
+
+  requestAnimationFrame(() => {
+    applySqlPaneHeight(tab);
+    sqlEditor?.focus();
+  });
+}
+
+function applySqlPaneHeight(tab) {
+  if (!tab?.editorPaneHeight) {
+    sqlWorkspace.style.removeProperty("grid-template-rows");
+    return;
+  }
+
+  const splitterHeight = sqlPaneSplitter.offsetHeight || 8;
+  const maxHeight = Math.max(
+      180,
+      sqlWorkspace.clientHeight - splitterHeight - 180
+  );
+  const height = Math.min(
+      maxHeight,
+      Math.max(180, Math.round(tab.editorPaneHeight))
+  );
+
+  tab.editorPaneHeight = height;
+  sqlWorkspace.style.gridTemplateRows =
+      `${height}px ${splitterHeight}px minmax(180px, 1fr)`;
+}
+
+function beginSqlPaneResize(event) {
+  const tab = activeTab();
+  if (!tab || tab.kind !== "sql") return;
+
+  event.preventDefault();
+  sqlPaneResizeState = {
+    pointerId: event.pointerId,
+    startY: event.clientY,
+    startHeight: sqlEditorPane.getBoundingClientRect().height,
+  };
+
+  sqlPaneSplitter.setPointerCapture(event.pointerId);
+  document.body.classList.add("resizing-sql-pane");
+}
+
+function resizeSqlPane(event) {
+  if (!sqlPaneResizeState || event.pointerId !== sqlPaneResizeState.pointerId) {
+    return;
+  }
+
+  const tab = activeTab();
+  if (!tab || tab.kind !== "sql") return;
+
+  tab.editorPaneHeight =
+      sqlPaneResizeState.startHeight + event.clientY - sqlPaneResizeState.startY;
+  applySqlPaneHeight(tab);
+}
+
+function finishSqlPaneResize(event) {
+  if (!sqlPaneResizeState || event.pointerId !== sqlPaneResizeState.pointerId) {
+    return;
+  }
+
+  sqlPaneResizeState = null;
+  document.body.classList.remove("resizing-sql-pane");
+
+  if (sqlPaneSplitter.hasPointerCapture(event.pointerId)) {
+    sqlPaneSplitter.releasePointerCapture(event.pointerId);
+  }
+
+  queueWorkspaceSave();
+}
+
+async function removeWorkspaceView(viewName) {
+  try {
+    await invoke("remove_duckdb_result_table", {
+      tableName: viewName,
+    });
+  } catch (error) {
+    showToast(`Could not remove ${viewName}: ${error}`);
+    return;
+  }
+
+  workspaceViews.delete(viewName);
+
+  for (const tab of tabs.values()) {
+    if (tab.kind !== "sql") continue;
+
+    for (const [resultKey, result] of tab.results) {
+      if (result.tableName !== viewName) continue;
+
+      result.closed = true;
+      tab.results.delete(resultKey);
+
+      if (tab.activeResultKey === resultKey) {
+        tab.activeResultKey = Array.from(tab.results.keys()).at(-1) || null;
+      }
+    }
+  }
+
+  queueWorkspaceSave();
+
+  if (activeTab()?.kind === "sql") {
+    await renderSqlTables();
+    renderSqlResultTabs(activeTab());
+    renderActiveSqlResult(activeTab());
+  }
 }
 
 async function renderSqlTables() {
@@ -636,6 +2002,7 @@ async function renderSqlTables() {
 
   try {
     const tables = await invoke("list_duckdb_tables");
+    sqlCompletionTables = tables;
 
     if (activeTab()?.kind !== "sql") return;
 
@@ -672,10 +2039,66 @@ async function renderSqlTables() {
         button.className = "sql-table-item";
         button.type = "button";
         button.textContent = table.name;
-        button.title = `${table.name}\n${table.path}`;
 
-        button.addEventListener("click", () => insertSqlText(table.name));
-        sqlTables.appendChild(button);
+        const savedView = table.is_view
+            ? workspaceViews.get(table.name)
+            : null;
+        button.title = savedView
+            ? `View: ${table.name}\n\n${savedView.sql}`
+            : `${table.name}\n${table.path}`;
+
+        let singleClickTimer = null;
+
+        button.addEventListener("click", () => {
+          clearTimeout(singleClickTimer);
+
+          singleClickTimer = setTimeout(() => {
+            singleClickTimer = null;
+
+            if (table.is_view) {
+              void openViewResult(table.name);
+              return;
+            }
+
+            const parquetTabId = tabIdByPath.get(table.path);
+            if (parquetTabId) {
+              switchTab(parquetTabId);
+            } else {
+              showToast(`The source tab for "${table.name}" is no longer open.`);
+            }
+          }, 220);
+        });
+
+        button.addEventListener("dblclick", (event) => {
+          event.preventDefault();
+          clearTimeout(singleClickTimer);
+          singleClickTimer = null;
+
+          insertSqlText(completionInsertText(table.name));
+        });
+
+        if (!table.is_view) {
+          sqlTables.appendChild(button);
+          continue;
+        }
+
+        const viewItem = document.createElement("div");
+        viewItem.className = "sql-view-item";
+        viewItem.appendChild(button);
+
+        const remove = document.createElement("button");
+        remove.className = "sql-view-remove";
+        remove.type = "button";
+        remove.textContent = "×";
+        remove.title = `Delete view ${table.name}`;
+        remove.setAttribute("aria-label", `Delete view ${table.name}`);
+        remove.addEventListener("click", (event) => {
+          event.stopPropagation();
+          void removeWorkspaceView(table.name);
+        });
+
+        viewItem.appendChild(remove);
+        sqlTables.appendChild(viewItem);
       }
     };
 
@@ -689,13 +2112,22 @@ async function renderSqlTables() {
 
 function insertSqlText(text) {
   const tab = activeTab();
-  if (!tab || tab.kind !== "sql") return;
+  if (!tab || tab.kind !== "sql" || !sqlEditor) return;
 
-  const start = sqlInput.selectionStart;
-  const end = sqlInput.selectionEnd;
-  sqlInput.setRangeText(text, start, end, "end");
-  tab.sql = sqlInput.value;
-  sqlInput.focus();
+  const selection = sqlEditor.getSelection();
+  if (!selection) return;
+
+  sqlEditor.executeEdits("duckview-insert-table-name", [
+    {
+      range: selection,
+      text,
+      forceMoveMarkers: true,
+    },
+  ]);
+
+  tab.sql = sqlEditorValue();
+  queueWorkspaceSave();
+  sqlEditor.focus();
 }
 
 function selectSqlResult(tab, key) {
@@ -712,27 +2144,44 @@ function activeSqlResult(tab) {
   return tab.results.get(tab.activeResultKey) || null;
 }
 
-async function closeAllSqlResults(tab) {
-  const results = Array.from(tab.results.values());
+function findOpenResultForView(viewName) {
+  for (const tab of tabs.values()) {
+    if (tab.kind !== "sql") continue;
 
-  for (const result of results) {
+    for (const [resultKey, result] of tab.results) {
+      if (!result.closed && result.tableName === viewName) {
+        return { tab, resultKey };
+      }
+    }
+  }
+
+  return null;
+}
+
+async function openViewResult(viewName) {
+  const existing = findOpenResultForView(viewName);
+
+  if (existing) {
+    if (activeTabId !== existing.tab.id) {
+      switchTab(existing.tab.id);
+    }
+    selectSqlResult(existing.tab, existing.resultKey);
+    return;
+  }
+
+  runSql(
+      `SELECT * FROM ${quoteSqlIdentifier(viewName)}`,
+      viewName
+  );
+}
+
+async function closeAllSqlResults(tab) {
+  for (const result of tab.results.values()) {
     result.closed = true;
   }
 
   tab.results.clear();
   tab.activeResultKey = null;
-
-  await Promise.all(
-      results
-          .filter((result) => result.tableName)
-          .map((result) =>
-              invoke("remove_duckdb_result_table", {
-                tableName: result.tableName,
-              }).catch((error) => {
-                console.warn(`Could not remove ${result.tableName}:`, error);
-              })
-          )
-  );
 }
 
 async function closeSqlResult(tab, key) {
@@ -743,6 +2192,7 @@ async function closeSqlResult(tab, key) {
   const wasActive = tab.activeResultKey === key;
 
   tab.results.delete(key);
+  queueWorkspaceSave();
 
   if (wasActive) {
     tab.activeResultKey =
@@ -752,20 +2202,6 @@ async function closeSqlResult(tab, key) {
   if (activeTab() === tab) {
     renderSqlResultTabs(tab);
     renderActiveSqlResult(tab);
-  }
-
-  if (!result.tableName) return;
-
-  try {
-    await invoke("remove_duckdb_result_table", {
-      tableName: result.tableName,
-    });
-  } catch (error) {
-    showToast(`Could not remove ${result.tableName}: ${error}`);
-  } finally {
-    if (activeTab()?.kind === "sql") {
-      await renderSqlTables();
-    }
   }
 }
 
@@ -879,16 +2315,24 @@ function renderTabs() {
 
   for (const tab of tabs.values()) {
     const el = document.createElement("div");
-    el.className = `file-tab${tab.id === activeTabId ? " active" : ""}`;
+    el.className =
+        `file-tab${tab.id === activeTabId ? " active" : ""}` +
+        `${tab.kind === "parquet" && tab.missing ? " missing" : ""}`;
     el.setAttribute("role", "button");
     el.tabIndex = 0;
 
     const title = tab.kind === "sql" ? tab.title : tab.meta.file_name;
-    el.title = tab.kind === "sql" ? title : tab.path;
+    el.title =
+        tab.kind === "sql"
+            ? title
+            : tab.missing
+                ? `${tab.path}\n(file not found — open Info to relink)`
+                : tab.path;
 
     const name = document.createElement("span");
     name.className = "file-tab-name";
-    name.textContent = title;
+    name.textContent =
+        tab.kind === "parquet" && tab.missing ? `${title} · Missing` : title;
 
     const close = document.createElement("button");
     close.className = "file-tab-close";
@@ -935,6 +2379,7 @@ function createAndOpenSqlTab() {
 
   const tab = createSqlTab();
   tabs.set(tab.id, tab);
+  queueWorkspaceSave();
 
   closeAdvanced();
   closeMeta();
@@ -950,6 +2395,7 @@ function switchTab(tabId) {
   closeAdvanced();
   closeMeta();
   restoreTabState(next);
+  queueWorkspaceSave();
 }
 
 async function closeTab(tabId) {
@@ -964,6 +2410,11 @@ async function closeTab(tabId) {
   }
 
   tabs.delete(tabId);
+  queueWorkspaceSave();
+
+  if (tab.kind === "sql") {
+    queueWorkspaceSave();
+  }
 
   if (tab.kind === "parquet") {
     tabIdByPath.delete(tab.path);
@@ -1069,6 +2520,7 @@ async function openParquetPath(path) {
     await loadPage(0, true);
     renderRows();
     updateStatus();
+    queueWorkspaceSave();
   } catch (e) {
     showToast("Couldn’t open file: " + e);
   } finally {
@@ -1200,6 +2652,7 @@ function finishColumnResize() {
   if (tab?.kind === "parquet") tab.colWidths = [...colWidths];
 
   suppressHeaderClick = true;
+  queueWorkspaceSave();
 }
 
 function updateSpacer() {
@@ -1393,24 +2846,118 @@ function updateStatus() {
 // ---- Metadata panel ---------------------------------------------------------
 function buildMetaPanel() {
   const m = fileMeta;
+  const tab = activeTab();
+  const missing = tab?.kind === "parquet" && tab.missing;
+
   const row = (k, v) =>
-    `<div class="meta-row"><span class="k">${k}</span><span class="v">${escapeHtml(v)}</span></div>`;
+      `<div class="meta-row"><span class="k">${k}</span><span class="v">${escapeHtml(v)}</span></div>`;
   let html = "";
   html += row("File", m.file_name);
-  html += row("Size", humanSize(m.file_size));
-  html += row("Rows", m.num_rows.toLocaleString());
-  html += row("Columns", m.num_columns.toLocaleString());
-  html += row("Row groups", m.num_row_groups.toLocaleString());
-  html += row("Compression", m.compression);
-  html += row("Format version", "v" + m.version);
-  if (m.created_by) html += row("Created by", m.created_by);
-  html += '<div class="meta-section-title">Schema</div>';
-  m.columns.forEach((c) => {
-    html += `<div class="schema-item"><span class="sname">${escapeHtml(c.name)}</span><span class="stype">${escapeHtml(c.type)}</span></div>`;
-  });
+  if (missing) {
+    html += `<div class="meta-row"><span class="k">Status</span><span class="v" style="color:#d64545">● Missing</span></div>`;
+  }
+  if (!missing) {
+    html += row("Size", humanSize(m.file_size));
+    html += row("Rows", m.num_rows.toLocaleString());
+    html += row("Columns", m.num_columns.toLocaleString());
+    html += row("Row groups", m.num_row_groups.toLocaleString());
+    html += row("Compression", m.compression);
+    html += row("Format version", "v" + m.version);
+    if (m.created_by) html += row("Created by", m.created_by);
+  }
+  if (!missing && m.columns.length) {
+    html += '<div class="meta-section-title">Schema</div>';
+    m.columns.forEach((c) => {
+      html += `<div class="schema-item"><span class="sname">${escapeHtml(c.name)}</span><span class="stype">${escapeHtml(c.type)}</span></div>`;
+    });
+  }
   html += '<div class="meta-section-title">Path</div>';
-  html += `<div class="meta-row"><span class="v" style="text-align:left;font-family:var(--mono);font-size:11px">${escapeHtml(m.path)}</span></div>`;
+  html +=
+      `<div class="meta-row" style="align-items:flex-start;gap:8px">` +
+      `<span class="v" id="metaPathValue" style="text-align:left;flex:1;font-family:var(--mono);font-size:11px">${escapeHtml(m.path)}</span>` +
+      `<button id="metaLocateBtn" class="btn ghost" type="button" style="flex:0 0 auto">Locate…</button>` +
+      `</div>`;
+  if (missing && tab?.missingError) {
+    html += `<div class="meta-row"><span class="v" style="text-align:left;color:#d64545;font-size:11px">${escapeHtml(tab.missingError)}</span></div>`;
+  }
   metaBody.innerHTML = html;
+
+  document
+      .getElementById("metaLocateBtn")
+      ?.addEventListener("click", relinkActiveParquet);
+}
+
+async function relinkActiveParquet() {
+  const tab = activeTab();
+  if (!tab || tab.kind !== "parquet") return;
+
+  let newPath;
+  try {
+    newPath = await invoke("pick_parquet_file");
+  } catch (error) {
+    showToast(String(error));
+    return;
+  }
+  if (!newPath || newPath === tab.path) return;
+
+  if (tabIdByPath.has(newPath) && tabIdByPath.get(newPath) !== tab.id) {
+    showToast("This file is already open in another tab.");
+    return;
+  }
+
+  setLoading(true, "Relinking file…");
+  try {
+    const meta = await invoke("open_file", { path: newPath });
+    const oldPath = tab.path;
+
+    tabIdByPath.delete(oldPath);
+    tab.path = newPath;
+    tab.meta = meta;
+    tab.missing = false;
+    tab.missingError = null;
+    tab.totalRows = meta.num_rows;
+    tab.cache = new Map();
+    tab.pending = new Set();
+    tab.edits = new Map();
+    tab.sortState = null;
+    tab.filterState = null;
+    tab.colWidths = null;
+    tab.scrollTop = 0;
+    tab.viewToken += 1;
+    tabIdByPath.set(newPath, tab.id);
+
+    if (oldPath !== newPath) {
+      await invoke("close_file", { path: oldPath }).catch(() => {});
+    }
+
+    if (tab.id === activeTabId) {
+      currentPath = newPath;
+      fileMeta = meta;
+      cache = tab.cache;
+      pending = tab.pending;
+      edits = tab.edits;
+      viewToken = tab.viewToken;
+      totalRows = tab.totalRows;
+      truncated = false;
+      sortState = null;
+      filterState = null;
+      syncAdvancedUiFromFilterState();
+      computeColWidths();
+      renderHeader();
+      buildMetaPanel();
+      updateSpacer();
+      await loadPage(0, true);
+      renderRows();
+      updateStatus();
+      renderTabs();
+    }
+    queueWorkspaceSave();
+    showToast("File relinked.");
+  } catch (error) {
+    showToast("Couldn’t open file: " + error);
+  } finally {
+    setLoading(false);
+  }
 }
 
 function openMeta() {
@@ -1525,6 +3072,8 @@ function applySettings(rerender) {
   ROW_H = DENSITY_PX[settings.density] || 30;
   root.style.setProperty("--row-h", ROW_H + "px");
   root.style.setProperty("--cell-font", (FONT_PX[settings.font] || 12) + "px");
+  syncSqlEditorTheme();
+
   if (rerender && fileMeta) {
     computeColWidths();
     renderHeader();
@@ -1750,15 +3299,57 @@ advClear.addEventListener("click", () => {
   }
 });
 
-metaBtn.addEventListener("click", () => {
+async function refreshActiveParquetAvailability() {
+  const tab = activeTab();
+  if (!tab || tab.kind !== "parquet" || tab.missing) {
+    return !tab?.missing;
+  }
+
+  const exists = await invoke("parquet_file_exists", { path: tab.path })
+      .catch(() => false);
+
+  if (exists) return true;
+
+  tab.missing = true;
+  tab.missingError = "The file no longer exists at its saved location.";
+  tab.cache = new Map();
+  tab.pending = new Set();
+  tab.edits = new Map();
+  tab.totalRows = 0;
+  tab.truncated = false;
+  tab.viewToken += 1;
+
+  await invoke("close_file", { path: tab.path }).catch(() => {});
+
+  if (tab.id === activeTabId) {
+    restoreParquetTab(tab);
+  }
+
+  queueWorkspaceSave();
+  return false;
+}
+
+metaBtn.addEventListener("click", async () => {
   if (!fileMeta) return;
-  openMeta();
+
+  await refreshActiveParquetAvailability();
+
+  if (fileMeta) {
+    openMeta();
+  }
 });
 metaClose.addEventListener("click", closeMeta);
 metaBackdropEl.addEventListener("click", closeMeta);
 
 // ---- Wiring -----------------------------------------------------------------
 $("openBtn2").addEventListener("click", pickFile);
+sqlRunBtn.addEventListener("click", () => runSql());
+
+sqlPaneSplitter.addEventListener("pointerdown", beginSqlPaneResize);
+sqlPaneSplitter.addEventListener("pointermove", resizeSqlPane);
+sqlPaneSplitter.addEventListener("pointerup", finishSqlPaneResize);
+sqlPaneSplitter.addEventListener("pointercancel", finishSqlPaneResize);
+
 tabBar.addEventListener(
     "wheel",
     (event) => {
@@ -1813,6 +3404,7 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault();
     openSettings();
   } else if (e.key === "Escape") {
+    closeWorkspaceDialog();
     closeExportFormatDialog();
     closeCsvImportDialog();
     closeSettings();
@@ -1820,6 +3412,8 @@ window.addEventListener("keydown", (e) => {
     closeMeta();
   }
 });
+
+window.addEventListener("beforeunload", saveWorkspace);
 
 // ---- Native file open (drag-drop, "Open With", CLI) -------------------------
 listen("tauri://drag-enter", () => dropOverlay.classList.add("show"));
@@ -1852,11 +3446,18 @@ listen("open-file", (e) => {
 loadSettings();
 applySettings(false);
 initSettingsControls();
+initSqlEditor();
+
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  if (settings.theme === "auto") syncSqlEditorTheme();
+});
 
 // A file may have been passed at launch (Finder "Open With" / `open -a`).
 // Retry a few times: on a cold launch the OS "Opened" event can land just
 // after the first poll, so one check isn't always enough.
 (async () => {
+  await restoreWorkspace();
+
   for (const delay of [0, 400, 1200]) {
     if (delay) await new Promise((r) => setTimeout(r, delay));
     if (fileMeta) return; // a file already opened (event or earlier poll)

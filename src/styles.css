@@ -122,6 +122,10 @@ body {
   font-size: 13px;
   font-weight: 700;
   letter-spacing: -0.01em;
+  max-width: 28vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .btn {
@@ -218,6 +222,15 @@ body {
   background: var(--border);
 }
 
+.file-tab.missing {
+  color: #d64545;
+}
+.file-tab.missing .file-tab-name {
+  text-decoration: line-through;
+  text-decoration-color: currentColor;
+  text-decoration-thickness: 1px;
+}
+
 .sql-new-tab {
   flex: 0 0 auto;
   width: auto;
@@ -238,7 +251,10 @@ body {
   width: 100%;
   overflow: hidden;
   display: grid;
-  grid-template-rows: minmax(180px, 38%) minmax(180px, 1fr);
+  grid-template-rows:
+        minmax(180px, 38%)
+        8px
+        minmax(180px, 1fr);
   background: var(--panel);
 }
 .sql-editor-pane {
@@ -248,6 +264,37 @@ body {
   min-height: 0;
   border-bottom: 1px solid var(--border-strong);
 }
+.sql-pane-splitter {
+  position: relative;
+  z-index: 2;
+  cursor: row-resize;
+  background: var(--bg);
+  touch-action: none;
+}
+
+.sql-pane-splitter::before {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: 0;
+  left: 0;
+  height: 2px;
+  background: var(--border-strong);
+}
+
+.sql-pane-splitter:hover::before,
+.sql-pane-splitter:focus-visible::before,
+/*.resizing-sql-pane .sql-pane-splitter::before {*/
+/*  background: var(--accent);*/
+/*}*/
+
+.resizing-sql-pane,
+.resizing-sql-pane * {
+  cursor: row-resize !important;
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
 .sql-tables-pane {
   min-width: 0;
   overflow: auto;
@@ -419,6 +466,20 @@ body {
 .sql-editor-actions .btn {
   padding: 4px 11px;
 }
+.sql-editor {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--panel);
+  font-family: var(--mono);
+}
+.sql-editor:focus-within {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.monaco-editor .suggest-widget {
+  z-index: 1000 !important;
+}
 .sql-input {
   flex: 1 1 auto;
   min-height: 0;
@@ -468,6 +529,39 @@ body {
 }
 .sql-table-item:hover {
   background: var(--row-hover);
+}
+.sql-view-item {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  border-radius: 5px;
+}
+.sql-view-item:hover {
+  background: var(--row-hover);
+}
+.sql-view-item .sql-table-item {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.sql-view-item .sql-table-item:hover {
+  background: transparent;
+}
+.sql-view-remove {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  margin-right: 3px;
+  border: none;
+  border-radius: 4px;
+  padding: 0;
+  color: var(--text-dim);
+  background: transparent;
+  font-size: 16px;
+  line-height: 20px;
+}
+.sql-view-remove:hover {
+  color: var(--text);
+  background: var(--border);
 }
 .sql-empty-tables,
 .sql-result-empty {
@@ -629,6 +723,47 @@ body {
   font-family: var(--sans);
   font-size: 10px;
 }
+.app-menu-separator {
+  height: 1px;
+  margin: 5px 4px;
+  background: var(--border);
+}
+.app-menu-label {
+  display: block;
+  padding: 6px 9px 4px;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.app-menu-workspace-list {
+  max-height: 154px;
+  overflow-y: auto;
+}
+.app-menu-workspace {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 7px;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 9px;
+  color: var(--text);
+  background: transparent;
+  font-family: var(--sans);
+  font-size: 12px;
+  text-align: left;
+}
+.app-menu-workspace:hover { background: var(--row-hover); }
+.app-menu-workspace.active { font-weight: 700; }
+.app-menu-workspace.active::before {
+  content: "✓";
+  color: var(--accent);
+  font-weight: 800;
+}
+.app-menu-item.danger { color: #d64545; }
+.app-menu-item.danger:hover { background: rgba(214, 69, 69, 0.1); }
 
 /* ---------- Empty state ---------- */
 .empty {
@@ -1110,6 +1245,44 @@ body {
   opacity: 1;
   pointer-events: auto;
   transform: translate(-50%, -50%) scale(1);
+}
+.workspace-dialog {
+  width: 400px;
+}
+.workspace-dialog-description {
+  margin: 10px 0 16px;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.workspace-dialog-input-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+.workspace-dialog-input {
+  width: 100%;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  outline: none;
+  padding: 8px 9px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-weight: 400;
+}
+.workspace-dialog-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+.workspace-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
 }
 .export-format-win {
   width: 360px;

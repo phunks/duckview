@@ -1,6 +1,6 @@
 [package]
 name = "duckview"
-version = "0.1.0"
+version = "0.2.0"
 description = "Parquet file viewer and SQL editor"
 authors = ["pnk"]
 edition = "2024"
@@ -14,6 +14,7 @@ tauri = { version = "2", features = ["custom-protocol"] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 regex = "1"
+encoding_rs = "0.8"
 arrow = "59"
 parquet = "59"
 duckdb = { version = "1", features = ["bundled", "parquet"] }

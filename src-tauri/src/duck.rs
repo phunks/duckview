@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::{copy, Write};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use arrow::datatypes::SchemaRef;
@@ -12,6 +13,13 @@ pub(crate) struct DuckTable {
     pub(crate) name: String,
     pub(crate) path: String,
     pub(crate) is_view: bool,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct DuckTableColumn {
+    pub(crate) name: String,
+    #[serde(rename = "type")]
+    pub(crate) type_name: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -370,10 +378,11 @@ pub(crate) async fn export_duckdb_query(
 ) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
 
-    let (extension, copy_options) = match format.as_str() {
-        "csv" => ("csv", "FORMAT CSV, HEADER TRUE"),
-        "parquet" => ("parquet", "FORMAT PARQUET, COMPRESSION ZSTD"),
-        "json" => ("json", "FORMAT JSON"),
+    let (extension, copy_options, write_utf8_bom) = match format.as_str() {
+        "csv" => ("csv", "FORMAT CSV, HEADER TRUE", false),
+        "csv_excel" => ("csv", "FORMAT CSV, HEADER TRUE", true),
+        "parquet" => ("parquet", "FORMAT PARQUET, COMPRESSION ZSTD", false),
+        "json" => ("json", "FORMAT JSON", false),
         _ => return Err("Unsupported export format.".to_string()),
     };
 
@@ -397,20 +406,55 @@ pub(crate) async fn export_duckdb_query(
         return Ok(None);
     };
 
-    let output_path = output_path.to_string_lossy().to_string();
+    let export_path = if write_utf8_bom {
+        std::env::temp_dir().join(format!(
+            "duckview-export-{}-{}.csv",
+            std::process::id(),
+            duckdb.next_query_id.fetch_add(1, AtomicOrdering::Relaxed)
+        ))
+    } else {
+        output_path.clone()
+    };
+
     let copy_sql = format!(
         "COPY ({sql}) TO {} WITH ({copy_options})",
-        quote_sql_string(&output_path)
+        quote_sql_string(&export_path.to_string_lossy())
     );
 
-    duckdb
+    let export_result = duckdb
         .connection
         .lock()
         .unwrap()
-        .execute_batch(&copy_sql)
-        .map_err(|error| format!("Export failed: {error}"))?;
+        .execute_batch(&copy_sql);
 
-    Ok(Some(output_path))
+    if let Err(error) = export_result {
+        if write_utf8_bom {
+            let _ = std::fs::remove_file(&export_path);
+        }
+        return Err(format!("Export failed: {error}"));
+    }
+
+    if write_utf8_bom {
+        let bom_result = (|| -> Result<(), String> {
+            let mut source = std::fs::File::open(&export_path)
+                .map_err(|error| format!("Could not read temporary CSV: {error}"))?;
+            let mut destination = std::fs::File::create(&output_path)
+                .map_err(|error| format!("Could not create CSV file: {error}"))?;
+
+            destination
+                .write_all(b"\xEF\xBB\xBF")
+                .map_err(|error| format!("Could not write UTF-8 BOM: {error}"))?;
+            copy(&mut source, &mut destination)
+                .map_err(|error| format!("Could not write CSV file: {error}"))?;
+
+            Ok(())
+        })();
+
+        let _ = std::fs::remove_file(&export_path);
+        bom_result?;
+    }
+
+    Ok(Some(output_path.to_string_lossy().to_string()))
 }
 
 fn quote_sql_identifier(value: &str) -> String {
@@ -436,33 +480,54 @@ pub(crate) fn register_duckdb_query_as_table(
         .map(|query| query.sql.clone())
         .ok_or("Query result is no longer available. Run the query again.")?;
 
+    register_duckdb_sql_as_view_inner(&duckdb, table_name, sql)
+}
+
+#[tauri::command]
+pub(crate) fn restore_duckdb_view(
+    duckdb: State<'_, DuckDbState>,
+    view_name: String,
+    sql: String,
+) -> Result<DuckTable, String> {
+    let view_name = view_name.trim().to_string();
+    if view_name.is_empty() {
+        return Err("A view name is required.".to_string());
+    }
+
+    let sql = normalize_read_only_sql(&sql)?;
+    register_duckdb_sql_as_view_inner(&duckdb, view_name, sql)
+}
+
+fn register_duckdb_sql_as_view_inner(
+    duckdb: &DuckDbState,
+    table_name: String,
+    sql: String,
+) -> Result<DuckTable, String> {
     let table = DuckTable {
         name: table_name.clone(),
         path: "SQL result".to_string(),
         is_view: true,
     };
 
-    {
-        let mut tables = duckdb.tables_by_path.lock().unwrap();
+    let mut tables = duckdb.tables_by_path.lock().unwrap();
 
-        if tables.values().any(|existing| existing.name == table_name) {
-            return Err(format!("A table named \"{table_name}\" already exists."));
-        }
-
-        let create_view = format!(
-            "CREATE TEMP VIEW {} AS {sql}",
-            quote_sql_identifier(&table_name),
-        );
-
-        duckdb
-            .connection
-            .lock()
-            .unwrap()
-            .execute_batch(&create_view)
-            .map_err(|error| format!("Could not save query result: {error}"))?;
-
-        tables.insert(format!("sql-result:{table_name}"), table.clone());
+    if tables.values().any(|existing| existing.name == table_name) {
+        return Err(format!("A table or view named \"{table_name}\" already exists."));
     }
+
+    let create_view = format!(
+        "CREATE TEMP VIEW {} AS {sql}",
+        quote_sql_identifier(&table_name),
+    );
+
+    duckdb
+        .connection
+        .lock()
+        .unwrap()
+        .execute_batch(&create_view)
+        .map_err(|error| format!("Could not create view: {error}"))?;
+
+    tables.insert(format!("sql-result:{table_name}"), table.clone());
 
     Ok(table)
 }
@@ -507,6 +572,46 @@ pub(crate) fn list_duckdb_tables(duckdb: State<'_, DuckDbState>) -> Vec<DuckTabl
         .values()
         .cloned()
         .collect()
+}
+
+#[tauri::command]
+pub(crate) fn get_duckdb_table_columns(
+    duckdb: State<'_, DuckDbState>,
+    table_name: String,
+) -> Result<Vec<DuckTableColumn>, String> {
+    let table_name = table_name.trim().to_string();
+
+    if table_name.is_empty() {
+        return Err("A table name is required.".to_string());
+    }
+
+    let sql = format!("DESCRIBE {}", quote_sql_identifier(&table_name));
+    let connection = duckdb.connection.lock().unwrap();
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| format!("Could not describe table \"{table_name}\": {error}"))?;
+
+    let mut rows = statement
+        .query([])
+        .map_err(|error| format!("Could not read table \"{table_name}\": {error}"))?;
+
+    let mut columns = Vec::new();
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("Could not read table \"{table_name}\": {error}"))?
+    {
+        columns.push(DuckTableColumn {
+            name: row
+                .get(0)
+                .map_err(|error| format!("Could not read column name: {error}"))?,
+            type_name: row
+                .get(1)
+                .map_err(|error| format!("Could not read column type: {error}"))?,
+        });
+    }
+
+    Ok(columns)
 }
 
 #[tauri::command]

@@ -24,7 +24,7 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::ProjectionMask;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
-use crate::duck::{execute_duckdb_query, export_duckdb_query, get_duckdb_query_rows, list_duckdb_tables, register_duckdb_query_as_table, remove_duckdb_result_table, run_filter_duckdb, run_sort_duckdb, DuckDbState, DuckTable};
+use crate::duck::{execute_duckdb_query, export_duckdb_query, get_duckdb_query_rows, get_duckdb_table_columns, list_duckdb_tables, register_duckdb_query_as_table, remove_duckdb_result_table, restore_duckdb_view, run_filter_duckdb, run_sort_duckdb, DuckDbState, DuckTable};
 
 // Cap on how many matching rows a search will collect, to bound memory/time on
 // huge files. Beyond this the result set is marked truncated.
@@ -666,8 +666,10 @@ async fn open_file(
     let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let file_name = std::path::Path::new(&path)
         .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.clone());
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "Unnamed Parquet file".to_string());
 
     let columns: Vec<ColumnInfo> = schema
         .fields()
@@ -831,8 +833,40 @@ async fn get_rows(
 }
 
 #[tauri::command]
-fn close_file(state: State<'_, AppState>, path: String) {
+fn close_file(
+    state: State<'_, AppState>,
+    duckdb: State<'_, DuckDbState>,
+    path: String,
+) {
     state.files.lock().unwrap().remove(&path);
+
+    let table = duckdb.tables_by_path.lock().unwrap().remove(&path);
+
+    if let Some(table) = table {
+        let drop_view = format!(
+            "DROP VIEW IF EXISTS {}",
+            quote_sql_identifier(&table.name),
+        );
+
+        if let Err(error) = duckdb
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(&drop_view)
+        {
+            eprintln!(
+                "[duckview] Could not unregister table view \"{}\": {error}",
+                table.name
+            );
+        }
+    }
+}
+
+#[tauri::command]
+fn parquet_file_exists(path: String) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
 }
 
 /// A file passed at launch, consumed once by the frontend on startup.
@@ -841,18 +875,19 @@ fn take_startup_file(state: State<'_, AppState>) -> Option<String> {
     state.pending_open.lock().unwrap().take()
 }
 
-#[allow(unused)]
 #[tauri::command]
 async fn pick_parquet_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
+
     let picked = app
         .dialog()
         .file()
         .add_filter("Parquet", &["parquet"])
         .blocking_pick_file();
+
     Ok(picked
-        .and_then(|f| f.into_path().ok())
-        .map(|p| p.to_string_lossy().to_string()))
+        .and_then(|file| file.into_path().ok())
+        .map(|path| path.to_string_lossy().to_string()))
 }
 
 #[tauri::command]
@@ -877,6 +912,7 @@ async fn import_csv_as_parquet(
     app: tauri::AppHandle,
     duckdb: State<'_, DuckDbState>,
     path: String,
+    encoding: String,
 ) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
 
@@ -899,19 +935,29 @@ async fn import_csv_as_parquet(
         return Ok(None);
     };
 
+    let temporary_csv = csv_source_for_import(&path, &encoding)?;
+    let csv_path = temporary_csv
+        .as_deref()
+        .unwrap_or_else(|| std::path::Path::new(&path));
     let output_path = output_path.to_string_lossy().to_string();
+
     let copy_sql = format!(
         "COPY (SELECT * FROM read_csv_auto({})) TO {} WITH (FORMAT PARQUET, COMPRESSION ZSTD)",
-        quote_sql_string(&path),
+        quote_sql_string(&csv_path.to_string_lossy()),
         quote_sql_string(&output_path),
     );
 
-    duckdb
+    let import_result = duckdb
         .connection
         .lock()
         .unwrap()
-        .execute_batch(&copy_sql)
-        .map_err(|error| format!("Could not convert CSV to Parquet: {error}"))?;
+        .execute_batch(&copy_sql);
+
+    if let Some(temporary_csv) = temporary_csv {
+        let _ = std::fs::remove_file(temporary_csv);
+    }
+
+    import_result.map_err(|error| format!("Could not convert CSV to Parquet: {error}"))?;
 
     Ok(Some(output_path))
 }
@@ -941,26 +987,75 @@ fn quote_sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn csv_source_for_import(
+    path: &str,
+    encoding_name: &str,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if encoding_name == "utf-8" {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("Cannot read CSV file: {error}"))?;
+
+        std::str::from_utf8(&bytes).map_err(|_| {
+            "The CSV is not valid UTF-8. Select its text encoding and try again.".to_string()
+        })?;
+
+        return Ok(None);
+    }
+
+    let encoding = match encoding_name {
+        "shift_jis" => encoding_rs::SHIFT_JIS,
+        "euc-jp" => encoding_rs::EUC_JP,
+        "iso-2022-jp" => encoding_rs::ISO_2022_JP,
+        "gbk" => encoding_rs::GBK,
+        "big5" => encoding_rs::BIG5,
+        "windows-1252" => encoding_rs::WINDOWS_1252,
+        _ => return Err("Unsupported CSV text encoding.".to_string()),
+    };
+
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("Cannot read CSV file: {error}"))?;
+    let (text, _, had_errors) = encoding.decode(&bytes);
+
+    if had_errors {
+        return Err(format!(
+            "The CSV contains invalid characters for {}.",
+            encoding.name()
+        ));
+    }
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("Could not create a temporary CSV path: {error}"))?
+        .as_nanos();
+
+    let temporary_path = std::env::temp_dir().join(format!(
+        "duckview-csv-{}-{unique}.csv",
+        std::process::id()
+    ));
+
+    std::fs::write(&temporary_path, text.as_bytes())
+        .map_err(|error| format!("Could not convert CSV to UTF-8: {error}"))?;
+
+    Ok(Some(temporary_path))
+}
+
 fn duck_table_base_name(path: &str) -> String {
-    let file_name = std::path::Path::new(path)
+    let file_stem = std::path::Path::new(path)
         .file_stem()
         .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
         .unwrap_or("parquet");
 
-    let mut result: String = file_name
+    let mut result: String = file_stem
         .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
+        .map(|ch| if ch == '\0' { '_' } else { ch })
         .collect();
 
-    if result.is_empty() {
+    if result.trim().is_empty() {
         result = "parquet".to_string();
     }
+
     if result
         .chars()
         .next()
@@ -968,10 +1063,79 @@ fn duck_table_base_name(path: &str) -> String {
     {
         result.insert(0, '_');
     }
+
+    result
+}
+
+/// Removes SQL line/block comments while preserving quoted string literals and
+/// quoted identifiers. Newlines in comments are retained so adjacent tokens
+/// cannot accidentally be joined together.
+fn strip_sql_comments(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(ch) = chars.next() {
+        if let Some(delimiter) = quote {
+            result.push(ch);
+
+            if ch == delimiter {
+                if chars.peek().is_some_and(|next| *next == delimiter) {
+                    result.push(chars.next().unwrap());
+                } else {
+                    quote = None;
+                }
+            }
+
+            continue;
+        }
+
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            result.push(ch);
+            continue;
+        }
+
+        if ch == '-' && chars.peek().is_some_and(|next| *next == '-') {
+            chars.next();
+
+            for comment_char in chars.by_ref() {
+                if comment_char == '\n' {
+                    result.push('\n');
+                    break;
+                }
+            }
+
+            continue;
+        }
+
+        if ch == '/' && chars.peek().is_some_and(|next| *next == '*') {
+            chars.next();
+
+            let mut previous = '\0';
+            for comment_char in chars.by_ref() {
+                if comment_char == '\n' {
+                    result.push('\n');
+                }
+
+                if previous == '*' && comment_char == '/' {
+                    break;
+                }
+
+                previous = comment_char;
+            }
+
+            continue;
+        }
+
+        result.push(ch);
+    }
+
     result
 }
 
 fn normalize_read_only_sql(sql: &str) -> Result<String, String> {
+    let sql = strip_sql_comments(sql);
     let sql = sql.trim();
     let sql = sql.strip_suffix(';').unwrap_or(sql).trim();
 
@@ -1016,19 +1180,23 @@ fn main() {
         .manage(AppState::default())
         .manage(duckdb)
         .invoke_handler(tauri::generate_handler![
-                        open_file,
-                        get_rows,
-                        close_file,
-                        list_duckdb_tables,
-                        execute_duckdb_query,
-                        get_duckdb_query_rows,
-                        export_duckdb_query,
-                        register_duckdb_query_as_table,
-                        remove_duckdb_result_table,
-                        take_startup_file,
-                        pick_file,
-                        import_csv_as_parquet
-                    ])
+            open_file,
+            get_rows,
+            close_file,
+            parquet_file_exists,
+            list_duckdb_tables,
+            get_duckdb_table_columns,
+            execute_duckdb_query,
+            get_duckdb_query_rows,
+            export_duckdb_query,
+            register_duckdb_query_as_table,
+            remove_duckdb_result_table,
+            restore_duckdb_view,
+            take_startup_file,
+            pick_file,
+            pick_parquet_file,
+            import_csv_as_parquet
+        ])
         .setup(|app| {
             // A file path may arrive as a CLI arg when launched via `open -a`.
             if let Some(path) = std::env::args()

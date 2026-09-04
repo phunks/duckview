@@ -60,7 +60,7 @@ jobs:
         with:
           targets: ${{ matrix.job.target }}
 
-      - name: Build macOS application
+      - name: Build application
         shell: bash
         run: npm run tauri build -- --target ${{ matrix.job.target }}
 
