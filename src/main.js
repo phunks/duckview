@@ -926,6 +926,7 @@ function quoteSqlIdentifier(identifier) {
 function sqlStatementAtCursor(sql, cursor) {
   const statements = [];
   let start = 0;
+  let contentStart = null;
   let quote = null;
   let lineComment = false;
   let blockComment = false;
@@ -971,18 +972,25 @@ function sqlStatementAtCursor(sql, cursor) {
     }
 
     if (ch === "'" || ch === '"' || ch === "`") {
+      contentStart ??= i;
       quote = ch;
       continue;
     }
 
     if (ch === ";") {
-      statements.push({ start, end: i });
+      statements.push({ start, end: i, contentStart });
       start = i + 1;
+      contentStart = null;
+      continue;
+    }
+
+    if (!/\s/.test(ch)) {
+      contentStart ??= i;
     }
   }
 
   if (start < sql.length) {
-    statements.push({ start, end: sql.length });
+    statements.push({ start, end: sql.length, contentStart });
   }
 
   if (!statements.length) {
@@ -998,6 +1006,16 @@ function sqlStatementAtCursor(sql, cursor) {
           cursor >= statement.start &&
           cursor <= statement.end
   );
+
+  if (
+      statementIndex > 0 &&
+      (
+          statements[statementIndex].contentStart === null ||
+          cursor < statements[statementIndex].contentStart
+      )
+  ) {
+    statementIndex -= 1;
+  }
 
   if (statementIndex < 0) {
     for (let index = statements.length - 1; index >= 0; index--) {
@@ -2422,23 +2440,9 @@ async function closeTab(tabId) {
   }
 
   if (!tabs.size) {
-    activeTabId = null;
-    currentPath = null;
-    fileMeta = null;
-    cache = new Map();
-    pending = new Set();
-    edits = new Map();
-
-    emptyEl.classList.remove("hidden");
-    tableWrap.classList.add("hidden");
-    statusBar.classList.add("hidden");
-    metaBtn.classList.add("hidden");
-    advBtn.classList.add("hidden");
-    tabBar.classList.add("hidden");
-    fileNameEl.textContent = "";
-    document.title = "DuckView";
-    closeAdvanced();
-    closeMeta();
+    resetWorkspaceUi();
+    renderWorkspaceTitle();
+    saveWorkspace();
     return;
   }
 
