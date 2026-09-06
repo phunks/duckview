@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Mutex;
 
-use arrow::array::{new_empty_array, Array, ArrayRef, UInt32Array};
-use arrow::compute::{concat, sort_to_indices, take, SortOptions};
-use arrow::datatypes::{DataType, SchemaRef};
-use arrow::record_batch::RecordBatch;
-use arrow::util::display::{ArrayFormatter, FormatOptions};
+use duckdb::arrow::array::{new_empty_array, Array, ArrayRef, UInt32Array};
+use duckdb::arrow::compute::{concat, sort_to_indices, take, SortOptions};
+use duckdb::arrow::datatypes::{DataType, SchemaRef};
+use duckdb::arrow::record_batch::RecordBatch;
+use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
 
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata,
@@ -24,7 +24,7 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::ProjectionMask;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
-use crate::duck::{execute_duckdb_query, export_duckdb_query, get_duckdb_query_rows, get_duckdb_table_columns, list_duckdb_tables, register_duckdb_query_as_table, remove_duckdb_result_table, restore_duckdb_view, run_filter_duckdb, run_sort_duckdb, DuckDbState, DuckTable};
+use crate::duck::{execute_duckdb_query, export_duckdb_query, get_duckdb_query_rows, get_duckdb_query_rows_arrow, get_duckdb_table_columns, list_duckdb_tables, register_duckdb_query_as_table, remove_duckdb_result_table, restore_duckdb_view, run_filter_duckdb, run_sort_duckdb, DuckDbState, DuckTable};
 
 // Cap on how many matching rows a search will collect, to bound memory/time on
 // huge files. Beyond this the result set is marked truncated.
@@ -1154,15 +1154,34 @@ fn normalize_read_only_sql(sql: &str) -> Result<String, String> {
         return Err("Only SELECT, WITH, and PIVOT queries are allowed.".to_string());
     }
 
-    const BLOCKED: [&str; 20] = [
-        "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "COPY",
-        "ATTACH", "DETACH", "INSTALL", "LOAD", "EXPORT", "IMPORT",
-        "READ_PARQUET", "READ_CSV", "READ_JSON", "READ_TEXT",
-        "READ_BLOB", "GLOB", "HTTPFS", "SQLITE_SCAN",
+    const BLOCKED: [(&str, &str); 23] = [
+        ("READ_CSV_AUTO", "`read_csv_auto` is not allowed. Import the CSV file as Parquet first, then query the imported table."),
+        ("READ_CSV", "`read_csv` is not allowed. Import the CSV file as Parquet first, then query the imported table."),
+        ("READ_PARQUET", "`read_parquet` is not allowed. Open the Parquet file in DuckView, then query its table."),
+        ("READ_JSON", "`read_json` is not allowed."),
+        ("READ_JSON_AUTO", "`read_json_auto` is not allowed."),
+        ("JSON_EXTRACT", "`json_extract` is not allowed."),
+        ("JSON_TRANSFORM", "`json_transform` is not allowed."),
+        ("READ_TEXT", "`read_text` is not allowed."),
+        ("READ_BLOB", "`read_blob` is not allowed."),
+        ("SQLITE_SCAN", "`sqlite_scan` is not allowed."),
+        ("INSERT", "`INSERT` is not allowed because this SQL editor is read-only."),
+        ("UPDATE", "`UPDATE` is not allowed because this SQL editor is read-only."),
+        ("DELETE", "`DELETE` is not allowed because this SQL editor is read-only."),
+        ("CREATE", "`CREATE` is not allowed because this SQL editor is read-only."),
+        ("DROP", "`DROP` is not allowed because this SQL editor is read-only."),
+        ("COPY", "`COPY` is not allowed from the SQL editor. Use the export feature instead."),
+        ("ATTACH", "`ATTACH` is not allowed."),
+        ("DETACH", "`DETACH` is not allowed."),
+        ("INSTALL", "`INSTALL` is not allowed."),
+        ("LOAD", "`LOAD` is not allowed."),
+        ("EXPORT", "`EXPORT` is not allowed."),
+        ("IMPORT", "`IMPORT` is not allowed."),
+        ("GLOB", "`glob` is not allowed."),
     ];
 
-    if BLOCKED.iter().any(|keyword| upper.contains(keyword)) {
-        return Err("This SQL operation is not allowed.".to_string());
+    if let Some((_, message)) = BLOCKED.iter().find(|(keyword, _)| upper.contains(keyword)) {
+        return Err((*message).to_string());
     }
 
     Ok(sql.to_string())
@@ -1180,23 +1199,24 @@ fn main() {
         .manage(AppState::default())
         .manage(duckdb)
         .invoke_handler(tauri::generate_handler![
-            open_file,
-            get_rows,
-            close_file,
-            parquet_file_exists,
-            list_duckdb_tables,
-            get_duckdb_table_columns,
-            execute_duckdb_query,
-            get_duckdb_query_rows,
-            export_duckdb_query,
-            register_duckdb_query_as_table,
-            remove_duckdb_result_table,
-            restore_duckdb_view,
-            take_startup_file,
-            pick_file,
-            pick_parquet_file,
-            import_csv_as_parquet
-        ])
+                open_file,
+                get_rows,
+                close_file,
+                parquet_file_exists,
+                list_duckdb_tables,
+                get_duckdb_table_columns,
+                execute_duckdb_query,
+                get_duckdb_query_rows,
+                get_duckdb_query_rows_arrow,
+                export_duckdb_query,
+                register_duckdb_query_as_table,
+                remove_duckdb_result_table,
+                restore_duckdb_view,
+                take_startup_file,
+                pick_file,
+                pick_parquet_file,
+                import_csv_as_parquet
+            ])
         .setup(|app| {
             // A file path may arrive as a CLI arg when launched via `open -a`.
             if let Some(path) = std::env::args()

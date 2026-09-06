@@ -1,6 +1,8 @@
 import * as monacoApi from "monaco-editor";
 import "monaco-editor/esm/vs/basic-languages/monaco.contribution";
 import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
+import { tableFromIPC } from "@apache-arrow/ts";
+import { format } from "sql-formatter";
 import {
   LanguageIdEnum,
   setupLanguageFeatures,
@@ -19,7 +21,7 @@ self.MonacoEnvironment = {
 
 setupLanguageFeatures(LanguageIdEnum.GSQL, {
   completionItems: true,
-  diagnostics: true,
+  diagnostics: false,
 });
 
 globalThis.MonacoEnvironment = {
@@ -40,6 +42,120 @@ globalThis.MonacoEnvironment = {
 // ---- Tauri bridge (withGlobalTauri) ----------------------------------------
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
+
+function isArrowVector(value) {
+  return value !== null &&
+      typeof value === "object" &&
+      typeof value.get === "function" &&
+      typeof value.toArray === "function" &&
+      Number.isSafeInteger(value.length);
+}
+
+function isArrowDecimalType(dataType) {
+  return dataType !== null &&
+      dataType !== undefined &&
+      Number.isInteger(dataType.precision) &&
+      Number.isInteger(dataType.scale);
+}
+
+function formatArrowDecimal(words, scale) {
+  let integer = 0n;
+
+  for (let index = words.length - 1; index >= 0; index--) {
+    integer = (integer << 32n) | BigInt(words[index] >>> 0);
+  }
+
+  const bitWidth = BigInt(words.length * 32);
+  const signBit = 1n << (bitWidth - 1n);
+
+  if ((integer & signBit) !== 0n) {
+    integer -= 1n << bitWidth;
+  }
+
+  const negative = integer < 0n;
+  let digits = (negative ? -integer : integer).toString();
+
+  if (scale <= 0) {
+    return `${negative ? "-" : ""}${digits}${"0".repeat(-scale)}`;
+  }
+
+  if (digits.length <= scale) {
+    digits = digits.padStart(scale + 1, "0");
+  }
+
+  const decimalPoint = digits.length - scale;
+  return `${negative ? "-" : ""}${digits.slice(0, decimalPoint)}.${digits.slice(decimalPoint)}`;
+}
+
+function listItemAt(values, index) {
+  return isArrowVector(values) ? values.get(index) : values[index];
+}
+
+function formatArrowListPreview(values, maxItems = 5) {
+  const itemCount = values.length;
+  const displayedCount = Math.min(itemCount, maxItems);
+  const displayed = [];
+
+  for (let index = 0; index < displayedCount; index++) {
+    displayed.push(formatArrowCell(listItemAt(values, index)));
+  }
+
+  const suffix = itemCount > maxItems
+      ? `, … (${itemCount.toLocaleString()} items)`
+      : "";
+
+  return `[${displayed.join(", ")}${suffix}]`;
+}
+
+function formatArrowStruct(value) {
+  const fields = Object.entries(value);
+
+  return `{${fields.map(([name, fieldValue]) => {
+    const formatted = formatArrowCell(fieldValue);
+    return `${name}=${formatted ?? "null"}`;
+  }).join(", ")}}`;
+}
+
+function formatArrowCell(value, dataType = null) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (isArrowDecimalType(dataType) && ArrayBuffer.isView(value)) {
+    return formatArrowDecimal(value, dataType.scale);
+  }
+
+  if (Array.isArray(value) || ArrayBuffer.isView(value) || isArrowVector(value)) {
+    return formatArrowListPreview(value);
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  if (typeof value === "object") {
+    return formatArrowStruct(value);
+  }
+
+  return String(value);
+}
+
+function arrowTableToRows(table, limit) {
+  const rows = [];
+  const rowCount = Math.min(table.numRows, limit);
+  const columns = Array.from(
+      { length: table.numCols },
+      (_, index) => table.getChildAt(index),
+  );
+
+  for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+    rows.push(columns.map((column) =>
+        formatArrowCell(column?.get(rowIndex), column?.type)
+    ));
+  }
+
+  return rows;
+}
 
 // ---- Layout constants (ROW_H mirrors the --row-h CSS var) -------------------
 let ROW_H = 30; // updated by the density setting
@@ -1048,7 +1164,32 @@ function sqlStatementAtCursor(sql, cursor) {
     sql: text,
     number: statementIndex + 1,
     count: statements.length,
+    selectionStart: statement.contentStart ?? statement.start,
+    selectionEnd: statement.end + 1,
   };
+}
+
+function selectSqlStatement(statement) {
+  if (
+      !sqlEditor ||
+      !Number.isInteger(statement.selectionStart) ||
+      !Number.isInteger(statement.selectionEnd)
+  ) {
+    return;
+  }
+
+  const model = sqlEditor.getModel();
+  if (!model) return;
+
+  const start = model.getPositionAt(statement.selectionStart);
+  const end = model.getPositionAt(statement.selectionEnd);
+
+  sqlEditor.setSelection(new monacoApi.Range(
+      start.lineNumber,
+      start.column,
+      end.lineNumber,
+      end.column,
+  ));
 }
 
 function isDarkSqlTheme() {
@@ -1282,6 +1423,46 @@ function initSqlEditor() {
   const createEditor = () => {
     const monaco = monacoApi;
 
+    const formatSql = (sql) => format(sql, {
+      language: "duckdb",
+      tabWidth: 2,
+      keywordCase: "upper",
+    });
+
+    monaco.languages.registerDocumentFormattingEditProvider(
+        LanguageIdEnum.GENERIC,
+        {
+          provideDocumentFormattingEdits(model) {
+            try {
+              return [{
+                range: model.getFullModelRange(),
+                text: formatSql(model.getValue()),
+              }];
+            } catch (error) {
+              console.warn("Could not format SQL:", error);
+              return [];
+            }
+          },
+        },
+    );
+
+    monaco.languages.registerDocumentRangeFormattingEditProvider(
+        LanguageIdEnum.GENERIC,
+        {
+          provideDocumentRangeFormattingEdits(model, range) {
+            try {
+              return [{
+                range,
+                text: formatSql(model.getValueInRange(range)),
+              }];
+            } catch (error) {
+              console.warn("Could not format selected SQL:", error);
+              return [];
+            }
+          },
+        },
+    );
+
     monaco.editor.defineTheme("duckview-light", {
       base: "vs",
       inherit: true,
@@ -1401,6 +1582,22 @@ function initSqlEditor() {
     });
 
     sqlEditor.addAction({
+      id: "duckview.format-sql",
+      label: "Format SQL",
+      keybindings: [
+        monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF,
+      ],
+      run: () => {
+        const selection = sqlEditor.getSelection();
+        const actionId = selection?.isEmpty()
+            ? "editor.action.formatDocument"
+            : "editor.action.formatSelection";
+
+        return sqlEditor.getAction(actionId)?.run();
+      },
+    });
+
+    sqlEditor.addAction({
       id: "duckview.run-sql",
       label: "Run SQL at Cursor",
       keybindings: [
@@ -1480,6 +1677,10 @@ function runSql(sqlOverride = null, existingViewName = null) {
     return;
   }
 
+  if (!sqlOverride) {
+    selectSqlStatement(statement);
+  }
+
   const resultNumber = tab.nextResultNumber++;
   const viewName = existingViewName || `_${Date.now()}`;
   const resultKey =
@@ -1517,12 +1718,41 @@ function runSql(sqlOverride = null, existingViewName = null) {
         sql: result.sql,
       });
       const preparedAt = performance.now();
-      const page = await invoke("get_duckdb_query_rows", {
+
+      const ipcStartedAt = performance.now();
+      const ipcBuffer = await invoke("get_duckdb_query_rows_arrow", {
         queryId: start.query_id,
         offset: 0,
         limit: PAGE,
       });
-      const rowsAt = performance.now();
+      const ipcReceivedAt = performance.now();
+
+      const decodeStartedAt = performance.now();
+      const arrowTable = tableFromIPC(
+          ipcBuffer instanceof Uint8Array
+              ? ipcBuffer
+              : new Uint8Array(ipcBuffer),
+      );
+      const hasMore = arrowTable.numRows > PAGE;
+      const resultRows = arrowTableToRows(arrowTable, PAGE);
+      const decodeFinishedAt = performance.now();
+
+      console.info("Arrow IPC timing (ms)", {
+        invokeTotal: Math.round(ipcReceivedAt - ipcStartedAt),
+        arrowDecodeAndPreview: Math.round(decodeFinishedAt - decodeStartedAt),
+        payloadMiB: Number(
+            (
+                (ipcBuffer.byteLength ?? ipcBuffer.length ?? 0) /
+                (1024 * 1024)
+            ).toFixed(2)
+        ),
+      });
+
+      const page = {
+        rows: resultRows,
+        offset: 0,
+        has_more: hasMore,
+      };
 
       result.queryId = start.query_id;
       result.columns = start.columns;
@@ -1533,15 +1763,27 @@ function runSql(sqlOverride = null, existingViewName = null) {
           ? `Showing rows 1–${page.rows.length}${page.has_more ? "+" : ""}`
           : "No rows returned.";
 
+      const cellLengths = page.rows.flatMap((row) =>
+          row.map((value) => String(value ?? "").length)
+      );
+      console.info("SQL result size", {
+        rows: page.rows.length,
+        cells: cellLengths.length,
+        maxCellChars: Math.max(0, ...cellLengths),
+        totalCellChars: cellLengths.reduce((sum, length) => sum + length, 0),
+      });
+
       if (activeTabId === tab.id && tab.activeResultKey === resultKey) {
         renderSqlResultTabs(tab);
         renderActiveSqlResult(tab);
       }
+
       const renderedAt = performance.now();
       console.info("SQL timing (ms)", {
         prepare: Math.round(preparedAt - startedAt),
-        fetchRows: Math.round(rowsAt - preparedAt),
-        render: Math.round(renderedAt - rowsAt),
+        invokeArrowIpc: Math.round(ipcReceivedAt - ipcStartedAt),
+        arrowDecodeAndPreview: Math.round(decodeFinishedAt - decodeStartedAt),
+        render: Math.round(renderedAt - decodeFinishedAt),
       });
 
       if (existingViewName) {
@@ -2014,7 +2256,27 @@ async function removeWorkspaceView(viewName) {
   }
 }
 
+async function copySqlToClipboard(sql, label = "SQL") {
+  try {
+    await navigator.clipboard.writeText(sql);
+    showToast(`${label} SQL copied to clipboard.`);
+  } catch (error) {
+    console.warn(`Could not copy ${label} SQL:`, error);
+    showToast(`Could not copy ${label} SQL to the clipboard.`);
+  }
+}
+
 async function renderSqlTables() {
+  const tablesPane = sqlTables.closest(".sql-tables-pane");
+  const previousScrollTop = tablesPane?.scrollTop ?? 0;
+  const restoreScrollPosition = () => {
+    requestAnimationFrame(() => {
+      if (tablesPane) {
+        tablesPane.scrollTop = previousScrollTop;
+      }
+    });
+  };
+
   sqlTables.innerHTML =
       '<div class="sql-empty-tables">Loading tables…</div>';
 
@@ -2095,6 +2357,13 @@ async function renderSqlTables() {
           insertSqlText(completionInsertText(table.name));
         });
 
+        if (table.is_view && savedView) {
+          button.addEventListener("contextmenu", (event) => {
+            event.preventDefault();
+            void copySqlToClipboard(savedView.sql, `View “${table.name}”`);
+          });
+        }
+
         if (!table.is_view) {
           sqlTables.appendChild(button);
           continue;
@@ -2125,6 +2394,8 @@ async function renderSqlTables() {
   } catch (error) {
     sqlTables.innerHTML =
         `<div class="sql-empty-tables">${escapeHtml(String(error))}</div>`;
+  } finally {
+    restoreScrollPosition();
   }
 }
 
@@ -2248,6 +2519,16 @@ function renderSqlResultTabs(tab) {
         ? `${result.sql}\n\nTemporary result: export as Parquet to keep it.`
         : result.sql;
     select.addEventListener("click", () => selectSqlResult(tab, key));
+    select.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      const viewSql = result.tableName
+          ? workspaceViews.get(result.tableName)?.sql
+          : null;
+      void copySqlToClipboard(
+          viewSql || result.sql,
+          result.tableName ? `View “${result.tableName}”` : "Result"
+      );
+    });
 
     const close = document.createElement("button");
     close.className = "sql-result-tab-close";
@@ -2326,6 +2607,24 @@ function renderSqlResults(result) {
 
   html += "</tbody></table>";
   sqlResultBody.innerHTML = html;
+}
+
+function sqlStringLiteral(value) {
+  if (value === null || value === undefined) {
+    return "NULL";
+  }
+
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+async function copyCellValueToClipboard(value) {
+  try {
+    await navigator.clipboard.writeText(sqlStringLiteral(value));
+    showToast("SQL literal copied to clipboard.");
+  } catch (error) {
+    console.warn("Could not copy cell value:", error);
+    showToast("Could not copy the cell value to the clipboard.");
+  }
 }
 
 function renderTabs() {
@@ -3043,6 +3342,24 @@ rows.addEventListener("dblclick", (e) => {
   startEdit(cellEl, r, c);
 });
 
+rows.addEventListener("contextmenu", (event) => {
+  const cellEl = event.target.closest(".cell[data-r][data-c]");
+  if (!cellEl || !rows.contains(cellEl)) return;
+
+  const rowIndex = Number.parseInt(cellEl.dataset.r, 10);
+  const columnIndex = Number.parseInt(cellEl.dataset.c, 10);
+  const row = getRow(rowIndex);
+  const globalRowIndex = getGindex(rowIndex);
+
+  if (!row || Number.isNaN(columnIndex)) return;
+
+  event.preventDefault();
+
+  const editKey = `${globalRowIndex}:${columnIndex}`;
+  const value = edits.has(editKey) ? edits.get(editKey) : row[columnIndex];
+  void copyCellValueToClipboard(value);
+});
+
 // ---- Settings ---------------------------------------------------------------
 const DEFAULT_SETTINGS = {
   theme: "auto",
@@ -3353,6 +3670,14 @@ sqlPaneSplitter.addEventListener("pointerdown", beginSqlPaneResize);
 sqlPaneSplitter.addEventListener("pointermove", resizeSqlPane);
 sqlPaneSplitter.addEventListener("pointerup", finishSqlPaneResize);
 sqlPaneSplitter.addEventListener("pointercancel", finishSqlPaneResize);
+
+sqlResultBody.addEventListener("contextmenu", (event) => {
+  const cell = event.target.closest("td");
+  if (!cell || !sqlResultBody.contains(cell)) return;
+
+  event.preventDefault();
+  void copyCellValueToClipboard(cell.textContent);
+});
 
 tabBar.addEventListener(
     "wheel",

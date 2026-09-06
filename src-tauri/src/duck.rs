@@ -2,11 +2,15 @@ use std::collections::HashMap;
 use std::io::{copy, Write};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
-use arrow::datatypes::SchemaRef;
+
+use duckdb::arrow::datatypes::{DataType, SchemaRef};
+use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
 use duckdb::Connection;
+use arrow::record_batch::RecordBatch;
+use arrow_ipc::writer::StreamWriter;
 use serde::Serialize;
-use tauri::State;
-use crate::{is_numeric, normalize_read_only_sql, Condition, FileCache, FilterSpec, SortSpec, MAX_PAGE, SEARCH_CAP};
+use tauri::{ipc::Response, State};
+use crate::{is_numeric, normalize_read_only_sql, quote_sql_string, Condition, FileCache, FilterSpec, SortSpec, CELL_MAX_CHARS, MAX_PAGE, SEARCH_CAP};
 
 #[derive(Serialize, Clone)]
 pub(crate) struct DuckTable {
@@ -78,51 +82,60 @@ impl DuckDbState {
     }
 }
 
-fn display_duck_value(value: duckdb::types::ValueRef<'_>) -> Option<String> {
-    use duckdb::types::ValueRef;
+// fn display_duck_value(value: duckdb::types::ValueRef<'_>) -> Option<String> {
+//     use duckdb::types::ValueRef;
+//
+//     match value {
+//         ValueRef::Null => None,
+//
+//         ValueRef::Boolean(value) => Some(value.to_string()),
+//
+//         ValueRef::TinyInt(value) => Some(value.to_string()),
+//         ValueRef::SmallInt(value) => Some(value.to_string()),
+//         ValueRef::Int(value) => Some(value.to_string()),
+//         ValueRef::BigInt(value) => Some(value.to_string()),
+//         ValueRef::HugeInt(value) => Some(value.to_string()),
+//
+//         ValueRef::UTinyInt(value) => Some(value.to_string()),
+//         ValueRef::USmallInt(value) => Some(value.to_string()),
+//         ValueRef::UInt(value) => Some(value.to_string()),
+//         ValueRef::UBigInt(value) => Some(value.to_string()),
+//         ValueRef::UHugeInt(value) => Some(value.to_string()),
+//
+//         ValueRef::Float(value) => Some(value.to_string()),
+//         ValueRef::Double(value) => Some(value.to_string()),
+//         ValueRef::Decimal(value) => Some(value.to_string()),
+//
+//         ValueRef::Text(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+//
+//         ValueRef::Blob(bytes) | ValueRef::Geometry(bytes) => Some(format!(
+//             "0x{}",
+//             bytes
+//                 .iter()
+//                 .map(|byte| format!("{byte:02x}"))
+//                 .collect::<String>()
+//         )),
+//
+//         ValueRef::Date32(days) => Some(format!("Date32({days})")),
+//         ValueRef::Time64(unit, value) => Some(format!("Time64({unit:?}, {value})")),
+//         ValueRef::Timestamp(unit, value) => Some(format!("Timestamp({unit:?}, {value})")),
+//
+//         ValueRef::List(duckdb::types::ListType::Regular(array), ..) => {
+//             let options = FormatOptions::default().with_null("NULL");
+//             let formatter = ArrayFormatter::try_new(array, &options)
+//                 .map_err(|error| format!("Could not format LIST value: {error}"))
+//                 .ok()?;
+//
+//             Some(formatter.value(0).to_string())
+//         }
+//
+//         other => Some(format!("{other:?}")),
+//     }
+// }
 
-    match value {
-        ValueRef::Null => None,
-
-        ValueRef::Boolean(value) => Some(value.to_string()),
-
-        ValueRef::TinyInt(value) => Some(value.to_string()),
-        ValueRef::SmallInt(value) => Some(value.to_string()),
-        ValueRef::Int(value) => Some(value.to_string()),
-        ValueRef::BigInt(value) => Some(value.to_string()),
-        ValueRef::HugeInt(value) => Some(value.to_string()),
-
-        ValueRef::UTinyInt(value) => Some(value.to_string()),
-        ValueRef::USmallInt(value) => Some(value.to_string()),
-        ValueRef::UInt(value) => Some(value.to_string()),
-        ValueRef::UBigInt(value) => Some(value.to_string()),
-        ValueRef::UHugeInt(value) => Some(value.to_string()),
-
-        ValueRef::Float(value) => Some(value.to_string()),
-        ValueRef::Double(value) => Some(value.to_string()),
-        ValueRef::Decimal(value) => Some(value.to_string()),
-
-        ValueRef::Text(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-
-        ValueRef::Blob(bytes) | ValueRef::Geometry(bytes) => Some(format!(
-            "0x{}",
-            bytes
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        )),
-
-        ValueRef::Date32(days) => Some(format!("Date32({days})")),
-        ValueRef::Time64(unit, value) => Some(format!("Time64({unit:?}, {value})")),
-        ValueRef::Timestamp(unit, value) => Some(format!("Timestamp({unit:?}, {value})")),
-
-        other => Some(format!("{other:?}")),
-    }
-}
-
-fn quote_sql_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
+// fn quote_sql_string(value: &str) -> String {
+//     format!("'{}'", value.replace('\'', "''"))
+// }
 
 #[allow(unused)]
 fn escape_like_pattern(value: &str) -> String {
@@ -669,6 +682,102 @@ pub(crate) fn execute_duckdb_query(
     Ok(QueryStartResponse { query_id, columns })
 }
 
+fn format_arrow_cell(
+    formatter: &ArrayFormatter<'_>,
+    data_type: &DataType,
+    row: usize,
+) -> String {
+    match data_type {
+        // List を含むネストした型も ArrayFormatter を使えば正しく再帰表示される。
+        // formatter は列ごとに一度だけ生成されるため、ValueRef::List ごとの
+        // ArrayFormatter::try_new() は発生しない。
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+            formatter.value(row).to_string()
+        }
+        _ => formatter.value(row).to_string(),
+    }
+}
+
+#[tauri::command]
+pub(crate) fn get_duckdb_query_rows_arrow(
+    duckdb: State<'_, DuckDbState>,
+    query_id: String,
+    offset: usize,
+    limit: usize,
+) -> Result<Response, String> {
+    let limit = limit.min(MAX_PAGE);
+
+    let sql = duckdb
+        .queries
+        .lock()
+        .unwrap()
+        .get(&query_id)
+        .map(|query| query.sql.clone())
+        .ok_or("Query result is no longer available.")?;
+    
+    let fetch_limit = limit.saturating_add(1);
+    let page_sql = format!(
+        "SELECT * FROM ({sql}) AS duckview_result LIMIT {fetch_limit} OFFSET {offset}"
+    );
+
+    let connection = duckdb.connection.lock().unwrap();
+    let mut statement = connection
+        .prepare(&page_sql)
+        .map_err(|error| format!("SQL error: {error}"))?;
+
+    let arrow_started = std::time::Instant::now();
+
+    let batches = statement
+        .query_arrow([])
+        .map_err(|error| format!("SQL error: {error}"))?;
+
+    let arrow_iterator_ready = std::time::Instant::now();
+
+    let batches: Vec<RecordBatch> = batches.collect();
+
+    let arrow_batches_ready = std::time::Instant::now();
+
+    eprintln!(
+        "[duckview] DuckDB Arrow: create-iterator={} ms, collect-batches={} ms",
+        arrow_iterator_ready.duration_since(arrow_started).as_millis(),
+        arrow_batches_ready.duration_since(arrow_iterator_ready).as_millis(),
+    );
+
+    let schema = batches
+        .first()
+        .map(|batch| batch.schema())
+        .ok_or("Could not determine the Arrow schema for this result.")?;
+
+    let mut bytes = Vec::new();
+    let ipc_started = std::time::Instant::now();
+
+    {
+        let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref())
+            .map_err(|error| format!("Could not encode Arrow IPC stream: {error}"))?;
+
+        for batch in &batches {
+            writer
+                .write(batch)
+                .map_err(|error| format!("Could not encode Arrow batch: {error}"))?;
+        }
+
+        writer
+            .finish()
+            .map_err(|error| format!("Could not finish Arrow IPC stream: {error}"))?;
+    }
+
+    eprintln!(
+        "[duckview] Arrow page: batches={}, rows={}, ipc-encode={} ms, payload={:.2} MiB",
+        batches.len(),
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        // query_finished.duration_since(query_started).as_millis(),
+        ipc_started.elapsed().as_millis(),
+        bytes.len() as f64 / (1024.0 * 1024.0),
+    );
+
+    Ok(Response::new(bytes))
+}
+
 #[tauri::command]
 pub(crate) fn get_duckdb_query_rows(
     duckdb: State<'_, DuckDbState>,
@@ -686,8 +795,9 @@ pub(crate) fn get_duckdb_query_rows(
         .map(|query| (query.sql.clone(), query.column_count))
         .ok_or("Query result is no longer available.")?;
 
+    let fetch_limit = limit + 1;
     let page_sql = format!(
-        "SELECT * FROM ({sql}) AS duckview_result LIMIT {limit} OFFSET {offset}"
+        "SELECT * FROM ({sql}) AS duckview_result LIMIT {fetch_limit} OFFSET {offset}"
     );
 
     let connection = duckdb.connection.lock().unwrap();
@@ -695,26 +805,63 @@ pub(crate) fn get_duckdb_query_rows(
         .prepare(&page_sql)
         .map_err(|e| format!("SQL error: {e}"))?;
 
-    let mut result = statement
-        .query([])
+    let batches = statement
+        .query_arrow([])
         .map_err(|e| format!("SQL error: {e}"))?;
 
-    let mut rows = Vec::with_capacity(limit);
-    while let Some(row) = result.next().map_err(|e| format!("SQL error: {e}"))? {
-        let mut values = Vec::with_capacity(column_count);
+    let options = FormatOptions::default().with_null("");
+    let mut rows = Vec::with_capacity(limit + 1);
 
-        for column in 0..column_count {
-            let value = row
-                .get_ref(column)
-                .map_err(|e| format!("Could not read SQL result: {e}"))?;
+    for batch in batches {
+        let formatters: Vec<ArrayFormatter<'_>> = (0..batch.num_columns())
+            .map(|column| {
+                ArrayFormatter::try_new(batch.column(column).as_ref(), &options)
+                    .map_err(|e| format!("Formatting error: {e}"))
+            })
+            .collect::<Result<_, _>>()?;
 
-            values.push(display_duck_value(value));
+        for row in 0..batch.num_rows() {
+            let mut values = Vec::with_capacity(column_count);
+
+            for column in 0..column_count {
+                let array = batch.column(column);
+
+                if array.is_null(row) {
+                    values.push(None);
+                    continue;
+                }
+
+                let value = format_arrow_cell(
+                    &formatters[column],
+                    array.data_type(),
+                    row,
+                );
+
+                let value = if value.chars().count() > CELL_MAX_CHARS {
+                    let mut truncated: String = value.chars().take(CELL_MAX_CHARS).collect();
+                    truncated.push('…');
+                    truncated
+                } else {
+                    value
+                };
+
+                values.push(Some(value));
+            }
+
+            rows.push(values);
+
+            if rows.len() > limit {
+                break;
+            }
         }
 
-        rows.push(values);
+        if rows.len() > limit {
+            break;
+        }
     }
 
-    let has_more = rows.len() == limit;
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
 
     Ok(QueryRowsResponse {
         rows,

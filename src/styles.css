@@ -282,12 +282,6 @@ body {
   background: var(--border-strong);
 }
 
-.sql-pane-splitter:hover::before,
-.sql-pane-splitter:focus-visible::before,
-/*.resizing-sql-pane .sql-pane-splitter::before {*/
-/*  background: var(--accent);*/
-/*}*/
-
 .resizing-sql-pane,
 .resizing-sql-pane * {
   cursor: row-resize !important;
