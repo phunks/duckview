@@ -1660,6 +1660,116 @@ function sqlUsesDynamicResultShape(sql) {
   return false;
 }
 
+async function fetchSqlResultPage(queryId, offset) {
+  const ipcStartedAt = performance.now();
+
+  const ipcBuffer = await invoke("get_duckdb_query_rows_arrow", {
+    queryId,
+    offset,
+    limit: PAGE,
+  });
+
+  const ipcReceivedAt = performance.now();
+  const decodeStartedAt = performance.now();
+
+  const arrowTable = tableFromIPC(
+      ipcBuffer instanceof Uint8Array
+          ? ipcBuffer
+          : new Uint8Array(ipcBuffer),
+  );
+
+  const hasMore = arrowTable.numRows > PAGE;
+  const rows = arrowTableToRows(arrowTable, PAGE);
+
+  const decodeFinishedAt = performance.now();
+
+  console.info("Arrow IPC timing (ms)", {
+    offset,
+    rows: rows.length,
+    invokeTotal: Math.round(ipcReceivedAt - ipcStartedAt),
+    arrowDecodeAndPreview: Math.round(decodeFinishedAt - decodeStartedAt),
+    payloadMiB: Number(
+        (
+            (ipcBuffer.byteLength ?? ipcBuffer.length ?? 0) /
+            (1024 * 1024)
+        ).toFixed(2)
+    ),
+  });
+
+  return { rows, offset, hasMore };
+}
+
+async function loadMoreSqlRows() {
+  const tab = activeTab();
+  const result = activeSqlResult(tab);
+
+  if (
+      !tab ||
+      tab.kind !== "sql" ||
+      !result ||
+      result.closed ||
+      result.error ||
+      result.loadingMore ||
+      !result.hasMore ||
+      !result.queryId
+  ) {
+    return;
+  }
+
+  const offset = result.rows?.length ?? 0;
+  const previousScrollTop = sqlResultBody.scrollTop;
+
+  result.loadingMore = true;
+  result.status = `Loading rows ${offset + 1}–${offset + PAGE}…`;
+
+  if (activeTab() === tab && activeSqlResult(tab) === result) {
+    sqlResultStatus.textContent = result.status;
+  }
+
+  try {
+    const page = await fetchSqlResultPage(result.queryId, offset);
+    if (result.closed || !tab.results.has(result.id)) {
+      return;
+    }
+
+    result.rows ??= [];
+    result.rows.push(...page.rows);
+    result.offset = 0;
+    result.hasMore = page.hasMore;
+    result.status = result.rows.length
+        ? `Showing rows 1–${result.rows.length}${result.hasMore ? "+" : ""}`
+        : "No rows returned.";
+
+    if (activeTab() === tab && activeSqlResult(tab) === result) {
+      renderActiveSqlResult(tab);
+
+      requestAnimationFrame(() => {
+        sqlResultBody.scrollTop = previousScrollTop;
+      });
+    }
+  } catch (error) {
+    result.error = String(error);
+    result.status = "Could not load more rows.";
+
+    if (activeTab() === tab && activeSqlResult(tab) === result) {
+      renderActiveSqlResult(tab);
+    }
+  } finally {
+    result.loadingMore = false;
+  }
+}
+
+function maybeLoadMoreSqlRows() {
+  const remaining =
+      sqlResultBody.scrollHeight -
+      sqlResultBody.scrollTop -
+      sqlResultBody.clientHeight;
+
+  if (remaining <= 160) {
+    void loadMoreSqlRows();
+  }
+}
+
 function runSql(sqlOverride = null, existingViewName = null) {
   const tab = activeTab();
   if (!tab || tab.kind !== "sql" || !sqlEditor) return;
@@ -1696,6 +1806,7 @@ function runSql(sqlOverride = null, existingViewName = null) {
     rows: null,
     offset: 0,
     hasMore: false,
+    loadingMore: false,
     error: null,
     closed: false,
     transientOnly: false,
@@ -1719,48 +1830,16 @@ function runSql(sqlOverride = null, existingViewName = null) {
       });
       const preparedAt = performance.now();
 
-      const ipcStartedAt = performance.now();
-      const ipcBuffer = await invoke("get_duckdb_query_rows_arrow", {
-        queryId: start.query_id,
-        offset: 0,
-        limit: PAGE,
-      });
-      const ipcReceivedAt = performance.now();
-
-      const decodeStartedAt = performance.now();
-      const arrowTable = tableFromIPC(
-          ipcBuffer instanceof Uint8Array
-              ? ipcBuffer
-              : new Uint8Array(ipcBuffer),
-      );
-      const hasMore = arrowTable.numRows > PAGE;
-      const resultRows = arrowTableToRows(arrowTable, PAGE);
-      const decodeFinishedAt = performance.now();
-
-      console.info("Arrow IPC timing (ms)", {
-        invokeTotal: Math.round(ipcReceivedAt - ipcStartedAt),
-        arrowDecodeAndPreview: Math.round(decodeFinishedAt - decodeStartedAt),
-        payloadMiB: Number(
-            (
-                (ipcBuffer.byteLength ?? ipcBuffer.length ?? 0) /
-                (1024 * 1024)
-            ).toFixed(2)
-        ),
-      });
-
-      const page = {
-        rows: resultRows,
-        offset: 0,
-        has_more: hasMore,
-      };
+      const page = await fetchSqlResultPage(start.query_id, 0);
+      const rowsAt = performance.now();
 
       result.queryId = start.query_id;
       result.columns = start.columns;
       result.rows = page.rows;
       result.offset = page.offset;
-      result.hasMore = page.has_more;
+      result.hasMore = page.hasMore;
       result.status = page.rows.length
-          ? `Showing rows 1–${page.rows.length}${page.has_more ? "+" : ""}`
+          ? `Showing rows 1–${page.rows.length}${page.hasMore ? "+" : ""}`
           : "No rows returned.";
 
       const cellLengths = page.rows.flatMap((row) =>
@@ -1781,9 +1860,8 @@ function runSql(sqlOverride = null, existingViewName = null) {
       const renderedAt = performance.now();
       console.info("SQL timing (ms)", {
         prepare: Math.round(preparedAt - startedAt),
-        invokeArrowIpc: Math.round(ipcReceivedAt - ipcStartedAt),
-        arrowDecodeAndPreview: Math.round(decodeFinishedAt - decodeStartedAt),
-        render: Math.round(renderedAt - decodeFinishedAt),
+        firstPage: Math.round(rowsAt - preparedAt),
+        render: Math.round(renderedAt - rowsAt),
       });
 
       if (existingViewName) {
@@ -2603,6 +2681,10 @@ function renderSqlResults(result) {
       }
     }
     html += "</tr>";
+  }
+
+  if (result.loadingMore) {
+    html += `<tr class="sql-result-loading"><td colspan="${result.columns.length}">Loading more rows…</td></tr>`;
   }
 
   html += "</tbody></table>";
@@ -3678,6 +3760,14 @@ sqlResultBody.addEventListener("contextmenu", (event) => {
   event.preventDefault();
   void copyCellValueToClipboard(cell.textContent);
 });
+
+sqlResultBody.addEventListener(
+    "scroll",
+    () => {
+      maybeLoadMoreSqlRows();
+    },
+    { passive: true },
+);
 
 tabBar.addEventListener(
     "wheel",

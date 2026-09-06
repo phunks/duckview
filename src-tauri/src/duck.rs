@@ -82,61 +82,6 @@ impl DuckDbState {
     }
 }
 
-// fn display_duck_value(value: duckdb::types::ValueRef<'_>) -> Option<String> {
-//     use duckdb::types::ValueRef;
-//
-//     match value {
-//         ValueRef::Null => None,
-//
-//         ValueRef::Boolean(value) => Some(value.to_string()),
-//
-//         ValueRef::TinyInt(value) => Some(value.to_string()),
-//         ValueRef::SmallInt(value) => Some(value.to_string()),
-//         ValueRef::Int(value) => Some(value.to_string()),
-//         ValueRef::BigInt(value) => Some(value.to_string()),
-//         ValueRef::HugeInt(value) => Some(value.to_string()),
-//
-//         ValueRef::UTinyInt(value) => Some(value.to_string()),
-//         ValueRef::USmallInt(value) => Some(value.to_string()),
-//         ValueRef::UInt(value) => Some(value.to_string()),
-//         ValueRef::UBigInt(value) => Some(value.to_string()),
-//         ValueRef::UHugeInt(value) => Some(value.to_string()),
-//
-//         ValueRef::Float(value) => Some(value.to_string()),
-//         ValueRef::Double(value) => Some(value.to_string()),
-//         ValueRef::Decimal(value) => Some(value.to_string()),
-//
-//         ValueRef::Text(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-//
-//         ValueRef::Blob(bytes) | ValueRef::Geometry(bytes) => Some(format!(
-//             "0x{}",
-//             bytes
-//                 .iter()
-//                 .map(|byte| format!("{byte:02x}"))
-//                 .collect::<String>()
-//         )),
-//
-//         ValueRef::Date32(days) => Some(format!("Date32({days})")),
-//         ValueRef::Time64(unit, value) => Some(format!("Time64({unit:?}, {value})")),
-//         ValueRef::Timestamp(unit, value) => Some(format!("Timestamp({unit:?}, {value})")),
-//
-//         ValueRef::List(duckdb::types::ListType::Regular(array), ..) => {
-//             let options = FormatOptions::default().with_null("NULL");
-//             let formatter = ArrayFormatter::try_new(array, &options)
-//                 .map_err(|error| format!("Could not format LIST value: {error}"))
-//                 .ok()?;
-//
-//             Some(formatter.value(0).to_string())
-//         }
-//
-//         other => Some(format!("{other:?}")),
-//     }
-// }
-
-// fn quote_sql_string(value: &str) -> String {
-//     format!("'{}'", value.replace('\'', "''"))
-// }
-
 #[allow(unused)]
 fn escape_like_pattern(value: &str) -> String {
     value
@@ -688,9 +633,6 @@ fn format_arrow_cell(
     row: usize,
 ) -> String {
     match data_type {
-        // List を含むネストした型も ArrayFormatter を使えば正しく再帰表示される。
-        // formatter は列ごとに一度だけ生成されるため、ValueRef::List ごとの
-        // ArrayFormatter::try_new() は発生しない。
         DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
             formatter.value(row).to_string()
         }

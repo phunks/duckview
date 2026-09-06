@@ -653,7 +653,14 @@ body {
   color: var(--null);
   font-style: italic;
 }
-
+.sql-result-grid .sql-result-loading td {
+  padding: 10px;
+  color: var(--text-dim);
+  font-family: var(--sans);
+  font-size: 11px;
+  font-style: italic;
+  text-align: center;
+}
 .sql-read-only {
   border: 1px solid var(--border-strong);
   border-radius: 4px;
