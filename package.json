@@ -1,7 +1,7 @@
 {
   "name": "duckview",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "description": "Parquet file viewer and SQL editor.",
   "engines": {

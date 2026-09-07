@@ -344,6 +344,16 @@
             <option value="windows-1252">Windows-1252</option>
           </select>
         </div>
+        <div class="set-row">
+          <div class="set-label">
+            <span>Column types</span>
+            <small>Keep IDs, leading zeroes, and inconsistent values safe.</small>
+          </div>
+          <label class="switch">
+            <input id="csvImportAllVarchar" type="checkbox" />
+            <span class="track"></span>
+          </label>
+        </div>
         <div class="csv-import-actions">
           <button id="csvImportCancelBtn" class="btn ghost" type="button">Cancel</button>
           <button id="csvImportSaveBtn" class="btn primary" type="button">

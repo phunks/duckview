@@ -1,6 +1,6 @@
 [package]
 name = "duckview"
-version = "0.3.1"
+version = "0.3.2"
 description = "Parquet file viewer and SQL editor"
 authors = ["pnk"]
 edition = "2024"

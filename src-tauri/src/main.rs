@@ -913,6 +913,7 @@ async fn import_csv_as_parquet(
     duckdb: State<'_, DuckDbState>,
     path: String,
     encoding: String,
+    all_varchar: bool,
 ) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
 
@@ -940,10 +941,15 @@ async fn import_csv_as_parquet(
         .as_deref()
         .unwrap_or_else(|| std::path::Path::new(&path));
     let output_path = output_path.to_string_lossy().to_string();
+    let all_varchar = if all_varchar { "true" } else { "false" };
 
     let copy_sql = format!(
-        "COPY (SELECT * FROM read_csv_auto({})) TO {} WITH (FORMAT PARQUET, COMPRESSION ZSTD)",
+        "COPY (
+                SELECT *
+                FROM read_csv_auto({}, all_varchar = {})
+             ) TO {} WITH (FORMAT PARQUET, COMPRESSION ZSTD)",
         quote_sql_string(&csv_path.to_string_lossy()),
+        all_varchar,
         quote_sql_string(&output_path),
     );
 

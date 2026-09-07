@@ -461,21 +461,33 @@ fn register_duckdb_sql_as_view_inner(
     table_name: String,
     sql: String,
 ) -> Result<DuckTable, String> {
+    let base_name = table_name.trim();
+
+    if base_name.is_empty() {
+        return Err("A table name is required.".to_string());
+    }
+
+    let mut tables = duckdb.tables_by_path.lock().unwrap();
+    let mut unique_name = base_name.to_string();
+    let mut suffix = 2usize;
+
+    while tables
+        .values()
+        .any(|existing| existing.name == unique_name)
+    {
+        unique_name = format!("{base_name}_{suffix}");
+        suffix += 1;
+    }
+
     let table = DuckTable {
-        name: table_name.clone(),
+        name: unique_name.clone(),
         path: "SQL result".to_string(),
         is_view: true,
     };
 
-    let mut tables = duckdb.tables_by_path.lock().unwrap();
-
-    if tables.values().any(|existing| existing.name == table_name) {
-        return Err(format!("A table or view named \"{table_name}\" already exists."));
-    }
-
     let create_view = format!(
         "CREATE TEMP VIEW {} AS {sql}",
-        quote_sql_identifier(&table_name),
+        quote_sql_identifier(&unique_name),
     );
 
     duckdb
@@ -485,7 +497,7 @@ fn register_duckdb_sql_as_view_inner(
         .execute_batch(&create_view)
         .map_err(|error| format!("Could not create view: {error}"))?;
 
-    tables.insert(format!("sql-result:{table_name}"), table.clone());
+    tables.insert(format!("sql-result:{unique_name}"), table.clone());
 
     Ok(table)
 }

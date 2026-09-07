@@ -653,6 +653,25 @@ body {
   color: var(--null);
   font-style: italic;
 }
+.sql-result-grid th.sql-row-number,
+.sql-result-grid td.sql-row-number {
+  width: 1%;
+  min-width: 54px;
+  padding-right: 10px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.sql-result-grid th.sql-row-number {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  background: var(--header-bg);
+}
+.sql-result-grid td.sql-row-number {
+  background: var(--gutter-bg);
+  border-right-color: var(--border-strong);
+}
 .sql-result-grid .sql-result-loading td {
   padding: 10px;
   color: var(--text-dim);

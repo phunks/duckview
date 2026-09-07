@@ -229,6 +229,7 @@ const csvImportPath = $("csvImportPath");
 const csvImportClose = $("csvImportClose");
 const csvImportCancelBtn = $("csvImportCancelBtn");
 const csvImportSaveBtn = $("csvImportSaveBtn");
+const csvImportAllVarchar = $("csvImportAllVarchar");
 const appMenuBtn = $("appMenuBtn");
 const appMenu = $("appMenu");
 const appMenuBackdrop = $("appMenuBackdrop");
@@ -1660,6 +1661,31 @@ function sqlUsesDynamicResultShape(sql) {
   return false;
 }
 
+function viewNameFromLeadingSqlComment(sql) {
+  let lastComment = null;
+
+  for (const line of String(sql ?? "").split(/\r?\n/)) {
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      continue;
+    }
+
+    const match = /^--\s*(.*?)\s*$/.exec(trimmed);
+    if (match) {
+      const text = match[1].trim();
+
+      if (text) {
+        lastComment = text;
+      }
+
+      continue;
+    }
+    break;
+  }
+  return lastComment;
+}
+
 async function fetchSqlResultPage(queryId, offset) {
   const ipcStartedAt = performance.now();
 
@@ -1723,11 +1749,16 @@ async function loadMoreSqlRows() {
   result.status = `Loading rows ${offset + 1}–${offset + PAGE}…`;
 
   if (activeTab() === tab && activeSqlResult(tab) === result) {
-    sqlResultStatus.textContent = result.status;
+    renderActiveSqlResult(tab);
+
+    requestAnimationFrame(() => {
+      sqlResultBody.scrollTop = previousScrollTop;
+    });
   }
 
   try {
     const page = await fetchSqlResultPage(result.queryId, offset);
+
     if (result.closed || !tab.results.has(result.id)) {
       return;
     }
@@ -1739,6 +1770,11 @@ async function loadMoreSqlRows() {
     result.status = result.rows.length
         ? `Showing rows 1–${result.rows.length}${result.hasMore ? "+" : ""}`
         : "No rows returned.";
+  } catch (error) {
+    result.error = String(error);
+    result.status = "Could not load more rows.";
+  } finally {
+    result.loadingMore = false;
 
     if (activeTab() === tab && activeSqlResult(tab) === result) {
       renderActiveSqlResult(tab);
@@ -1747,15 +1783,6 @@ async function loadMoreSqlRows() {
         sqlResultBody.scrollTop = previousScrollTop;
       });
     }
-  } catch (error) {
-    result.error = String(error);
-    result.status = "Could not load more rows.";
-
-    if (activeTab() === tab && activeSqlResult(tab) === result) {
-      renderActiveSqlResult(tab);
-    }
-  } finally {
-    result.loadingMore = false;
   }
 }
 
@@ -1792,7 +1819,10 @@ function runSql(sqlOverride = null, existingViewName = null) {
   }
 
   const resultNumber = tab.nextResultNumber++;
-  const viewName = existingViewName || `_${Date.now()}`;
+  const fallbackViewName = `_${Date.now()}`;
+  const viewName = existingViewName ||
+      viewNameFromLeadingSqlComment(statement.sql) ||
+      fallbackViewName;
   const resultKey =
       `result-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const result = {
@@ -1884,6 +1914,7 @@ function runSql(sqlOverride = null, existingViewName = null) {
           tableName,
         });
 
+        result.title = savedView.name;
         result.tableName = savedView.name;
         workspaceViews.set(savedView.name, {
           name: savedView.name,
@@ -1952,6 +1983,7 @@ function openCsvImportDialog(path) {
   pendingCsvImportPath = path;
   csvImportPath.textContent = path;
   csvImportEncoding.value = "utf-8";
+  csvImportAllVarchar.checked = true;
   csvImportWin.classList.add("open");
   exportFormatBackdrop.classList.add("open");
   csvImportSaveBtn.focus();
@@ -1968,12 +2000,14 @@ async function saveCsvAsParquet() {
   if (!csvPath) return;
 
   const encoding = csvImportEncoding.value;
+  const allVarchar = csvImportAllVarchar.checked;
   setLoading(true, "Converting CSV to Parquet…");
 
   try {
     const parquetPath = await invoke("import_csv_as_parquet", {
       path: csvPath,
       encoding,
+      allVarchar,
     });
 
     if (parquetPath) {
@@ -2665,13 +2699,18 @@ function renderSqlResults(result) {
   }
 
   let html = '<table class="sql-result-grid"><thead><tr>';
+  html += '<th class="sql-row-number" title="Row number">#</th>';
+
   for (const column of result.columns) {
     html += `<th title="${escapeHtml(column.type || "value")}">${escapeHtml(column.name)}</th>`;
   }
+
   html += "</tr></thead><tbody>";
 
-  for (const row of result.rows || []) {
+  for (const [rowIndex, row] of (result.rows || []).entries()) {
     html += "<tr>";
+    html += `<td class="sql-row-number">${(rowIndex + 1).toLocaleString()}</td>`;
+
     for (const value of row) {
       if (value === null || value === undefined) {
         html += '<td class="sql-null">null</td>';
@@ -2680,11 +2719,13 @@ function renderSqlResults(result) {
         html += `<td title="${escaped}">${escaped}</td>`;
       }
     }
+
     html += "</tr>";
   }
 
   if (result.loadingMore) {
-    html += `<tr class="sql-result-loading"><td colspan="${result.columns.length}">Loading more rows…</td></tr>`;
+    const colspan = result.columns.length + 1;
+    html += `<tr class="sql-result-loading"><td colspan="${colspan}">Loading more rows…</td></tr>`;
   }
 
   html += "</tbody></table>";
