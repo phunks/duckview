@@ -223,7 +223,49 @@
           <div class="set-label"><span>Fit columns to window</span><small>Stretch columns to fill width</small></div>
           <label class="switch"><input type="checkbox" id="setAutoFit" /><span class="track"></span></label>
         </div>
-        <div class="set-note">Preferences are saved on this Mac.</div>
+        <div class="set-row">
+          <div class="set-label">
+            <span>DuckDB memory limit</span>
+            <small>Maximum memory used for imports and SQL queries.</small>
+          </div>
+          <select id="setDuckDbMemoryLimit" class="select">
+            <option value="1024">1 GiB</option>
+            <option value="2048">2 GiB</option>
+            <option value="4096">4 GiB</option>
+            <option value="8192">8 GiB</option>
+            <option value="16384">16 GiB</option>
+          </select>
+        </div>
+        <div class="set-row">
+          <div class="set-label">
+            <span>Maximum CSV import size</span>
+            <small>Larger files are rejected before conversion starts.</small>
+          </div>
+          <select id="setCsvImportMaxSize" class="select">
+            <option value="2">2 GiB</option>
+            <option value="4">4 GiB</option>
+            <option value="8">8 GiB</option>
+            <option value="16">16 GiB</option>
+          </select>
+        </div>
+        <div class="set-row">
+          <div class="set-label">
+            <span>Maximum CSV line size</span>
+            <small>Increase this only for files with very large text fields.</small>
+          </div>
+          <select id="setCsvMaxLineSize" class="select">
+            <option value="2">2 MiB</option>
+            <option value="4">4 MiB</option>
+            <option value="8">8 MiB</option>
+            <option value="16">16 MiB</option>
+            <option value="32">32 MiB</option>
+            <option value="64">64 MiB</option>
+          </select>
+        </div>
+        <div class="set-note">
+          Large CSV files can need substantially more memory and temporary disk
+          space than their file size.
+        </div>
       </div>
     </div>
 

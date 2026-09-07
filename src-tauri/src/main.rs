@@ -6,6 +6,7 @@ mod duck;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::Mutex;
 
 use duckdb::arrow::array::{new_empty_array, Array, ArrayRef, UInt32Array};
@@ -24,7 +25,7 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::ProjectionMask;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
-use crate::duck::{execute_duckdb_query, export_duckdb_query, get_duckdb_query_rows, get_duckdb_query_rows_arrow, get_duckdb_table_columns, list_duckdb_tables, register_duckdb_query_as_table, remove_duckdb_result_table, restore_duckdb_view, run_filter_duckdb, run_sort_duckdb, DuckDbState, DuckTable};
+use crate::duck::{configure_duckdb_memory_limit, execute_duckdb_query, export_duckdb_query, get_duckdb_query_rows, get_duckdb_query_rows_arrow, get_duckdb_table_columns, list_duckdb_tables, register_duckdb_query_as_table, remove_duckdb_result_table, restore_duckdb_view, run_filter_duckdb, run_sort_duckdb, DuckDbState, DuckTable};
 
 // Cap on how many matching rows a search will collect, to bound memory/time on
 // huge files. Beyond this the result set is marked truncated.
@@ -914,8 +915,13 @@ async fn import_csv_as_parquet(
     path: String,
     encoding: String,
     all_varchar: bool,
+    max_csv_import_mib: u64,
+    max_csv_line_size_mib: u64,
 ) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
+
+    ensure_csv_import_size(&path, max_csv_import_mib)?;
+    let max_line_size_bytes = csv_line_size_bytes(max_csv_line_size_mib)?;
 
     let source = std::path::Path::new(&path);
     let file_name = source
@@ -946,10 +952,15 @@ async fn import_csv_as_parquet(
     let copy_sql = format!(
         "COPY (
                 SELECT *
-                FROM read_csv_auto({}, all_varchar = {})
+                FROM read_csv_auto(
+                    {},
+                    all_varchar = {},
+                    max_line_size = {}
+                )
              ) TO {} WITH (FORMAT PARQUET, COMPRESSION ZSTD)",
         quote_sql_string(&csv_path.to_string_lossy()),
         all_varchar,
+        max_line_size_bytes,
         quote_sql_string(&output_path),
     );
 
@@ -993,18 +1004,57 @@ fn quote_sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn ensure_csv_import_size(path: &str, max_csv_import_mib: u64) -> Result<(), String> {
+    const MIN_CSV_IMPORT_MIB: u64 = 256;
+    const MAX_CSV_IMPORT_MIB: u64 = 65_536;
+
+    if !(MIN_CSV_IMPORT_MIB..=MAX_CSV_IMPORT_MIB).contains(&max_csv_import_mib) {
+        return Err(format!(
+            "CSV import limit must be between {MIN_CSV_IMPORT_MIB} MiB and {MAX_CSV_IMPORT_MIB} MiB."
+        ));
+    }
+
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("Cannot inspect CSV file: {error}"))?;
+
+    if !metadata.is_file() {
+        return Err("The selected CSV path is not a regular file.".to_string());
+    }
+
+    let max_bytes = max_csv_import_mib * 1024 * 1024;
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "This CSV is {:.2} GiB, but the configured import limit is {:.2} GiB. \
+             Increase “Maximum CSV import size” in Settings, split the file, \
+             or convert it with DuckDB externally.",
+            metadata.len() as f64 / (1024.0 * 1024.0 * 1024.0),
+            max_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        ));
+    }
+
+    Ok(())
+}
+
+fn csv_line_size_bytes(max_csv_line_size_mib: u64) -> Result<u64, String> {
+    const MIN_CSV_LINE_SIZE_MIB: u64 = 1;
+    const MAX_CSV_LINE_SIZE_MIB: u64 = 64;
+
+    if !(MIN_CSV_LINE_SIZE_MIB..=MAX_CSV_LINE_SIZE_MIB).contains(&max_csv_line_size_mib) {
+        return Err(format!(
+            "CSV line size limit must be between {MIN_CSV_LINE_SIZE_MIB} MiB and {MAX_CSV_LINE_SIZE_MIB} MiB."
+        ));
+    }
+
+    Ok(max_csv_line_size_mib * 1024 * 1024)
+}
+
 fn csv_source_for_import(
     path: &str,
     encoding_name: &str,
 ) -> Result<Option<std::path::PathBuf>, String> {
     if encoding_name == "utf-8" {
-        let bytes = std::fs::read(path)
-            .map_err(|error| format!("Cannot read CSV file: {error}"))?;
-
-        std::str::from_utf8(&bytes).map_err(|_| {
-            "The CSV is not valid UTF-8. Select its text encoding and try again.".to_string()
-        })?;
-
+        // DuckDB reads CSV files incrementally. Do not load the entire file only
+        // to validate UTF-8: invalid UTF-8 is reported by the import itself.
         return Ok(None);
     }
 
@@ -1018,17 +1068,6 @@ fn csv_source_for_import(
         _ => return Err("Unsupported CSV text encoding.".to_string()),
     };
 
-    let bytes =
-        std::fs::read(path).map_err(|error| format!("Cannot read CSV file: {error}"))?;
-    let (text, _, had_errors) = encoding.decode(&bytes);
-
-    if had_errors {
-        return Err(format!(
-            "The CSV contains invalid characters for {}.",
-            encoding.name()
-        ));
-    }
-
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| format!("Could not create a temporary CSV path: {error}"))?
@@ -1039,9 +1078,88 @@ fn csv_source_for_import(
         std::process::id()
     ));
 
-    std::fs::write(&temporary_path, text.as_bytes())
-        .map_err(|error| format!("Could not convert CSV to UTF-8: {error}"))?;
+    let conversion_result = (|| -> Result<(), String> {
+        const INPUT_BUFFER_SIZE: usize = 64 * 1024;
+        const OUTPUT_BUFFER_SIZE: usize = 256 * 1024;
 
+        let source = File::open(path)
+            .map_err(|error| format!("Cannot read CSV file: {error}"))?;
+        let destination = File::create(&temporary_path)
+            .map_err(|error| format!("Could not create temporary CSV: {error}"))?;
+
+        let mut reader = BufReader::new(source);
+        let mut writer = BufWriter::new(destination);
+        let mut decoder = encoding.new_decoder_without_bom_handling();
+        let mut input = [0_u8; INPUT_BUFFER_SIZE];
+        let mut output = [0_u8; OUTPUT_BUFFER_SIZE];
+        let mut had_errors = false;
+
+        loop {
+            let bytes_read = reader
+                .read(&mut input)
+                .map_err(|error| format!("Cannot read CSV file: {error}"))?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            let mut consumed = 0;
+
+            loop {
+                let (result, read, written, decode_had_errors) = decoder.decode_to_utf8(
+                    &input[consumed..bytes_read],
+                    &mut output,
+                    false,
+                );
+
+                consumed += read;
+                had_errors |= decode_had_errors;
+
+                writer
+                    .write_all(&output[..written])
+                    .map_err(|error| format!("Could not write temporary CSV: {error}"))?;
+
+                match result {
+                    encoding_rs::CoderResult::InputEmpty => break,
+                    encoding_rs::CoderResult::OutputFull => continue,
+                }
+            }
+        }
+
+        loop {
+            let (result, _, written, decode_had_errors) =
+                decoder.decode_to_utf8(b"", &mut output, true);
+
+            had_errors |= decode_had_errors;
+
+            writer
+                .write_all(&output[..written])
+                .map_err(|error| format!("Could not write temporary CSV: {error}"))?;
+
+            if result == encoding_rs::CoderResult::InputEmpty {
+                break;
+            }
+        }
+
+        writer
+            .flush()
+            .map_err(|error| format!("Could not finish temporary CSV: {error}"))?;
+
+        if had_errors {
+            return Err(format!(
+                "The CSV contains invalid characters for {}.",
+                encoding.name()
+            ));
+        }
+
+        Ok(())
+    })();
+
+    if conversion_result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+
+    conversion_result?;
     Ok(Some(temporary_path))
 }
 
@@ -1218,6 +1336,7 @@ fn main() {
                 register_duckdb_query_as_table,
                 remove_duckdb_result_table,
                 restore_duckdb_view,
+                configure_duckdb_memory_limit,
                 take_startup_file,
                 pick_file,
                 pick_parquet_file,

@@ -253,6 +253,9 @@ const setDensity = $("setDensity");
 const setFont = $("setFont");
 const setAutoFit = $("setAutoFit");
 const setCase = $("setCase");
+const setDuckDbMemoryLimit = $("setDuckDbMemoryLimit");
+const setCsvImportMaxSize = $("setCsvImportMaxSize");
+const setCsvMaxLineSize = $("setCsvMaxLineSize");
 
 // ---- State ------------------------------------------------------------------
 let currentPath = null;
@@ -1551,7 +1554,7 @@ function initSqlEditor() {
       language: LanguageIdEnum.GENERIC,
       theme: sqlEditorThemeName(),
       automaticLayout: true,
-      fixedOverflowWidgets: true,
+      fixedOverflowWidgets: false,
       fontFamily: "var(--mono)",
       fontSize: 12,
       lineHeight: 19,
@@ -1571,6 +1574,38 @@ function initSqlEditor() {
         bottom: 12,
       },
     });
+
+    const setFindReplaceButtonTitles = () => {
+      const replaceButton = sqlEditorEl.querySelector(
+          ".codicon-find-replace",
+      );
+      const replaceAllButton = sqlEditorEl.querySelector(
+          ".codicon-find-replace-all",
+      );
+
+      if (replaceButton && !replaceButton.hasAttribute("title")) {
+        replaceButton.setAttribute(
+            "title",
+            replaceButton.getAttribute("aria-label") || "Replace",
+        );
+      }
+
+      if (replaceAllButton && !replaceAllButton.hasAttribute("title")) {
+        replaceAllButton.setAttribute(
+            "title",
+            replaceAllButton.getAttribute("aria-label") || "Replace All",
+        );
+      }
+    };
+
+    const findReplaceObserver = new MutationObserver(
+        setFindReplaceButtonTitles,
+    );
+    findReplaceObserver.observe(sqlEditorEl, {
+      childList: true,
+      subtree: true,
+    });
+    sqlEditor.onDidDispose(() => findReplaceObserver.disconnect());
 
     pendingSqlEditorValue = null;
 
@@ -1649,16 +1684,6 @@ function initSqlEditor() {
   };
 
   createEditor();
-}
-
-function sqlUsesDynamicResultShape(sql) {
-  const normalized = sql
-      .replace(/--.*$/gm, "")
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .toUpperCase();
-
-  // return /\bPIVOT\b|\bUNPIVOT\b/.test(normalized);
-  return false;
 }
 
 function viewNameFromLeadingSqlComment(sql) {
@@ -2008,6 +2033,8 @@ async function saveCsvAsParquet() {
       path: csvPath,
       encoding,
       allVarchar,
+      maxCsvImportMib: settings.csvImportMaxSizeGiB * 1024,
+      maxCsvLineSizeMib: settings.csvMaxLineSizeMiB,
     });
 
     if (parquetPath) {
@@ -3489,6 +3516,9 @@ const DEFAULT_SETTINGS = {
   density: "default",
   font: "default",
   autoFit: true,
+  duckDbMemoryLimitMiB: 2048,
+  csvImportMaxSizeGiB: 4,
+  csvMaxLineSizeMiB: 8,
 };
 let settings = { ...DEFAULT_SETTINGS };
 const DENSITY_PX = { compact: 24, default: 30, comfortable: 38 };
@@ -3509,6 +3539,17 @@ function saveSettings() {
     /* ignore */
   }
 }
+async function applyDuckDbMemoryLimit() {
+  try {
+    await invoke("configure_duckdb_memory_limit", {
+      memoryLimitMib: settings.duckDbMemoryLimitMiB,
+    });
+  } catch (error) {
+    console.warn("Could not update DuckDB memory limit:", error);
+    showToast("Could not update the DuckDB memory limit: " + error);
+  }
+}
+
 function applySettings(rerender) {
   const root = document.documentElement;
   if (settings.theme === "auto") root.removeAttribute("data-theme");
@@ -3530,6 +3571,49 @@ function initSettingsControls() {
   setDensity.value = settings.density;
   setFont.value = settings.font;
   setAutoFit.checked = settings.autoFit;
+  setDuckDbMemoryLimit.value = String(settings.duckDbMemoryLimitMiB);
+  setCsvImportMaxSize.value = String(settings.csvImportMaxSizeGiB);
+  setCsvMaxLineSize.value = String(settings.csvMaxLineSizeMiB);
+
+  setTheme.addEventListener("change", () => {
+    settings.theme = setTheme.value;
+    applySettings(true);
+    saveSettings();
+  });
+
+  setDensity.addEventListener("change", () => {
+    settings.density = setDensity.value;
+    applySettings(true);
+    saveSettings();
+  });
+
+  setFont.addEventListener("change", () => {
+    settings.font = setFont.value;
+    applySettings(true);
+    saveSettings();
+  });
+
+  setAutoFit.addEventListener("change", () => {
+    settings.autoFit = setAutoFit.checked;
+    applySettings(true);
+    saveSettings();
+  });
+
+  setDuckDbMemoryLimit.addEventListener("change", () => {
+    settings.duckDbMemoryLimitMiB = Number(setDuckDbMemoryLimit.value);
+    saveSettings();
+    void applyDuckDbMemoryLimit();
+  });
+
+  setCsvImportMaxSize.addEventListener("change", () => {
+    settings.csvImportMaxSizeGiB = Number(setCsvImportMaxSize.value);
+    saveSettings();
+  });
+
+  setCsvMaxLineSize.addEventListener("change", () => {
+    settings.csvMaxLineSizeMiB = Number(setCsvMaxLineSize.value);
+    saveSettings();
+  });
 }
 function openSettings() {
   settingsWin.classList.add("open");
@@ -3561,7 +3645,6 @@ setAutoFit.addEventListener("change", () => {
   saveSettings();
 });
 
-// settingsBtn.addEventListener("click", openSettings);
 settingsClose.addEventListener("click", closeSettings);
 settingsBackdrop.addEventListener("click", closeSettings);
 
@@ -3905,6 +3988,7 @@ listen("open-file", (e) => {
 // ---- Startup ----------------------------------------------------------------
 loadSettings();
 applySettings(false);
+void applyDuckDbMemoryLimit();
 initSettingsControls();
 initSqlEditor();
 

@@ -67,7 +67,7 @@ impl DuckDbState {
         connection
             .execute_batch(
                 "
-                SET memory_limit = '2GB';
+                SET memory_limit = '2GiB';
                 SET preserve_insertion_order = false;
                 ",
             )
@@ -80,6 +80,30 @@ impl DuckDbState {
             next_query_id: AtomicU64::new(1),
         })
     }
+}
+
+#[tauri::command]
+pub(crate) fn configure_duckdb_memory_limit(
+    duckdb: State<'_, DuckDbState>,
+    memory_limit_mib: u64,
+) -> Result<(), String> {
+    const MIN_MEMORY_LIMIT_MIB: u64 = 512;
+    const MAX_MEMORY_LIMIT_MIB: u64 = 65_536;
+
+    if !(MIN_MEMORY_LIMIT_MIB..=MAX_MEMORY_LIMIT_MIB).contains(&memory_limit_mib) {
+        return Err(format!(
+            "DuckDB memory limit must be between {MIN_MEMORY_LIMIT_MIB} MiB and {MAX_MEMORY_LIMIT_MIB} MiB."
+        ));
+    }
+
+    duckdb
+        .connection
+        .lock()
+        .unwrap()
+        .execute_batch(&format!("SET memory_limit = '{memory_limit_mib}MiB'"))
+        .map_err(|error| format!("Could not configure DuckDB memory limit: {error}"))?;
+
+    Ok(())
 }
 
 #[allow(unused)]
