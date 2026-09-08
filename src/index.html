@@ -234,6 +234,8 @@
             <option value="4096">4 GiB</option>
             <option value="8192">8 GiB</option>
             <option value="16384">16 GiB</option>
+            <option value="24576">24 GiB</option>
+            <option value="32768">32 GiB</option>
           </select>
         </div>
         <div class="set-row">
@@ -405,6 +407,45 @@
       </div>
     </div>
 
+    <div id="csvImportErrorBackdrop" class="modal-backdrop"></div>
+    <div
+            id="csvImportErrorWin"
+            class="settings-win csv-import-error-win"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="csvImportErrorTitle"
+            aria-describedby="csvImportErrorMessage"
+    >
+      <div class="win-head">
+        <h2 id="csvImportErrorTitle">CSV import failed</h2>
+        <button
+                id="csvImportErrorClose"
+                class="icon-btn"
+                type="button"
+                title="Close"
+                aria-label="Close"
+        >✕</button>
+      </div>
+      <div class="win-body">
+        <p class="csv-import-error-description">
+          The CSV was not converted. Review and copy the error below if you
+          need to adjust the import settings or inspect the source file.
+        </p>
+        <pre
+                id="csvImportErrorMessage"
+                class="csv-import-error-message"
+                tabindex="0"
+        ></pre>
+        <div class="csv-import-actions">
+          <button id="csvImportErrorCopyBtn" class="btn ghost" type="button">
+            Copy error
+          </button>
+          <button id="csvImportErrorDismissBtn" class="btn primary" type="button">
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
     <!-- Drop overlay -->
     <div id="dropOverlay" class="drop-overlay">
       <div class="drop-inner">Drop to open .parquet or .csv</div>

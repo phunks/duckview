@@ -230,6 +230,12 @@ const csvImportClose = $("csvImportClose");
 const csvImportCancelBtn = $("csvImportCancelBtn");
 const csvImportSaveBtn = $("csvImportSaveBtn");
 const csvImportAllVarchar = $("csvImportAllVarchar");
+const csvImportErrorWin = $("csvImportErrorWin");
+const csvImportErrorBackdrop = $("csvImportErrorBackdrop");
+const csvImportErrorMessage = $("csvImportErrorMessage");
+const csvImportErrorClose = $("csvImportErrorClose");
+const csvImportErrorDismissBtn = $("csvImportErrorDismissBtn");
+const csvImportErrorCopyBtn = $("csvImportErrorCopyBtn");
 const appMenuBtn = $("appMenuBtn");
 const appMenu = $("appMenu");
 const appMenuBackdrop = $("appMenuBackdrop");
@@ -2020,6 +2026,28 @@ function closeCsvImportDialog() {
   exportFormatBackdrop.classList.remove("open");
 }
 
+function openCsvImportError(error) {
+  csvImportErrorMessage.textContent = String(error);
+  csvImportErrorWin.classList.add("open");
+  csvImportErrorBackdrop.classList.add("open");
+  csvImportErrorClose.focus();
+}
+
+function closeCsvImportError() {
+  csvImportErrorWin.classList.remove("open");
+  csvImportErrorBackdrop.classList.remove("open");
+}
+
+async function copyCsvImportError() {
+  try {
+    await navigator.clipboard.writeText(csvImportErrorMessage.textContent);
+    showToast("CSV import error copied to clipboard.");
+  } catch (error) {
+    console.warn("Could not copy CSV import error:", error);
+    showToast("Could not copy the CSV import error.");
+  }
+}
+
 async function saveCsvAsParquet() {
   const csvPath = pendingCsvImportPath;
   if (!csvPath) return;
@@ -2042,7 +2070,7 @@ async function saveCsvAsParquet() {
       await openParquetPath(parquetPath);
     }
   } catch (error) {
-    showToast("Couldn’t import CSV: " + error);
+    openCsvImportError("Could not convert CSV to Parquet:\n\n" + error);
   } finally {
     setLoading(false);
   }
@@ -2105,11 +2133,13 @@ exportExcelCsvBtn.addEventListener("click", () => exportSql("csv_excel"));
 exportFormatClose.addEventListener("click", closeExportFormatDialog);
 exportFormatBackdrop.addEventListener("click", () => {
   closeExportFormatDialog();
-  closeCsvImportDialog();
 });
 csvImportClose.addEventListener("click", closeCsvImportDialog);
 csvImportCancelBtn.addEventListener("click", closeCsvImportDialog);
 csvImportSaveBtn.addEventListener("click", saveCsvAsParquet);
+csvImportErrorClose.addEventListener("click", closeCsvImportError);
+csvImportErrorDismissBtn.addEventListener("click", closeCsvImportError);
+csvImportErrorCopyBtn.addEventListener("click", copyCsvImportError);
 
 function closeAppMenu() {
   appMenu.classList.add("hidden");
@@ -3949,6 +3979,7 @@ window.addEventListener("keydown", (e) => {
   } else if (e.key === "Escape") {
     closeWorkspaceDialog();
     closeExportFormatDialog();
+    closeCsvImportError();
     closeCsvImportDialog();
     closeSettings();
     closeAdvanced();

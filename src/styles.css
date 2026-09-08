@@ -1341,6 +1341,37 @@ body {
   gap: 8px;
 }
 
+.csv-import-error-win {
+  width: min(760px, calc(100vw - 32px));
+}
+
+.csv-import-error-description {
+  margin: 0 0 12px;
+  color: inherit;
+  opacity: 0.72;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.csv-import-error-message {
+  box-sizing: border-box;
+  width: 100%;
+  max-height: min(52vh, 420px);
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  color: inherit;
+  background: rgb(0 0 0 / 6%);
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
 .export-format-options {
   display: grid;
   grid-template-columns: 1fr 1fr;
