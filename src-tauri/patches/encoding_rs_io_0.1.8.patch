@@ -1,0 +1,174 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 452ac62..3a18c45 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -93,7 +93,7 @@ extern crate encoding_rs;
+ use std::fmt;
+ use std::io::{self, Read};
+ 
+-use encoding_rs::{Decoder, Encoding, UTF_8};
++use encoding_rs::{Decoder, DecoderResult, Encoding, UTF_8};
+ 
+ use util::{BomPeeker, TinyTranscoder};
+ 
+@@ -107,6 +107,7 @@ pub struct DecodeReaderBytesBuilder {
+     bom_override: bool,
+     strip_bom: bool,
+     bom_sniffing: bool,
++    lossy: bool,
+ }
+ 
+ impl Default for DecodeReaderBytesBuilder {
+@@ -129,6 +130,7 @@ impl DecodeReaderBytesBuilder {
+             bom_override: false,
+             strip_bom: false,
+             bom_sniffing: true,
++            lossy: true,
+         }
+     }
+ 
+@@ -176,6 +178,7 @@ impl DecodeReaderBytesBuilder {
+             decoder: encoding,
+             tiny: TinyTranscoder::new(),
+             utf8_passthru: self.utf8_passthru,
++            lossy: self.lossy,
+             buf: buffer,
+             buflen: 0,
+             pos: 0,
+@@ -328,6 +331,14 @@ impl DecodeReaderBytesBuilder {
+         self.bom_sniffing = yes;
+         self
+     }
++
++    pub fn lossy(
++        &mut self,
++        yes: bool,
++    ) -> &mut DecodeReaderBytesBuilder {
++        self.lossy = yes;
++        self
++    }
+ }
+ 
+ /// An implementation of `io::Read` that transcodes to UTF-8 in a streaming
+@@ -367,6 +378,8 @@ pub struct DecodeReaderBytes<R, B> {
+     /// the UTF-8 transcoder (which will replace invalid sequences with the
+     /// REPLACEMENT CHARACTER).
+     utf8_passthru: bool,
++    /// Whether malformed source bytes should be replaced with U+FFFD.
++    lossy: bool,
+     /// The internal buffer to store transcoded bytes before they are read by
+     /// callers.
+     buf: B,
+@@ -428,43 +441,92 @@ impl<R: io::Read, B: AsMut<[u8]>> DecodeReaderBytes<R, B> {
+         if self.exhausted || buf.is_empty() {
+             return Ok(0);
+         }
++
+         let nwrite = self.tiny.read(buf)?;
+         if nwrite > 0 {
+-            // We could technically mush on if the caller provided buffer is
+-            // big enough, but to keep things we simple, we satisfy the
+-            // contract and quit.
+             return Ok(nwrite);
+         }
++
+         if self.pos >= self.buflen {
+             self.fill()?;
+         }
++
+         if buf.len() < 4 {
+             return self.tiny_transcode(buf);
+         }
++
+         loop {
+-            let (_, nin, nout, _) =
+-                self.decoder.as_mut().unwrap().decode_to_utf8(
+-                    &self.buf.as_mut()[self.pos..self.buflen],
+-                    buf,
+-                    false,
+-                );
+-            self.pos += nin;
+-            // If we've written at least one byte to the caller-provided
+-            // buffer, then our mission is complete.
+-            if nout > 0 {
+-                return Ok(nout);
++            let source = &self.buf.as_mut()[self.pos..self.buflen];
++
++            if self.lossy {
++                let (_, nread, nwritten, _) = self
++                    .decoder
++                    .as_mut()
++                    .unwrap()
++                    .decode_to_utf8(source, buf, false);
++
++                self.pos += nread;
++
++                if nwritten > 0 {
++                    return Ok(nwritten);
++                }
++            } else {
++                let (result, nread, nwritten) = self
++                    .decoder
++                    .as_mut()
++                    .unwrap()
++                    .decode_to_utf8_without_replacement(source, buf, false);
++
++                self.pos += nread;
++
++                if let DecoderResult::Malformed(malformed_len, trailing_len) = result {
++                    return Err(io::Error::new(
++                        io::ErrorKind::InvalidData,
++                        format!(
++                            "Invalid {} byte sequence (length {malformed_len}, \
++                                 followed by {trailing_len} consumed byte(s)).",
++                            self.decoder.as_ref().unwrap().encoding().name(),
++                        ),
++                    ));
++                }
++
++                if nwritten > 0 {
++                    return Ok(nwritten);
++                }
+             }
+-            // Otherwise, we know that our internal buffer has insufficient
+-            // data to transcode at least one char, so we attempt to refill it.
++
+             self.fill()?;
+-            // ... but quit on EOF.
++
+             if self.buflen == 0 {
+-                let (_, _, nout, _) = self
++                if self.lossy {
++                    let (_, _, nwritten, _) = self
++                        .decoder
++                        .as_mut()
++                        .unwrap()
++                        .decode_to_utf8(&[], buf, true);
++
++                    return Ok(nwritten);
++                }
++
++                let (result, _, nwritten) = self
+                     .decoder
+                     .as_mut()
+                     .unwrap()
+-                    .decode_to_utf8(&[], buf, true);
+-                return Ok(nout);
++                    .decode_to_utf8_without_replacement(&[], buf, true);
++
++                if let DecoderResult::Malformed(malformed_len, trailing_len) = result {
++                    return Err(io::Error::new(
++                        io::ErrorKind::InvalidData,
++                        format!(
++                            "Incomplete or invalid {} byte sequence at end of file \
++                                 (length {malformed_len}, followed by {trailing_len} \
++                                 consumed byte(s)).",
++                            self.decoder.as_ref().unwrap().encoding().name(),
++                        ),
++                    ));
++                }
++
++                return Ok(nwritten);
+             }
+         }
+     }

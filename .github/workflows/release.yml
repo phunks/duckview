@@ -49,6 +49,14 @@ jobs:
             patchelf \
             xdg-utils
 
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Setup patched vendored dependencies
+        shell: bash
+        run: |
+          just setup-ext
+
       - name: Extract crate information
         shell: bash
         run: |

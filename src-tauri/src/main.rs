@@ -1048,6 +1048,43 @@ fn csv_line_size_bytes(max_csv_line_size_mib: u64) -> Result<u64, String> {
     Ok(max_csv_line_size_mib * 1024 * 1024)
 }
 
+fn is_valid_utf8_file(path: &str) -> Result<bool, String> {
+    const BUFFER_SIZE: usize = 64 * 1024;
+
+    let source = File::open(path)
+        .map_err(|error| format!("Cannot read CSV file: {error}"))?;
+    let mut reader = BufReader::new(source);
+    let mut buffer = [0_u8; BUFFER_SIZE];
+    let mut pending = Vec::<u8>::with_capacity(3);
+
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("Cannot read CSV file: {error}"))?;
+
+        if bytes_read == 0 {
+            return Ok(pending.is_empty());
+        }
+
+        pending.extend_from_slice(&buffer[..bytes_read]);
+
+        match std::str::from_utf8(&pending) {
+            Ok(_) => pending.clear(),
+            Err(error) if error.error_len().is_some() => return Ok(false),
+            Err(error) => {
+                let valid_end = error.valid_up_to();
+                let incomplete = pending[valid_end..].to_vec();
+
+                if incomplete.len() > 3 {
+                    return Ok(false);
+                }
+
+                pending = incomplete;
+            }
+        }
+    }
+}
+
 fn csv_source_for_import(
     path: &str,
     encoding_name: &str,
@@ -1056,6 +1093,15 @@ fn csv_source_for_import(
         // DuckDB reads CSV files incrementally. Do not load the entire file only
         // to validate UTF-8: invalid UTF-8 is reported by the import itself.
         return Ok(None);
+    }
+
+    if is_valid_utf8_file(path)? {
+        return Err(
+            "This file is valid UTF-8. Importing it as Shift_JIS or another \
+             legacy encoding can corrupt text (for example, emoji becoming \
+             mojibake). Select UTF-8 as the text encoding instead."
+                .to_string(),
+        );
     }
 
     let encoding = match encoding_name {
@@ -1068,6 +1114,15 @@ fn csv_source_for_import(
         _ => return Err("Unsupported CSV text encoding.".to_string()),
     };
 
+    if is_valid_utf8_file(path)? {
+        return Err(format!(
+            "This file is valid UTF-8. Importing it as {} can corrupt text \
+             (for example, emoji becoming mojibake). Select UTF-8 as the \
+             text encoding instead.",
+            encoding.name()
+        ));
+    }
+
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| format!("Could not create a temporary CSV path: {error}"))?
@@ -1079,78 +1134,51 @@ fn csv_source_for_import(
     ));
 
     let conversion_result = (|| -> Result<(), String> {
-        const INPUT_BUFFER_SIZE: usize = 64 * 1024;
-        const OUTPUT_BUFFER_SIZE: usize = 256 * 1024;
+        use std::io::BufRead;
 
         let source = File::open(path)
             .map_err(|error| format!("Cannot read CSV file: {error}"))?;
         let destination = File::create(&temporary_path)
             .map_err(|error| format!("Could not create temporary CSV: {error}"))?;
 
-        let mut reader = BufReader::new(source);
+        let decoder = encoding_rs_io::DecodeReaderBytesBuilder::new()
+            .encoding(Some(encoding))
+            .lossy(false)
+            .build(source);
+
+        let mut reader = BufReader::new(decoder);
         let mut writer = BufWriter::new(destination);
-        let mut decoder = encoding.new_decoder_without_bom_handling();
-        let mut input = [0_u8; INPUT_BUFFER_SIZE];
-        let mut output = [0_u8; OUTPUT_BUFFER_SIZE];
-        let mut had_errors = false;
+        let mut line_number = 1_u64;
+        let mut line = String::new();
 
         loop {
-            let bytes_read = reader
-                .read(&mut input)
-                .map_err(|error| format!("Cannot read CSV file: {error}"))?;
+            line.clear();
 
-            if bytes_read == 0 {
-                break;
-            }
-
-            let mut consumed = 0;
-
-            loop {
-                let (result, read, written, decode_had_errors) = decoder.decode_to_utf8(
-                    &input[consumed..bytes_read],
-                    &mut output,
-                    false,
-                );
-
-                consumed += read;
-                had_errors |= decode_had_errors;
-
-                writer
-                    .write_all(&output[..written])
-                    .map_err(|error| format!("Could not write temporary CSV: {error}"))?;
-
-                match result {
-                    encoding_rs::CoderResult::InputEmpty => break,
-                    encoding_rs::CoderResult::OutputFull => continue,
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    writer
+                        .write_all(line.as_bytes())
+                        .map_err(|error| format!("Could not write temporary CSV: {error}"))?;
+                    line_number += 1;
                 }
-            }
-        }
-
-        loop {
-            let (result, _, written, decode_had_errors) =
-                decoder.decode_to_utf8(b"", &mut output, true);
-
-            had_errors |= decode_had_errors;
-
-            writer
-                .write_all(&output[..written])
-                .map_err(|error| format!("Could not write temporary CSV: {error}"))?;
-
-            if result == encoding_rs::CoderResult::InputEmpty {
-                break;
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err(format!(
+                        "The CSV is not valid {} at physical line {line_number}: {error}",
+                        encoding.name()
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Cannot read CSV near physical line {line_number}: {error}"
+                    ));
+                }
             }
         }
 
         writer
             .flush()
             .map_err(|error| format!("Could not finish temporary CSV: {error}"))?;
-
-        if had_errors {
-            return Err(format!(
-                "The CSV contains invalid characters for {}.",
-                encoding.name()
-            ));
-        }
 
         Ok(())
     })();
