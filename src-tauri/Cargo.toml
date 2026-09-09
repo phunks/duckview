@@ -1,6 +1,6 @@
 [package]
 name = "duckview"
-version = "0.3.5"
+version = "0.3.6"
 description = "Parquet file viewer and SQL editor"
 authors = ["pnk"]
 edition = "2024"
@@ -18,8 +18,12 @@ encoding_rs = "0.8"
 encoding_rs_io = "0.1.8"
 arrow = "=58.4.0"
 arrow-ipc = "=58.4.0"
+arrow-csv = { version = "=58.4.0" }
+arrow-schema = { version = "=58.4.0" }
 parquet = "=58.4.0"
 duckdb = { version = "1", features = ["bundled", "parquet"] }
+thiserror = "2.0.20"
+sysinfo = "0.37"
 
 [profile.release]
 opt-level = 2

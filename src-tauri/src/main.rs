@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod duck;
+mod csv;
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -911,17 +912,18 @@ async fn pick_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
 #[tauri::command]
 async fn import_csv_as_parquet(
     app: tauri::AppHandle,
-    duckdb: State<'_, DuckDbState>,
     path: String,
     encoding: String,
     all_varchar: bool,
     max_csv_import_mib: u64,
-    max_csv_line_size_mib: u64,
+    conversion_profile: String,
 ) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
 
     ensure_csv_import_size(&path, max_csv_import_mib)?;
-    let max_line_size_bytes = csv_line_size_bytes(max_csv_line_size_mib)?;
+
+    let conversion_profile = csv::ConvertProfile::parse(&conversion_profile)
+        .map_err(|error| error.to_string())?;
 
     let source = std::path::Path::new(&path);
     let file_name = source
@@ -942,39 +944,46 @@ async fn import_csv_as_parquet(
         return Ok(None);
     };
 
-    let temporary_csv = csv_source_for_import(&path, &encoding)?;
-    let csv_path = temporary_csv
-        .as_deref()
-        .unwrap_or_else(|| std::path::Path::new(&path));
+    let source_encoding = csv_encoding_for_import(&path, &encoding)?;
     let output_path = output_path.to_string_lossy().to_string();
-    let all_varchar = if all_varchar { "true" } else { "false" };
 
-    let copy_sql = format!(
-        "COPY (
-                SELECT *
-                FROM read_csv_auto(
-                    {},
-                    all_varchar = {},
-                    max_line_size = {}
-                )
-             ) TO {} WITH (FORMAT PARQUET, COMPRESSION ZSTD)",
-        quote_sql_string(&csv_path.to_string_lossy()),
-        all_varchar,
-        max_line_size_bytes,
-        quote_sql_string(&output_path),
-    );
+    let mut options = csv::options_for_profile(conversion_profile);
+    options.all_varchar = all_varchar;
 
-    let import_result = duckdb
-        .connection
-        .lock()
-        .unwrap()
-        .execute_batch(&copy_sql);
+    let input_path = std::path::PathBuf::from(&path);
+    let output_path_for_conversion = std::path::PathBuf::from(&output_path);
 
-    if let Some(temporary_csv) = temporary_csv {
-        let _ = std::fs::remove_file(temporary_csv);
+    let import_result = tauri::async_runtime::spawn_blocking(move || {
+        if let Some(encoding) = source_encoding {
+            csv::convert_reader_to_parquet(
+                || {
+                    let source = File::open(&input_path)?;
+
+                    Ok(
+                        encoding_rs_io::DecodeReaderBytesBuilder::new()
+                            .encoding(Some(encoding))
+                            .lossy(false)
+                            .build(source),
+                    )
+                },
+                &output_path_for_conversion,
+                &options,
+            )
+        } else {
+            csv::convert_csv_to_parquet(
+                &input_path,
+                &output_path_for_conversion,
+                &options,
+            )
+        }
+    })
+        .await
+        .map_err(|error| format!("CSV conversion task failed: {error}"))?;
+
+    if let Err(error) = import_result {
+        let _ = std::fs::remove_file(&output_path);
+        return Err(format!("Could not convert CSV to Parquet: {error}"));
     }
-
-    import_result.map_err(|error| format!("Could not convert CSV to Parquet: {error}"))?;
 
     Ok(Some(output_path))
 }
@@ -1085,23 +1094,12 @@ fn is_valid_utf8_file(path: &str) -> Result<bool, String> {
     }
 }
 
-fn csv_source_for_import(
+fn csv_encoding_for_import(
     path: &str,
     encoding_name: &str,
-) -> Result<Option<std::path::PathBuf>, String> {
+) -> Result<Option<&'static encoding_rs::Encoding>, String> {
     if encoding_name == "utf-8" {
-        // DuckDB reads CSV files incrementally. Do not load the entire file only
-        // to validate UTF-8: invalid UTF-8 is reported by the import itself.
         return Ok(None);
-    }
-
-    if is_valid_utf8_file(path)? {
-        return Err(
-            "This file is valid UTF-8. Importing it as Shift_JIS or another \
-             legacy encoding can corrupt text (for example, emoji becoming \
-             mojibake). Select UTF-8 as the text encoding instead."
-                .to_string(),
-        );
     }
 
     let encoding = match encoding_name {
@@ -1116,79 +1114,12 @@ fn csv_source_for_import(
 
     if is_valid_utf8_file(path)? {
         return Err(format!(
-            "This file is valid UTF-8. Importing it as {} can corrupt text \
-             (for example, emoji becoming mojibake). Select UTF-8 as the \
-             text encoding instead.",
+            "This file is valid UTF-8. Importing it as {} can corrupt text.",
             encoding.name()
         ));
     }
 
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("Could not create a temporary CSV path: {error}"))?
-        .as_nanos();
-
-    let temporary_path = std::env::temp_dir().join(format!(
-        "duckview-csv-{}-{unique}.csv",
-        std::process::id()
-    ));
-
-    let conversion_result = (|| -> Result<(), String> {
-        use std::io::BufRead;
-
-        let source = File::open(path)
-            .map_err(|error| format!("Cannot read CSV file: {error}"))?;
-        let destination = File::create(&temporary_path)
-            .map_err(|error| format!("Could not create temporary CSV: {error}"))?;
-
-        let decoder = encoding_rs_io::DecodeReaderBytesBuilder::new()
-            .encoding(Some(encoding))
-            .lossy(false)
-            .build(source);
-
-        let mut reader = BufReader::new(decoder);
-        let mut writer = BufWriter::new(destination);
-        let mut line_number = 1_u64;
-        let mut line = String::new();
-
-        loop {
-            line.clear();
-
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {
-                    writer
-                        .write_all(line.as_bytes())
-                        .map_err(|error| format!("Could not write temporary CSV: {error}"))?;
-                    line_number += 1;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                    return Err(format!(
-                        "The CSV is not valid {} at physical line {line_number}: {error}",
-                        encoding.name()
-                    ));
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "Cannot read CSV near physical line {line_number}: {error}"
-                    ));
-                }
-            }
-        }
-
-        writer
-            .flush()
-            .map_err(|error| format!("Could not finish temporary CSV: {error}"))?;
-
-        Ok(())
-    })();
-
-    if conversion_result.is_err() {
-        let _ = std::fs::remove_file(&temporary_path);
-    }
-
-    conversion_result?;
-    Ok(Some(temporary_path))
+    Ok(Some(encoding))
 }
 
 fn duck_table_base_name(path: &str) -> String {

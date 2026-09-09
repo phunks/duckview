@@ -226,7 +226,7 @@
         <div class="set-row">
           <div class="set-label">
             <span>DuckDB memory limit</span>
-            <small>Maximum memory used for imports and SQL queries.</small>
+            <small>Maximum memory used for SQL queries and DuckDB operations.</small>
           </div>
           <select id="setDuckDbMemoryLimit" class="select">
             <option value="1024">1 GiB</option>
@@ -236,6 +236,18 @@
             <option value="16384">16 GiB</option>
             <option value="24576">24 GiB</option>
             <option value="32768">32 GiB</option>
+          </select>
+        </div>
+        <div class="set-row">
+          <div class="set-label">
+            <span>CSV conversion profile</span>
+            <small>Controls memory use, Parquet row groups, and compression.</small>
+          </div>
+          <select id="setCsvConversionProfile" class="select">
+            <option value="auto">Auto</option>
+            <option value="low_memory">Low memory</option>
+            <option value="balanced">Balanced</option>
+            <option value="fast">Fast</option>
           </select>
         </div>
         <div class="set-row">

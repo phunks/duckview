@@ -262,6 +262,7 @@ const setCase = $("setCase");
 const setDuckDbMemoryLimit = $("setDuckDbMemoryLimit");
 const setCsvImportMaxSize = $("setCsvImportMaxSize");
 const setCsvMaxLineSize = $("setCsvMaxLineSize");
+const setCsvConversionProfile = $("setCsvConversionProfile");
 
 // ---- State ------------------------------------------------------------------
 let currentPath = null;
@@ -2062,7 +2063,7 @@ async function saveCsvAsParquet() {
       encoding,
       allVarchar,
       maxCsvImportMib: settings.csvImportMaxSizeGiB * 1024,
-      maxCsvLineSizeMib: settings.csvMaxLineSizeMiB,
+      conversionProfile: settings.csvConversionProfile,
     });
 
     if (parquetPath) {
@@ -3549,6 +3550,7 @@ const DEFAULT_SETTINGS = {
   duckDbMemoryLimitMiB: 2048,
   csvImportMaxSizeGiB: 4,
   csvMaxLineSizeMiB: 8,
+  csvConversionProfile: "auto",
 };
 let settings = { ...DEFAULT_SETTINGS };
 const DENSITY_PX = { compact: 24, default: 30, comfortable: 38 };
@@ -3604,6 +3606,7 @@ function initSettingsControls() {
   setDuckDbMemoryLimit.value = String(settings.duckDbMemoryLimitMiB);
   setCsvImportMaxSize.value = String(settings.csvImportMaxSizeGiB);
   setCsvMaxLineSize.value = String(settings.csvMaxLineSizeMiB);
+  setCsvConversionProfile.value = settings.csvConversionProfile;
 
   setTheme.addEventListener("change", () => {
     settings.theme = setTheme.value;
@@ -3644,6 +3647,11 @@ function initSettingsControls() {
     settings.csvMaxLineSizeMiB = Number(setCsvMaxLineSize.value);
     saveSettings();
   });
+
+  setCsvConversionProfile.addEventListener("change", () => {
+    settings.csvConversionProfile = setCsvConversionProfile.value;
+    saveSettings();
+  });
 }
 function openSettings() {
   settingsWin.classList.add("open");
@@ -3653,27 +3661,6 @@ function closeSettings() {
   settingsWin.classList.remove("open");
   settingsBackdrop.classList.remove("open");
 }
-
-setTheme.addEventListener("change", () => {
-  settings.theme = setTheme.value;
-  applySettings(false);
-  saveSettings();
-});
-setDensity.addEventListener("change", () => {
-  settings.density = setDensity.value;
-  applySettings(true);
-  saveSettings();
-});
-setFont.addEventListener("change", () => {
-  settings.font = setFont.value;
-  applySettings(true);
-  saveSettings();
-});
-setAutoFit.addEventListener("change", () => {
-  settings.autoFit = setAutoFit.checked;
-  applySettings(true);
-  saveSettings();
-});
 
 settingsClose.addEventListener("click", closeSettings);
 settingsBackdrop.addEventListener("click", closeSettings);
