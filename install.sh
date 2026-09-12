@@ -15,12 +15,30 @@ BUNDLE="$ROOT/src-tauri/target/release/bundle/macos/$APP_NAME"
 DEST="./src-tauri/target/$APP_NAME"
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
+echo "==> Cleaning previous bundle and dist output…"
+rm -rf "$ROOT/dist"
+rm -rf "$ROOT/src-tauri/target/release/bundle"
+
+echo "==> Building frontend (vite)…"
+( cd "$ROOT" && npm run vite:build )
+
+if [ ! -f "$ROOT/dist/index.html" ]; then
+  echo "!! Vite did not produce dist/index.html — aborting." >&2
+  exit 1
+fi
+
 echo "==> Building release bundle…"
 # The bundler may exit non-zero on the cosmetic xattr step; don't abort on it.
 ( cd "$ROOT" && npm run tauri build ) || echo "   (bundler returned non-zero — continuing; the .app is built before the xattr step)"
 
 if [ ! -d "$BUNDLE" ]; then
   echo "!! Build did not produce $BUNDLE" >&2
+  exit 1
+fi
+
+# Sanity check: the compiled asset must actually be inside the bundle.
+if ! /usr/bin/find "$BUNDLE" -name index.html -print -quit | grep -q .; then
+  echo "!! Bundle is missing index.html — the frontend was not embedded." >&2
   exit 1
 fi
 

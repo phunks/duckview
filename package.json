@@ -1,7 +1,7 @@
 {
   "name": "duckview",
   "private": true,
-  "version": "0.3.6",
+  "version": "0.3.7",
   "type": "module",
   "description": "Parquet file viewer and SQL editor.",
   "engines": {
@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "@apache-arrow/ts": "^17.0.0",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.3",
     "monaco-editor": "^0.54.0",
     "monaco-sql-languages": "^1.2.1",
     "sql-formatter": "^15.8.2"

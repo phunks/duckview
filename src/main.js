@@ -1,6 +1,7 @@
 import * as monacoApi from "monaco-editor";
 import "monaco-editor/esm/vs/basic-languages/monaco.contribution";
 import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
+import { writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
 import { tableFromIPC } from "@apache-arrow/ts";
 import { format } from "sql-formatter";
 import {
@@ -42,6 +43,8 @@ globalThis.MonacoEnvironment = {
 // ---- Tauri bridge (withGlobalTauri) ----------------------------------------
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
+const getCurrentWebviewWindow =
+    window.__TAURI__.webviewWindow.getCurrentWebviewWindow;
 
 function isArrowVector(value) {
   return value !== null &&
@@ -161,8 +164,10 @@ function arrowTableToRows(table, limit) {
 let ROW_H = 30; // updated by the density setting
 const HEADER_H = 34;
 const GUTTER_W = 66;
-const PAGE = 200; // rows fetched per backend request
+const PAGE = 200; // rows in one vertical page
+const COLUMN_PAGE = 64; // Parquet columns read in one projection
 const BUFFER = 8; // extra rows rendered above/below the viewport
+const COLUMN_BUFFER = 3; // columns rendered just outside the horizontal viewport
 const SEARCH_CAP = 100000; // must match SEARCH_CAP in main.rs
 
 // ---- DOM --------------------------------------------------------------------
@@ -268,6 +273,7 @@ const setCsvConversionProfile = $("setCsvConversionProfile");
 let currentPath = null;
 let fileMeta = null;
 let colWidths = [];
+let colOffsets = [];
 let gridWidth = 0;
 let resizeState = null;
 let suppressHeaderClick = false;
@@ -277,8 +283,11 @@ let filterState = null; // { query, column }
 let truncated = false;
 let viewToken = 0; // bumped on every view change to discard stale fetches
 
-let cache = new Map(); // pageIndex -> { rows, indices }
-let pending = new Set(); // pageIndex currently fetching
+// Key: `${rowPage}:${columnPage}`.
+// Value: { rows, columnOffset } where rows contain only COLUMN_PAGE columns.
+let cache = new Map();
+let rowIndices = new Map(); // rowPage -> global row indices
+let pending = new Set(); // `${rowPage}:${columnPage}`
 let edits = new Map(); // "globalRow:col" -> edited string (session-local, not saved to file)
 
 const tabs = new Map();
@@ -696,6 +705,7 @@ function resetWorkspaceUi() {
   filterState = null;
   truncated = false;
   cache = new Map();
+  rowIndices = new Map();
   pending = new Set();
   edits = new Map();
   sqlCompletionTables = [];
@@ -998,9 +1008,11 @@ function createTab(path, meta) {
     truncated: false,
     totalRows: meta.num_rows,
     cache: new Map(),
+    rowIndices: new Map(),
     pending: new Set(),
     edits: new Map(),
     scrollTop: 0,
+    scrollLeft: 0,
     viewToken: 0,
   };
 }
@@ -1562,6 +1574,7 @@ function initSqlEditor() {
       theme: sqlEditorThemeName(),
       automaticLayout: true,
       fixedOverflowWidgets: false,
+      copyWithSyntaxHighlighting: false,
       fontFamily: "var(--mono)",
       fontSize: 12,
       lineHeight: 19,
@@ -1579,6 +1592,24 @@ function initSqlEditor() {
       padding: {
         top: 12,
         bottom: 12,
+      },
+    });
+
+    sqlEditor.addAction({
+      id: "duckview.copy-sql-selection",
+      label: "Copy SQL Selection",
+      keybindings: [
+        monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyC,
+      ],
+      run: async () => {
+        const model = sqlEditor.getModel();
+        const selection = sqlEditor.getSelection();
+
+        if (!model || !selection || selection.isEmpty()) {
+          return;
+        }
+
+        await writeTextToClipboard(model.getValueInRange(selection));
       },
     });
 
@@ -2041,7 +2072,7 @@ function closeCsvImportError() {
 
 async function copyCsvImportError() {
   try {
-    await navigator.clipboard.writeText(csvImportErrorMessage.textContent);
+    await writeTextToClipboard(csvImportErrorMessage.textContent);
     showToast("CSV import error copied to clipboard.");
   } catch (error) {
     console.warn("Could not copy CSV import error:", error);
@@ -2236,12 +2267,14 @@ function saveActiveTabState() {
   if (!tab) return;
 
   tab.scrollTop = viewport.scrollTop;
+  tab.scrollLeft = viewport.scrollLeft;
   tab.colWidths = fileMeta ? [...colWidths] : null;
   tab.sortState = sortState;
   tab.filterState = filterState;
   tab.truncated = truncated;
   tab.totalRows = totalRows;
   tab.cache = cache;
+  tab.rowIndices = rowIndices;
   tab.pending = pending;
   tab.edits = edits;
   tab.viewToken = viewToken;
@@ -2268,6 +2301,7 @@ function restoreParquetTab(tab) {
   truncated = tab.truncated;
   totalRows = tab.missing ? 0 : tab.totalRows;
   cache = tab.cache;
+  rowIndices = tab.rowIndices || new Map();
   pending = tab.pending;
   edits = tab.edits;
   viewToken = tab.viewToken;
@@ -2289,6 +2323,7 @@ function restoreParquetTab(tab) {
 
   requestAnimationFrame(() => {
     viewport.scrollTop = tab.scrollTop;
+    viewport.scrollLeft = tab.scrollLeft || 0;
     if (!tab.missing) renderRows();
     updateStatus();
   });
@@ -2428,7 +2463,7 @@ async function removeWorkspaceView(viewName) {
 
 async function copySqlToClipboard(sql, label = "SQL") {
   try {
-    await navigator.clipboard.writeText(sql);
+    await writeTextToClipboard(sql);
     showToast(`${label} SQL copied to clipboard.`);
   } catch (error) {
     console.warn(`Could not copy ${label} SQL:`, error);
@@ -2800,7 +2835,7 @@ function sqlStringLiteral(value) {
 
 async function copyCellValueToClipboard(value) {
   try {
-    await navigator.clipboard.writeText(sqlStringLiteral(value));
+    await writeTextToClipboard(sqlStringLiteral(value));
     showToast("SQL literal copied to clipboard.");
   } catch (error) {
     console.warn("Could not copy cell value:", error);
@@ -2971,6 +3006,34 @@ function showToast(msg) {
   toastTimer = setTimeout(() => toast.classList.add("hidden"), 4800);
 }
 
+async function writeTextToClipboard(text) {
+  const value = String(text ?? "");
+
+  try {
+    await writeClipboardText(value);
+    return;
+  } catch (pluginError) {
+    console.warn("Tauri clipboard write failed; using DOM fallback:", pluginError);
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+
+  document.body.appendChild(textarea);
+  textarea.select();
+
+  const copied = document.execCommand("copy");
+  textarea.remove();
+
+  if (!copied) {
+    throw new Error("Could not copy text to the clipboard.");
+  }
+}
+
 // ---- Open a file ------------------------------------------------------------
 async function openPath(path) {
   if (isCsvPath(path)) {
@@ -3023,8 +3086,52 @@ async function pickFile() {
 
 // ---- Column sizing ----------------------------------------------------------
 function updateGridWidth() {
-  gridWidth = GUTTER_W + colWidths.reduce((sum, width) => sum + width, 0);
-  grid.style.width = gridWidth + "px";
+  colOffsets = new Array(colWidths.length + 1);
+  colOffsets[0] = GUTTER_W;
+
+  for (let index = 0; index < colWidths.length; index++) {
+    colOffsets[index + 1] = colOffsets[index] + colWidths[index];
+  }
+
+  gridWidth = colOffsets[colWidths.length] || GUTTER_W;
+  grid.style.width = `${gridWidth}px`;
+}
+
+function firstColumnEndingAfter(position) {
+  let low = 0;
+  let high = colWidths.length;
+
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+
+    if (colOffsets[middle + 1] <= position) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+
+  return low;
+}
+
+function visibleColumnRange() {
+  if (!fileMeta || !colWidths.length) {
+    return { start: 0, end: 0 };
+  }
+
+  const left = Math.max(GUTTER_W, viewport.scrollLeft);
+  const right = viewport.scrollLeft + viewport.clientWidth;
+
+  const start = Math.max(
+      0,
+      firstColumnEndingAfter(left) - COLUMN_BUFFER,
+  );
+  const end = Math.min(
+      colWidths.length,
+      firstColumnEndingAfter(right) + COLUMN_BUFFER + 1,
+  );
+
+  return { start, end };
 }
 
 function computeColWidths() {
@@ -3057,21 +3164,25 @@ function computeColWidths() {
 
 // ---- Rendering --------------------------------------------------------------
 function renderHeader() {
+  const { start, end } = visibleColumnRange();
   let html = '<div class="h-cell gutter">#</div>';
-  fileMeta.columns.forEach((c, i) => {
-    let ind = "";
-    if (sortState && sortState.column === i)
-      ind = `<span class="sort-ind">${sortState.ascending ? "▲" : "▼"}</span>`;
-    html += `<div class="h-cell" style="width:${colWidths[i]}px" data-col="${i}" title="${escapeHtml(c.name)} · ${escapeHtml(c.type)}">
-      <div class="h-name">${escapeHtml(c.name)}${ind}</div>
-      <div class="h-type">${escapeHtml(c.type)}</div>
+
+  for (let i = start; i < end; i++) {
+    const column = fileMeta.columns[i];
+    const indicator =
+        sortState && sortState.column === i
+            ? `<span class="sort-ind">${sortState.ascending ? "▲" : "▼"}</span>`
+            : "";
+
+    html += `<div class="h-cell" style="left:${colOffsets[i]}px;width:${colWidths[i]}px" data-col="${i}" title="${escapeHtml(column.name)} · ${escapeHtml(column.type)}">
+      <div class="h-name">${escapeHtml(column.name)}${indicator}</div>
+      <div class="h-type">${escapeHtml(column.type)}</div>
       <div class="column-resizer" data-resize-col="${i}" title="Drag to resize column" role="separator" aria-orientation="vertical"></div>
     </div>`;
-  });
-  html += '<div class="h-cell filler"></div>';
+  }
+
   headerRow.innerHTML = html;
-  headerRow.style.width = "100%";
-  updateGridWidth();
+  headerRow.style.width = `${gridWidth}px`;
 
   headerRow.querySelectorAll(".h-cell[data-col]").forEach((el) => {
     el.addEventListener("click", () => {
@@ -3079,6 +3190,7 @@ function renderHeader() {
         suppressHeaderClick = false;
         return;
       }
+
       onHeaderClick(parseInt(el.dataset.col, 10));
     });
   });
@@ -3143,111 +3255,175 @@ function updateSpacer() {
   spacer.style.height = totalRows * ROW_H + "px";
 }
 
-function getRow(i) {
-  const p = Math.floor(i / PAGE);
-  const page = cache.get(p);
-  if (!page) return null;
-  return page.rows[i - p * PAGE] ?? null;
+function cacheKey(rowPage, columnPage) {
+  return `${rowPage}:${columnPage}`;
 }
 
-// Global (file) row index for display row i — stable across sort/filter.
-function getGindex(i) {
-  const p = Math.floor(i / PAGE);
-  const page = cache.get(p);
-  if (!page) return null;
-  return page.indices[i - p * PAGE] ?? null;
+function rowPageFor(rowIndex) {
+  return Math.floor(rowIndex / PAGE);
+}
+
+function columnPageFor(columnIndex) {
+  return Math.floor(columnIndex / COLUMN_PAGE);
+}
+
+function columnOffsetFor(columnPage) {
+  return columnPage * COLUMN_PAGE;
+}
+
+function getPage(rowIndex, columnIndex) {
+  const rowPage = rowPageFor(rowIndex);
+  const columnPage = columnPageFor(columnIndex);
+  return cache.get(cacheKey(rowPage, columnPage)) || null;
+}
+
+function getCell(rowIndex, columnIndex) {
+  const page = getPage(rowIndex, columnIndex);
+  if (!page) {
+    return { loaded: false, value: undefined };
+  }
+
+  const row = page.rows[rowIndex % PAGE];
+  if (!row) {
+    return { loaded: false, value: undefined };
+  }
+
+  return {
+    loaded: true,
+    value: row[columnIndex - page.columnOffset],
+  };
+}
+
+// Global file-row index; it remains stable through sorting and filtering.
+function getGindex(rowIndex) {
+  const indices = rowIndices.get(rowPageFor(rowIndex));
+  return indices?.[rowIndex % PAGE] ?? null;
 }
 
 function renderRows() {
   if (!fileMeta) return;
-  if (editingEl) return; // don't rebuild while a cell editor is open
-  const vpH = viewport.clientHeight;
+  if (editingEl) return;
+
+  const viewportHeight = viewport.clientHeight;
   const first = Math.max(0, Math.floor(viewport.scrollTop / ROW_H) - BUFFER);
-  const visCount = Math.ceil(vpH / ROW_H) + BUFFER * 2;
-  const last = Math.min(totalRows, first + visCount);
-  const ncols = fileMeta.columns.length;
+  const visibleRows = Math.ceil(viewportHeight / ROW_H) + BUFFER * 2;
+  const last = Math.min(totalRows, first + visibleRows);
+  const { start: firstColumn, end: lastColumn } = visibleColumnRange();
 
   let html = "";
-  for (let i = first; i < last; i++) {
-    const rec = getRow(i);
-    const g = getGindex(i);
-    const alt = i % 2 ? " alt" : "";
-    html += `<div class="data-row${alt}" style="top:${i * ROW_H}px">`;
-    html += `<div class="gutter">${(i + 1).toLocaleString()}</div>`;
-    if (rec) {
-      for (let c = 0; c < ncols; c++) {
-        const w = colWidths[c];
-        const key = g + ":" + c;
-        const hasEdit = g !== null && edits.has(key);
-        const val = hasEdit ? edits.get(key) : rec[c];
-        const attrs = `data-r="${i}" data-c="${c}"`;
-        if (!hasEdit && (val === null || val === undefined)) {
-          html += `<div class="cell null" style="width:${w}px" ${attrs}>null</div>`;
-        } else {
-          let cls = fileMeta.columns[c].numeric ? "cell num" : "cell";
-          if (hasEdit) cls += " edited";
-          const esc = escapeHtml(val);
-          html += `<div class="${cls}" style="width:${w}px" title="${esc}" ${attrs}>${esc}</div>`;
-        }
+
+  for (let rowIndex = first; rowIndex < last; rowIndex++) {
+    const globalRowIndex = getGindex(rowIndex);
+    const alternate = rowIndex % 2 ? " alt" : "";
+
+    html += `<div class="data-row${alternate}" style="top:${rowIndex * ROW_H}px">`;
+    html += `<div class="gutter">${(rowIndex + 1).toLocaleString()}</div>`;
+
+    for (let columnIndex = firstColumn; columnIndex < lastColumn; columnIndex++) {
+      const cell = getCell(rowIndex, columnIndex);
+      const editKey = `${globalRowIndex}:${columnIndex}`;
+      const hasEdit = globalRowIndex !== null && edits.has(editKey);
+      const value = hasEdit ? edits.get(editKey) : cell.value;
+      const style =
+          `left:${colOffsets[columnIndex]}px;width:${colWidths[columnIndex]}px`;
+      const attributes = `data-r="${rowIndex}" data-c="${columnIndex}"`;
+
+      if (!cell.loaded) {
+        html += `<div class="cell null" style="${style}" ${attributes}>…</div>`;
+        continue;
       }
-    } else {
-      for (let c = 0; c < ncols; c++) {
-        html += `<div class="cell null" style="width:${colWidths[c]}px">…</div>`;
+
+      if (!hasEdit && (value === null || value === undefined)) {
+        html += `<div class="cell null" style="${style}" ${attributes}>null</div>`;
+        continue;
       }
+
+      let className = fileMeta.columns[columnIndex].numeric
+          ? "cell num"
+          : "cell";
+      if (hasEdit) className += " edited";
+
+      const escaped = escapeHtml(value);
+      html += `<div class="${className}" style="${style}" title="${escaped}" ${attributes}>${escaped}</div>`;
     }
-    html += '<div class="cell filler"></div>';
+
     html += "</div>";
   }
+
   rows.innerHTML = html;
-  ensureVisibleLoaded(first, last);
+  ensureVisibleLoaded(first, last, firstColumn, lastColumn);
 }
 
 function scheduleRender() {
   if (rafPending) return;
+
   rafPending = true;
   requestAnimationFrame(() => {
     rafPending = false;
+    renderHeader();
     renderRows();
   });
 }
 
 // ---- Paging -----------------------------------------------------------------
-function ensureVisibleLoaded(first, last) {
-  if (last <= first) return;
-  const startPage = Math.floor(first / PAGE);
-  const endPage = Math.floor((last - 1) / PAGE);
-  for (let p = startPage; p <= endPage; p++) {
-    if (!cache.has(p) && !pending.has(p)) {
-      loadPage(p).then((changed) => {
-        if (changed) scheduleRender();
-      });
+function ensureVisibleLoaded(firstRow, lastRow, firstColumn, lastColumn) {
+  if (lastRow <= firstRow || lastColumn <= firstColumn) return;
+
+  const firstRowPage = rowPageFor(firstRow);
+  const lastRowPage = rowPageFor(lastRow - 1);
+  const firstColumnPage = columnPageFor(firstColumn);
+  const lastColumnPage = columnPageFor(lastColumn - 1);
+
+  for (let rowPage = firstRowPage; rowPage <= lastRowPage; rowPage++) {
+    for (let columnPage = firstColumnPage; columnPage <= lastColumnPage; columnPage++) {
+      const key = cacheKey(rowPage, columnPage);
+
+      if (!cache.has(key) && !pending.has(key)) {
+        loadPage(rowPage, columnPage).then((changed) => {
+          if (changed) scheduleRender();
+        });
+      }
     }
   }
 }
 
-async function loadPage(pageIndex, force) {
+async function loadPage(rowPage, columnPage, force = false) {
   const tab = activeTab();
-  if (!tab) return false;
-  if (!force && (tab.cache.has(pageIndex) || tab.pending.has(pageIndex))) return false;
-  if (tab.pending.has(pageIndex)) return false;
+  if (!tab || tab.kind !== "parquet") return false;
 
-  tab.pending.add(pageIndex);
+  const key = cacheKey(rowPage, columnPage);
+  if (!force && (tab.cache.has(key) || tab.pending.has(key))) return false;
+  if (tab.pending.has(key)) return false;
+
+  const columnOffset = columnOffsetFor(columnPage);
+  if (columnOffset >= tab.meta.num_columns) return false;
+
+  tab.pending.add(key);
   const token = tab.viewToken;
 
   try {
-    const resp = await invoke("get_rows", {
+    const response = await invoke("get_rows", {
       path: tab.path,
-      offset: pageIndex * PAGE,
+      offset: rowPage * PAGE,
       limit: PAGE,
+      columnOffset,
+      columnLimit: Math.min(
+          COLUMN_PAGE,
+          tab.meta.num_columns - columnOffset,
+      ),
       sort: tab.sortState,
       filter: tab.filterState,
     });
 
     if (token !== tab.viewToken) return false;
 
-    tab.cache.set(pageIndex, { rows: resp.rows, indices: resp.indices });
-    tab.totalRows = resp.total_rows;
-    tab.truncated = resp.truncated;
+    tab.cache.set(key, {
+      rows: response.rows,
+      columnOffset: response.column_offset,
+    });
+    tab.rowIndices.set(rowPage, response.indices);
+    tab.totalRows = response.total_rows;
+    tab.truncated = response.truncated;
 
     if (tab.id === activeTabId) {
       totalRows = tab.totalRows;
@@ -3255,11 +3431,13 @@ async function loadPage(pageIndex, force) {
     }
 
     return true;
-  } catch (e) {
-    if (tab.id === activeTabId && token === tab.viewToken) showToast(String(e));
+  } catch (error) {
+    if (tab.id === activeTabId && token === tab.viewToken) {
+      showToast(String(error));
+    }
     return false;
   } finally {
-    tab.pending.delete(pageIndex);
+    tab.pending.delete(key);
   }
 }
 
@@ -3270,19 +3448,22 @@ async function applyView() {
 
   viewToken++;
   cache.clear();
+  rowIndices.clear();
   pending.clear();
 
   tab.viewToken = viewToken;
   tab.sortState = sortState;
   tab.filterState = filterState;
   tab.cache = cache;
+  tab.rowIndices = rowIndices;
   tab.pending = pending;
 
   const heavy = !!filterState || !!sortState;
   if (heavy) setLoading(true, filterState ? "Filtering…" : "Sorting…");
   if (!filterState) totalRows = fileMeta.num_rows;
 
-  await loadPage(0, true);
+  const { start: firstColumn } = visibleColumnRange();
+  await loadPage(0, columnPageFor(firstColumn), true);
 
   if (tab.id !== activeTabId) return;
   if (heavy) setLoading(false);
@@ -3457,13 +3638,20 @@ function closeMeta() {
 // Double-click a cell to select its whole value (copy with ⌘C) or edit it.
 // Edits are session-local overrides keyed by global row index; they are shown
 // with an accent marker and are NOT written back to the .parquet file.
-function startEdit(cellEl, r, c) {
+function startEdit(cellEl, rowIndex, columnIndex) {
   if (editingEl) commitEdit();
-  const g = getGindex(r);
-  if (g === null) return; // row not loaded yet
-  const rec = getRow(r);
-  editingFileOrig = rec && rec[c] != null ? String(rec[c]) : "";
-  const key = g + ":" + c;
+
+  const globalRowIndex = getGindex(rowIndex);
+  const cell = getCell(rowIndex, columnIndex);
+
+  if (globalRowIndex === null || !cell.loaded) return;
+
+  editingFileOrig =
+      cell.value === null || cell.value === undefined
+          ? ""
+          : String(cell.value);
+
+  const key = `${globalRowIndex}:${columnIndex}`;
   const current = edits.has(key) ? edits.get(key) : editingFileOrig;
 
   const input = document.createElement("input");
@@ -3529,15 +3717,22 @@ rows.addEventListener("contextmenu", (event) => {
 
   const rowIndex = Number.parseInt(cellEl.dataset.r, 10);
   const columnIndex = Number.parseInt(cellEl.dataset.c, 10);
-  const row = getRow(rowIndex);
   const globalRowIndex = getGindex(rowIndex);
+  const cell = getCell(rowIndex, columnIndex);
 
-  if (!row || Number.isNaN(columnIndex)) return;
+  if (
+      Number.isNaN(rowIndex) ||
+      Number.isNaN(columnIndex) ||
+      globalRowIndex === null ||
+      !cell.loaded
+  ) {
+    return;
+  }
 
   event.preventDefault();
 
   const editKey = `${globalRowIndex}:${columnIndex}`;
-  const value = edits.has(editKey) ? edits.get(editKey) : row[columnIndex];
+  const value = edits.has(editKey) ? edits.get(editKey) : cell.value;
   void copyCellValueToClipboard(value);
 });
 
@@ -3724,8 +3919,13 @@ function addConditionRow(preset) {
     if (!advConditions.children.length) addConditionRow();
   });
   valInp.addEventListener("keydown", (e) => {
+    if (e.isComposing || e.keyCode === 229) {
+      return;
+    }
+
     if (e.key === "Enter") applyAdvanced();
   });
+
   advConditions.appendChild(row);
 }
 
@@ -3938,11 +4138,17 @@ viewport.addEventListener(
     "scroll",
     () => {
       const tab = activeTab();
-      if (tab) tab.scrollTop = viewport.scrollTop;
+
+      if (tab?.kind === "parquet") {
+        tab.scrollTop = viewport.scrollTop;
+        tab.scrollLeft = viewport.scrollLeft;
+      }
+
       scheduleRender();
     },
     { passive: true }
 );
+
 window.addEventListener("resize", () => {
   if (fileMeta) {
     computeColWidths();
@@ -3977,31 +4183,73 @@ window.addEventListener("keydown", (e) => {
 window.addEventListener("beforeunload", saveWorkspace);
 
 // ---- Native file open (drag-drop, "Open With", CLI) -------------------------
-listen("tauri://drag-enter", () => dropOverlay.classList.add("show"));
-listen("tauri://drag-over", () => dropOverlay.classList.add("show"));
-listen("tauri://drag-leave", () => dropOverlay.classList.remove("show"));
-listen("tauri://drag-drop", async (e) => {
-  dropOverlay.classList.remove("show");
+async function registerNativeFileOpenHandlers() {
+  const appWebview = getCurrentWebviewWindow();
 
-  const paths = (e.payload?.paths || []).filter((path) => {
-    const lower = path.toLowerCase();
-    return lower.endsWith(".parquet") || lower.endsWith(".csv");
+  await appWebview.onDragDropEvent(async (event) => {
+    switch (event.payload.type) {
+      case "enter":
+      case "over":
+        dropOverlay.classList.add("show");
+        break;
+
+      case "leave":
+        dropOverlay.classList.remove("show");
+        break;
+
+      case "drop": {
+        dropOverlay.classList.remove("show");
+
+        const paths = event.payload.paths.filter((path) => {
+          const lower = path.toLowerCase();
+          return lower.endsWith(".parquet") || lower.endsWith(".csv");
+        });
+
+        if (!paths.length) {
+          showToast("Drop one or more .parquet or .csv files.");
+          return;
+        }
+
+        for (const path of paths) {
+          await openPath(path);
+          if (pendingCsvImportPath) break;
+        }
+        break;
+      }
+    }
   });
 
-  if (!paths.length) {
-    showToast("Drop one or more .parquet or .csv files.");
-    return;
-  }
-
-  for (const path of paths) {
-    await openPath(path);
-    if (pendingCsvImportPath) break;
-  }
-});
-
-listen("open-file", (e) => {
-  if (e.payload) openPath(e.payload);
-});
+  await listen("open-file", (event) => {
+    if (event.payload) {
+      void openPath(event.payload);
+    }
+  });
+}
+// listen("tauri://drag-enter", () => dropOverlay.classList.add("show"));
+// listen("tauri://drag-over", () => dropOverlay.classList.add("show"));
+// listen("tauri://drag-leave", () => dropOverlay.classList.remove("show"));
+// listen("tauri://drag-drop", async (e) => {
+//   dropOverlay.classList.remove("show");
+//
+//   const paths = (e.payload?.paths || []).filter((path) => {
+//     const lower = path.toLowerCase();
+//     return lower.endsWith(".parquet") || lower.endsWith(".csv");
+//   });
+//
+//   if (!paths.length) {
+//     showToast("Drop one or more .parquet or .csv files.");
+//     return;
+//   }
+//
+//   for (const path of paths) {
+//     await openPath(path);
+//     if (pendingCsvImportPath) break;
+//   }
+// });
+//
+// listen("open-file", (e) => {
+//   if (e.payload) openPath(e.payload);
+// });
 
 // ---- Startup ----------------------------------------------------------------
 loadSettings();
@@ -4009,6 +4257,11 @@ applySettings(false);
 void applyDuckDbMemoryLimit();
 initSettingsControls();
 initSqlEditor();
+
+void registerNativeFileOpenHandlers().catch((error) => {
+  console.error("Could not register native file handlers:", error);
+  showToast(`Native file handlers are unavailable: ${error}`);
+});
 
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   if (settings.theme === "auto") syncSqlEditorTheme();

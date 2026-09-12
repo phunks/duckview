@@ -16,16 +16,15 @@ export default defineConfig({
     build: {
         outDir: "../dist",
         emptyOutDir: true,
-        rolldownOptions: {
+        rollupOptions: {
             output: {
-                codeSplitting: {
-                    groups: [
-                        {
-                            name: 'monaco-editor-core',
-                            test: (id) => id.includes('monaco-editor') || id.includes('monaco-sql-languages'),
-                            priority: 100,
-                        },
-                    ],
+                manualChunks(id) {
+                    if (
+                        id.includes("monaco-editor") ||
+                        id.includes("monaco-sql-languages")
+                    ) {
+                        return "monaco-editor-core";
+                    }
                 },
             },
         },

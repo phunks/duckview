@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow_csv::{reader::Format, ReaderBuilder};
+use arrow_csv::{ReaderBuilder, reader::Format};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -149,9 +149,11 @@ fn deduplicate_schema(schema: Schema) -> Schema {
         };
         *count += 1;
 
-        fields.push(Arc::new(
-            Field::new(name, field.data_type().clone(), field.is_nullable()),
-        ));
+        fields.push(Arc::new(Field::new(
+            name,
+            field.data_type().clone(),
+            field.is_nullable(),
+        )));
     }
 
     Schema::new_with_metadata(fields, schema.metadata().clone())
@@ -161,13 +163,7 @@ fn all_varchar_schema(schema: Schema) -> Schema {
     let fields: Vec<_> = schema
         .fields()
         .iter()
-        .map(|field| {
-            Arc::new(Field::new(
-                field.name(),
-                DataType::Utf8,
-                true,
-            ))
-        })
+        .map(|field| Arc::new(Field::new(field.name(), DataType::Utf8, true)))
         .collect();
 
     Schema::new_with_metadata(fields, schema.metadata().clone())
@@ -193,11 +189,7 @@ pub fn convert_csv_to_parquet(
     output_path: &Path,
     options: &ConvertOptions,
 ) -> Result<()> {
-    convert_reader_to_parquet(
-        || File::open(input_path),
-        output_path,
-        options,
-    )
+    convert_reader_to_parquet(|| File::open(input_path), output_path, options)
 }
 
 pub fn convert_reader_to_parquet<R, OpenInput>(
@@ -217,8 +209,7 @@ where
 
     if options.row_group_rows < options.batch_rows {
         return Err(CsvError::Other(
-            "Parquet row group size must be at least the CSV batch size."
-                .to_string(),
+            "Parquet row group size must be at least the CSV batch size.".to_string(),
         ));
     }
 

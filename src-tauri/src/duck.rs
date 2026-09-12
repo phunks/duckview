@@ -1,16 +1,19 @@
 use std::collections::HashMap;
-use std::io::{copy, Write};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::io::{Write, copy};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use duckdb::arrow::datatypes::{DataType, SchemaRef};
-use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
-use duckdb::Connection;
+use crate::{
+    CELL_MAX_CHARS, Condition, FileCache, FilterSpec, MAX_PAGE, SEARCH_CAP, SortSpec, is_numeric,
+    normalize_read_only_sql, quote_sql_string,
+};
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::writer::StreamWriter;
+use duckdb::Connection;
+use duckdb::arrow::datatypes::{DataType, SchemaRef};
+use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
 use serde::Serialize;
-use tauri::{ipc::Response, State};
-use crate::{is_numeric, normalize_read_only_sql, quote_sql_string, Condition, FileCache, FilterSpec, SortSpec, CELL_MAX_CHARS, MAX_PAGE, SEARCH_CAP};
+use tauri::{State, ipc::Response};
 
 #[derive(Serialize, Clone)]
 pub(crate) struct DuckTable {
@@ -61,8 +64,8 @@ pub(crate) struct DuckDbState {
 
 impl DuckDbState {
     pub(crate) fn new() -> Result<Self, String> {
-        let connection = Connection::open_in_memory()
-            .map_err(|e| format!("Could not start DuckDB: {e}"))?;
+        let connection =
+            Connection::open_in_memory().map_err(|e| format!("Could not start DuckDB: {e}"))?;
 
         connection
             .execute_batch(
@@ -223,9 +226,10 @@ pub(crate) fn run_filter_duckdb(
     filter: &FilterSpec,
 ) -> Result<(Vec<u32>, bool), String> {
     let (conditions, any) = match filter {
-        FilterSpec::Advanced { conditions, combine } => {
-            (conditions, combine.eq_ignore_ascii_case("or"))
-        }
+        FilterSpec::Advanced {
+            conditions,
+            combine,
+        } => (conditions, combine.eq_ignore_ascii_case("or")),
     };
 
     if conditions.is_empty() {
@@ -270,7 +274,10 @@ pub(crate) fn run_filter_duckdb(
         .map_err(|e| format!("DuckDB filter SQL error: {e}"))?;
 
     let mut out = Vec::<u32>::new();
-    while let Some(row) = rows.next().map_err(|e| format!("DuckDB filter SQL error: {e}"))? {
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("DuckDB filter SQL error: {e}"))?
+    {
         let idx: i64 = row
             .get(0)
             .map_err(|e| format!("Could not read filter row index: {e}"))?;
@@ -330,7 +337,10 @@ pub(crate) fn run_sort_duckdb(
         .map_err(|e| format!("DuckDB sort SQL error: {e}"))?;
 
     let mut out = Vec::<u32>::with_capacity(cache.num_rows);
-    while let Some(row) = rows.next().map_err(|e| format!("DuckDB sort SQL error: {e}"))? {
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("DuckDB sort SQL error: {e}"))?
+    {
         let idx: i64 = row
             .get(0)
             .map_err(|e| format!("Could not read sort row index: {e}"))?;
@@ -403,11 +413,7 @@ pub(crate) async fn export_duckdb_query(
         quote_sql_string(&export_path.to_string_lossy())
     );
 
-    let export_result = duckdb
-        .connection
-        .lock()
-        .unwrap()
-        .execute_batch(&copy_sql);
+    let export_result = duckdb.connection.lock().unwrap().execute_batch(&copy_sql);
 
     if let Err(error) = export_result {
         if write_utf8_bom {
@@ -495,10 +501,7 @@ fn register_duckdb_sql_as_view_inner(
     let mut unique_name = base_name.to_string();
     let mut suffix = 2usize;
 
-    while tables
-        .values()
-        .any(|existing| existing.name == unique_name)
-    {
+    while tables.values().any(|existing| existing.name == unique_name) {
         unique_name = format!("{base_name}_{suffix}");
         suffix += 1;
     }
@@ -540,10 +543,7 @@ pub(crate) fn remove_duckdb_result_table(
         }
     }
 
-    let drop_view = format!(
-        "DROP VIEW IF EXISTS {}",
-        quote_sql_identifier(&table_name),
-    );
+    let drop_view = format!("DROP VIEW IF EXISTS {}", quote_sql_identifier(&table_name),);
 
     duckdb
         .connection
@@ -622,9 +622,7 @@ pub(crate) fn execute_duckdb_query(
         .map_err(|e| format!("SQL error: {e}"))?;
 
     {
-        let rows = statement
-            .query([])
-            .map_err(|e| format!("SQL error: {e}"))?;
+        let rows = statement.query([]).map_err(|e| format!("SQL error: {e}"))?;
         drop(rows);
     }
 
@@ -652,22 +650,12 @@ pub(crate) fn execute_duckdb_query(
         .queries
         .lock()
         .unwrap()
-        .insert(
-            query_id.clone(),
-            QuerySession {
-                sql,
-                column_count,
-            },
-        );
+        .insert(query_id.clone(), QuerySession { sql, column_count });
 
     Ok(QueryStartResponse { query_id, columns })
 }
 
-fn format_arrow_cell(
-    formatter: &ArrayFormatter<'_>,
-    data_type: &DataType,
-    row: usize,
-) -> String {
+fn format_arrow_cell(formatter: &ArrayFormatter<'_>, data_type: &DataType, row: usize) -> String {
     match data_type {
         DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
             formatter.value(row).to_string()
@@ -692,11 +680,10 @@ pub(crate) fn get_duckdb_query_rows_arrow(
         .get(&query_id)
         .map(|query| query.sql.clone())
         .ok_or("Query result is no longer available.")?;
-    
+
     let fetch_limit = limit.saturating_add(1);
-    let page_sql = format!(
-        "SELECT * FROM ({sql}) AS duckview_result LIMIT {fetch_limit} OFFSET {offset}"
-    );
+    let page_sql =
+        format!("SELECT * FROM ({sql}) AS duckview_result LIMIT {fetch_limit} OFFSET {offset}");
 
     let connection = duckdb.connection.lock().unwrap();
     let mut statement = connection
@@ -717,8 +704,12 @@ pub(crate) fn get_duckdb_query_rows_arrow(
 
     eprintln!(
         "[duckview] DuckDB Arrow: create-iterator={} ms, collect-batches={} ms",
-        arrow_iterator_ready.duration_since(arrow_started).as_millis(),
-        arrow_batches_ready.duration_since(arrow_iterator_ready).as_millis(),
+        arrow_iterator_ready
+            .duration_since(arrow_started)
+            .as_millis(),
+        arrow_batches_ready
+            .duration_since(arrow_iterator_ready)
+            .as_millis(),
     );
 
     let schema = batches
@@ -774,9 +765,8 @@ pub(crate) fn get_duckdb_query_rows(
         .ok_or("Query result is no longer available.")?;
 
     let fetch_limit = limit + 1;
-    let page_sql = format!(
-        "SELECT * FROM ({sql}) AS duckview_result LIMIT {fetch_limit} OFFSET {offset}"
-    );
+    let page_sql =
+        format!("SELECT * FROM ({sql}) AS duckview_result LIMIT {fetch_limit} OFFSET {offset}");
 
     let connection = duckdb.connection.lock().unwrap();
     let mut statement = connection
@@ -809,11 +799,7 @@ pub(crate) fn get_duckdb_query_rows(
                     continue;
                 }
 
-                let value = format_arrow_cell(
-                    &formatters[column],
-                    array.data_type(),
-                    row,
-                );
+                let value = format_arrow_cell(&formatters[column], array.data_type(), row);
 
                 let value = if value.chars().count() > CELL_MAX_CHARS {
                     let mut truncated: String = value.chars().take(CELL_MAX_CHARS).collect();

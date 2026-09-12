@@ -6,7 +6,10 @@
   "permissions": [
     "core:default",
     "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-emit",
     "core:window:default",
-    "core:webview:default"
+    "core:webview:default",
+    "clipboard-manager:allow-write-text"
   ]
 }

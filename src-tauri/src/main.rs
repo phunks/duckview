@@ -1,32 +1,34 @@
 // Prevents an extra console window on Windows in release. No effect on macOS.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod duck;
 mod csv;
+mod duck;
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read};
 use std::sync::Mutex;
 
-use duckdb::arrow::array::{new_empty_array, Array, ArrayRef, UInt32Array};
-use duckdb::arrow::compute::{concat, sort_to_indices, take, SortOptions};
+use duckdb::arrow::array::{Array, ArrayRef, UInt32Array, new_empty_array};
+use duckdb::arrow::compute::{SortOptions, concat, sort_to_indices, take};
 use duckdb::arrow::datatypes::{DataType, SchemaRef};
 use duckdb::arrow::record_batch::RecordBatch;
 use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
 
-use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata,
-    ArrowReaderOptions,
-    ParquetRecordBatchReaderBuilder,
-    RowSelection,
-    RowSelector,
+use crate::duck::{
+    DuckDbState, DuckTable, configure_duckdb_memory_limit, execute_duckdb_query,
+    export_duckdb_query, get_duckdb_query_rows, get_duckdb_query_rows_arrow,
+    get_duckdb_table_columns, list_duckdb_tables, register_duckdb_query_as_table,
+    remove_duckdb_result_table, restore_duckdb_view, run_filter_duckdb, run_sort_duckdb,
 };
 use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+    RowSelector,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
-use crate::duck::{configure_duckdb_memory_limit, execute_duckdb_query, export_duckdb_query, get_duckdb_query_rows, get_duckdb_query_rows_arrow, get_duckdb_table_columns, list_duckdb_tables, register_duckdb_query_as_table, remove_duckdb_result_table, restore_duckdb_view, run_filter_duckdb, run_sort_duckdb, DuckDbState, DuckTable};
 
 // Cap on how many matching rows a search will collect, to bound memory/time on
 // huge files. Beyond this the result set is marked truncated.
@@ -111,13 +113,38 @@ impl FilterSpec {
 #[derive(Serialize)]
 struct RowsResponse {
     rows: Vec<Vec<Option<String>>>,
-    /// Global (file) row index for each returned row, in display order. Lets the
-    /// frontend pin per-cell edits to a stable row regardless of sort/filter.
+    /// The source-column index represented by `rows[row][0]`.
+    column_offset: usize,
+    /// Global (file) row index for each returned row, in display order.
     indices: Vec<u32>,
     total_rows: usize,
     offset: usize,
     /// True when an active filter hit the SEARCH_CAP and results are partial.
     truncated: bool,
+}
+
+fn projection_for_columns(
+    meta: &ArrowReaderMetadata,
+    column_offset: usize,
+    column_limit: usize,
+) -> Result<ProjectionMask, String> {
+    let num_columns = meta.schema().fields().len();
+
+    if column_limit == 0 {
+        return Err("Column page size must be greater than zero.".to_string());
+    }
+
+    let column_end = column_offset
+        .checked_add(column_limit)
+        .ok_or("Column range is too large")?
+        .min(num_columns);
+
+    if column_offset >= column_end {
+        return Err("Column range is out of bounds.".to_string());
+    }
+
+    let schema = meta.metadata().file_metadata().schema_descr();
+    Ok(ProjectionMask::roots(schema, column_offset..column_end))
 }
 
 // ---------------------------------------------------------------------------
@@ -244,12 +271,17 @@ fn read_contiguous(
     path: &str,
     offset: usize,
     limit: usize,
+    column_offset: usize,
+    column_limit: usize,
 ) -> Result<Vec<Vec<Option<String>>>, String> {
     if limit == 0 {
         return Ok(vec![]);
     }
+
+    let projection = projection_for_columns(meta, column_offset, column_limit)?;
     let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
     let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, meta.clone())
+        .with_projection(projection)
         .with_offset(offset)
         .with_limit(limit)
         .with_batch_size(limit)
@@ -261,6 +293,7 @@ fn read_contiguous(
         let batch = batch.map_err(|e| format!("Read error: {e}"))?;
         append_batch_rows(&batch, &mut out)?;
     }
+
     Ok(out)
 }
 
@@ -294,12 +327,15 @@ fn read_scattered(
     meta: &ArrowReaderMetadata,
     path: &str,
     page: &[u32],
+    column_offset: usize,
+    column_limit: usize,
 ) -> Result<Vec<Vec<Option<String>>>, String> {
     if page.is_empty() {
         return Ok(vec![]);
     }
-    // Sort by file position (required for RowSelection) while remembering each
-    // row's display position so we can restore the requested order afterward.
+
+    let projection = projection_for_columns(meta, column_offset, column_limit)?;
+
     let mut ordered: Vec<(u32, usize)> =
         page.iter().enumerate().map(|(pos, &g)| (g, pos)).collect();
     ordered.sort_by_key(|(g, _)| *g);
@@ -307,6 +343,7 @@ fn read_scattered(
 
     let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
     let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, meta.clone())
+        .with_projection(projection)
         .with_row_selection(selection_for(&sorted_global))
         .with_batch_size(sorted_global.len())
         .build()
@@ -317,25 +354,22 @@ fn read_scattered(
         let batch = batch.map_err(|e| format!("Read error: {e}"))?;
         append_batch_rows(&batch, &mut file_order)?;
     }
+
     if file_order.len() != ordered.len() {
         return Err("Row selection returned an unexpected count".into());
     }
 
-    // Scatter back into requested (display) order.
     let mut result: Vec<Vec<Option<String>>> = vec![Vec::new(); page.len()];
-    for (k, (_, disp_pos)) in ordered.into_iter().enumerate() {
-        result[disp_pos] = std::mem::take(&mut file_order[k]);
+    for (index, (_, display_position)) in ordered.into_iter().enumerate() {
+        result[display_position] = std::mem::take(&mut file_order[index]);
     }
+
     Ok(result)
 }
 
 /// Loads one full column (all row groups, projected to just that column) as a
 /// single contiguous array. Memory scales with one column, not the whole file.
-fn load_full_column(
-    cache: &mut FileCache,
-    path: &str,
-    col: usize,
-) -> Result<ArrayRef, String> {
+fn load_full_column(cache: &mut FileCache, path: &str, col: usize) -> Result<ArrayRef, String> {
     if let Some(a) = cache.column_cache.get(&col) {
         return Ok(a.clone());
     }
@@ -365,7 +399,12 @@ fn load_full_column(
 
 /// Ensures `cache.sort_cache` holds a full-file permutation for `spec`.
 fn ensure_sort(cache: &mut FileCache, path: &str, spec: &SortSpec) -> Result<(), String> {
-    if cache.sort_cache.as_ref().map(|(s, _)| s == spec).unwrap_or(false) {
+    if cache
+        .sort_cache
+        .as_ref()
+        .map(|(s, _)| s == spec)
+        .unwrap_or(false)
+    {
         return Ok(());
     }
     let col = load_full_column(cache, path, spec.column)?;
@@ -373,8 +412,8 @@ fn ensure_sort(cache: &mut FileCache, path: &str, spec: &SortSpec) -> Result<(),
         descending: !spec.ascending,
         nulls_first: false,
     };
-    let idx = sort_to_indices(col.as_ref(), Some(opts), None)
-        .map_err(|e| format!("Sort error: {e}"))?;
+    let idx =
+        sort_to_indices(col.as_ref(), Some(opts), None).map_err(|e| format!("Sort error: {e}"))?;
     let perm: Vec<u32> = idx.values().to_vec();
     cache.sort_cache = Some((spec.clone(), perm));
     Ok(())
@@ -387,7 +426,12 @@ fn ensure_sort_with_duckdb(
     path: &str,
     spec: &SortSpec,
 ) -> Result<(), String> {
-    if cache.sort_cache.as_ref().map(|(s, _)| s == spec).unwrap_or(false) {
+    if cache
+        .sort_cache
+        .as_ref()
+        .map(|(s, _)| s == spec)
+        .unwrap_or(false)
+    {
         return Ok(());
     }
 
@@ -417,9 +461,13 @@ fn sort_filtered(
         descending: !spec.ascending,
         nulls_first: false,
     };
-    let order = sort_to_indices(sub.as_ref(), Some(opts), None)
-        .map_err(|e| format!("Sort error: {e}"))?;
-    Ok(order.values().iter().map(|&p| filtered[p as usize]).collect())
+    let order =
+        sort_to_indices(sub.as_ref(), Some(opts), None).map_err(|e| format!("Sort error: {e}"))?;
+    Ok(order
+        .values()
+        .iter()
+        .map(|&p| filtered[p as usize])
+        .collect())
 }
 
 /// Dispatches a filter to the simple or advanced scanner.
@@ -442,7 +490,6 @@ fn run_filter(
         ),
     }
 }
-
 
 // A comparison/predicate operator for an advanced condition.
 enum Op {
@@ -752,6 +799,8 @@ async fn get_rows(
     path: String,
     offset: usize,
     limit: usize,
+    column_offset: usize,
+    column_limit: usize,
     sort: Option<SortSpec>,
     filter: Option<FilterSpec>,
 ) -> Result<RowsResponse, String> {
@@ -761,10 +810,17 @@ async fn get_rows(
     let num_columns = cache.num_columns;
     let meta = cache.meta.clone();
 
+    if column_offset >= num_columns {
+        return Err("Column range is out of bounds.".to_string());
+    }
+
+    let column_limit = column_limit.min(num_columns - column_offset).max(1);
     let limit = limit.min(MAX_PAGE);
+
     if let Some(s) = &sort
-        && s.column >= num_columns {
-            return Err("Sort column is out of range".to_string());
+        && s.column >= num_columns
+    {
+        return Err("Sort column is out of range".to_string());
     }
 
     let filtered: Option<Vec<u32>> = match &filter {
@@ -799,34 +855,37 @@ async fn get_rows(
 
     let (rows, total_rows, indices) = match (&filter_or_none(&filter), &sort) {
         (None, None) => {
-            let rows = read_contiguous(&meta, &path, offset, limit)?;
-            let idx: Vec<u32> = (0..rows.len()).map(|k| (offset + k) as u32).collect();
-            (rows, num_rows, idx)
+            let rows = read_contiguous(&meta, &path, offset, limit, column_offset, column_limit)?;
+            let indices = (0..rows.len())
+                .map(|index| (offset + index) as u32)
+                .collect();
+            (rows, num_rows, indices)
         }
         (None, Some(spec)) => {
             ensure_sort(cache, &path, spec)?;
             let perm = &cache.sort_cache.as_ref().unwrap().1;
             let page = slice_page(perm, offset, limit);
-            let rows = read_scattered(&meta, &path, &page)?;
+            let rows = read_scattered(&meta, &path, &page, column_offset, column_limit)?;
             (rows, num_rows, page)
         }
         (Some(_), None) => {
-            let fi = filtered.as_ref().unwrap();
-            let page = slice_page(fi, offset, limit);
-            let rows = read_scattered(&meta, &path, &page)?;
-            (rows, fi.len(), page)
+            let filtered = filtered.as_ref().unwrap();
+            let page = slice_page(filtered, offset, limit);
+            let rows = read_scattered(&meta, &path, &page, column_offset, column_limit)?;
+            (rows, filtered.len(), page)
         }
         (Some(_), Some(spec)) => {
-            let fi = filtered.as_ref().unwrap();
-            let sorted = sort_filtered(cache, &path, fi, spec)?;
+            let filtered = filtered.as_ref().unwrap();
+            let sorted = sort_filtered(cache, &path, filtered, spec)?;
             let page = slice_page(&sorted, offset, limit);
-            let rows = read_scattered(&meta, &path, &page)?;
+            let rows = read_scattered(&meta, &path, &page, column_offset, column_limit)?;
             (rows, sorted.len(), page)
         }
     };
 
     Ok(RowsResponse {
         rows,
+        column_offset,
         indices,
         total_rows,
         offset,
@@ -835,27 +894,15 @@ async fn get_rows(
 }
 
 #[tauri::command]
-fn close_file(
-    state: State<'_, AppState>,
-    duckdb: State<'_, DuckDbState>,
-    path: String,
-) {
+fn close_file(state: State<'_, AppState>, duckdb: State<'_, DuckDbState>, path: String) {
     state.files.lock().unwrap().remove(&path);
 
     let table = duckdb.tables_by_path.lock().unwrap().remove(&path);
 
     if let Some(table) = table {
-        let drop_view = format!(
-            "DROP VIEW IF EXISTS {}",
-            quote_sql_identifier(&table.name),
-        );
+        let drop_view = format!("DROP VIEW IF EXISTS {}", quote_sql_identifier(&table.name),);
 
-        if let Err(error) = duckdb
-            .connection
-            .lock()
-            .unwrap()
-            .execute_batch(&drop_view)
-        {
+        if let Err(error) = duckdb.connection.lock().unwrap().execute_batch(&drop_view) {
             eprintln!(
                 "[duckview] Could not unregister table view \"{}\": {error}",
                 table.name
@@ -922,8 +969,8 @@ async fn import_csv_as_parquet(
 
     ensure_csv_import_size(&path, max_csv_import_mib)?;
 
-    let conversion_profile = csv::ConvertProfile::parse(&conversion_profile)
-        .map_err(|error| error.to_string())?;
+    let conversion_profile =
+        csv::ConvertProfile::parse(&conversion_profile).map_err(|error| error.to_string())?;
 
     let source = std::path::Path::new(&path);
     let file_name = source
@@ -959,26 +1006,20 @@ async fn import_csv_as_parquet(
                 || {
                     let source = File::open(&input_path)?;
 
-                    Ok(
-                        encoding_rs_io::DecodeReaderBytesBuilder::new()
-                            .encoding(Some(encoding))
-                            .lossy(false)
-                            .build(source),
-                    )
+                    Ok(encoding_rs_io::DecodeReaderBytesBuilder::new()
+                        .encoding(Some(encoding))
+                        .lossy(false)
+                        .build(source))
                 },
                 &output_path_for_conversion,
                 &options,
             )
         } else {
-            csv::convert_csv_to_parquet(
-                &input_path,
-                &output_path_for_conversion,
-                &options,
-            )
+            csv::convert_csv_to_parquet(&input_path, &output_path_for_conversion, &options)
         }
     })
-        .await
-        .map_err(|error| format!("CSV conversion task failed: {error}"))?;
+    .await
+    .map_err(|error| format!("CSV conversion task failed: {error}"))?;
 
     if let Err(error) = import_result {
         let _ = std::fs::remove_file(&output_path);
@@ -1023,8 +1064,8 @@ fn ensure_csv_import_size(path: &str, max_csv_import_mib: u64) -> Result<(), Str
         ));
     }
 
-    let metadata = std::fs::metadata(path)
-        .map_err(|error| format!("Cannot inspect CSV file: {error}"))?;
+    let metadata =
+        std::fs::metadata(path).map_err(|error| format!("Cannot inspect CSV file: {error}"))?;
 
     if !metadata.is_file() {
         return Err("The selected CSV path is not a regular file.".to_string());
@@ -1060,8 +1101,7 @@ fn csv_line_size_bytes(max_csv_line_size_mib: u64) -> Result<u64, String> {
 fn is_valid_utf8_file(path: &str) -> Result<bool, String> {
     const BUFFER_SIZE: usize = 64 * 1024;
 
-    let source = File::open(path)
-        .map_err(|error| format!("Cannot read CSV file: {error}"))?;
+    let source = File::open(path).map_err(|error| format!("Cannot read CSV file: {error}"))?;
     let mut reader = BufReader::new(source);
     let mut buffer = [0_u8; BUFFER_SIZE];
     let mut pending = Vec::<u8>::with_capacity(3);
@@ -1139,11 +1179,7 @@ fn duck_table_base_name(path: &str) -> String {
         result = "parquet".to_string();
     }
 
-    if result
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_digit())
-    {
+    if result.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
         result.insert(0, '_');
     }
 
@@ -1232,15 +1268,26 @@ fn normalize_read_only_sql(sql: &str) -> Result<String, String> {
     let upper = sql.to_ascii_uppercase();
     let first_keyword = upper.split_whitespace().next().unwrap_or("");
 
-    if !matches!(first_keyword, "SELECT" | "WITH" | "PIVOT" | "UNPIVOT"
-        | "DESCRIBE" | "SHOW" | "VALUES") {
+    if !matches!(
+        first_keyword,
+        "SELECT" | "WITH" | "PIVOT" | "UNPIVOT" | "DESCRIBE" | "SHOW" | "VALUES"
+    ) {
         return Err("Only SELECT, WITH, and PIVOT queries are allowed.".to_string());
     }
 
     const BLOCKED: [(&str, &str); 23] = [
-        ("READ_CSV_AUTO", "`read_csv_auto` is not allowed. Import the CSV file as Parquet first, then query the imported table."),
-        ("READ_CSV", "`read_csv` is not allowed. Import the CSV file as Parquet first, then query the imported table."),
-        ("READ_PARQUET", "`read_parquet` is not allowed. Open the Parquet file in DuckView, then query its table."),
+        (
+            "READ_CSV_AUTO",
+            "`read_csv_auto` is not allowed. Import the CSV file as Parquet first, then query the imported table.",
+        ),
+        (
+            "READ_CSV",
+            "`read_csv` is not allowed. Import the CSV file as Parquet first, then query the imported table.",
+        ),
+        (
+            "READ_PARQUET",
+            "`read_parquet` is not allowed. Open the Parquet file in DuckView, then query its table.",
+        ),
         ("READ_JSON", "`read_json` is not allowed."),
         ("READ_JSON_AUTO", "`read_json_auto` is not allowed."),
         ("JSON_EXTRACT", "`json_extract` is not allowed."),
@@ -1248,12 +1295,30 @@ fn normalize_read_only_sql(sql: &str) -> Result<String, String> {
         ("READ_TEXT", "`read_text` is not allowed."),
         ("READ_BLOB", "`read_blob` is not allowed."),
         ("SQLITE_SCAN", "`sqlite_scan` is not allowed."),
-        ("INSERT", "`INSERT` is not allowed because this SQL editor is read-only."),
-        ("UPDATE", "`UPDATE` is not allowed because this SQL editor is read-only."),
-        ("DELETE", "`DELETE` is not allowed because this SQL editor is read-only."),
-        ("CREATE", "`CREATE` is not allowed because this SQL editor is read-only."),
-        ("DROP", "`DROP` is not allowed because this SQL editor is read-only."),
-        ("COPY", "`COPY` is not allowed from the SQL editor. Use the export feature instead."),
+        (
+            "INSERT",
+            "`INSERT` is not allowed because this SQL editor is read-only.",
+        ),
+        (
+            "UPDATE",
+            "`UPDATE` is not allowed because this SQL editor is read-only.",
+        ),
+        (
+            "DELETE",
+            "`DELETE` is not allowed because this SQL editor is read-only.",
+        ),
+        (
+            "CREATE",
+            "`CREATE` is not allowed because this SQL editor is read-only.",
+        ),
+        (
+            "DROP",
+            "`DROP` is not allowed because this SQL editor is read-only.",
+        ),
+        (
+            "COPY",
+            "`COPY` is not allowed from the SQL editor. Use the export feature instead.",
+        ),
         ("ATTACH", "`ATTACH` is not allowed."),
         ("DETACH", "`DETACH` is not allowed."),
         ("INSTALL", "`INSTALL` is not allowed."),
@@ -1278,38 +1343,36 @@ fn main() {
     let duckdb = DuckDbState::new().expect("Could not initialize DuckDB");
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .manage(duckdb)
         .invoke_handler(tauri::generate_handler![
-                open_file,
-                get_rows,
-                close_file,
-                parquet_file_exists,
-                list_duckdb_tables,
-                get_duckdb_table_columns,
-                execute_duckdb_query,
-                get_duckdb_query_rows,
-                get_duckdb_query_rows_arrow,
-                export_duckdb_query,
-                register_duckdb_query_as_table,
-                remove_duckdb_result_table,
-                restore_duckdb_view,
-                configure_duckdb_memory_limit,
-                take_startup_file,
-                pick_file,
-                pick_parquet_file,
-                import_csv_as_parquet
-            ])
+            open_file,
+            get_rows,
+            close_file,
+            parquet_file_exists,
+            list_duckdb_tables,
+            get_duckdb_table_columns,
+            execute_duckdb_query,
+            get_duckdb_query_rows,
+            get_duckdb_query_rows_arrow,
+            export_duckdb_query,
+            register_duckdb_query_as_table,
+            remove_duckdb_result_table,
+            restore_duckdb_view,
+            configure_duckdb_memory_limit,
+            take_startup_file,
+            pick_file,
+            pick_parquet_file,
+            import_csv_as_parquet
+        ])
         .setup(|app| {
             // A file path may arrive as a CLI arg when launched via `open -a`.
-            if let Some(path) = std::env::args()
-                .skip(1)
-                .find(|arg| {
-                    let lower = arg.to_ascii_lowercase();
-                    lower.ends_with(".parquet") || lower.ends_with(".csv")
-                })
-            {
+            if let Some(path) = std::env::args().skip(1).find(|arg| {
+                let lower = arg.to_ascii_lowercase();
+                lower.ends_with(".parquet") || lower.ends_with(".csv")
+            }) {
                 *app.state::<AppState>().pending_open.lock().unwrap() = Some(path);
             }
             Ok(())
@@ -1334,4 +1397,3 @@ fn main() {
             }
         });
 }
-

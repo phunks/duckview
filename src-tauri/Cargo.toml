@@ -1,6 +1,6 @@
 [package]
 name = "duckview"
-version = "0.3.6"
+version = "0.3.7"
 description = "Parquet file viewer and SQL editor"
 authors = ["pnk"]
 edition = "2024"
@@ -23,7 +23,8 @@ arrow-schema = { version = "=58.4.0" }
 parquet = "=58.4.0"
 duckdb = { version = "1", features = ["bundled", "parquet"] }
 thiserror = "2.0.20"
-sysinfo = "0.37"
+sysinfo = "0.39"
+tauri-plugin-clipboard-manager = "2.3.3"
 
 [profile.release]
 opt-level = 2

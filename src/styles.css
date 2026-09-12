@@ -813,27 +813,31 @@ body {
   overflow: auto;
   background: var(--panel);
 }
-.grid { position: relative; min-width: 100%; }
+.grid {
+  position: relative;
+  min-width: 100%;
+}
 
 .header-row {
   position: sticky;
   top: 0;
-  display: flex;
+  display: block;
   height: 34px;
   background: var(--header-bg);
   border-bottom: 1px solid var(--border-strong);
   z-index: 5;
 }
 .h-cell {
-  flex: 0 0 auto;
+  position: absolute;
+  top: 0;
   display: flex;
   flex-direction: column;
   justify-content: center;
+  height: 34px;
   padding: 3px 10px;
   border-right: 1px solid var(--border);
   overflow: hidden;
   cursor: default;
-  position: relative;
 }
 .h-cell:hover { background: var(--row-hover); }
 .h-cell .h-name {
@@ -884,7 +888,6 @@ body {
 .data-row {
   position: absolute;
   left: 0;
-  display: flex;
   height: var(--row-h);
   border-bottom: 1px solid var(--border);
   width: 100%;
@@ -893,7 +896,9 @@ body {
 .data-row:hover { background: var(--row-hover); }
 
 .cell {
-  flex: 0 0 auto;
+  position: absolute;
+  top: 0;
+  height: var(--row-h);
   padding: 0 10px;
   line-height: var(--row-h);
   font-family: var(--mono);
@@ -954,7 +959,10 @@ body {
   border-right: 1px solid var(--border-strong);
 }
 .h-cell.gutter {
+  position: sticky;
+  left: 0;
   z-index: 6;
+  width: 66px;
   align-items: flex-end;
   justify-content: center;
   background: var(--header-bg);
