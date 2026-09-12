@@ -279,6 +279,86 @@
             <option value="64">64 MiB</option>
           </select>
         </div>
+        <div class="set-row ai-settings-heading">
+          <div class="set-label">
+            <span>AI SQL generation</span>
+            <small>Uses an OpenAI-compatible Chat Completions API.</small>
+          </div>
+        </div>
+        <div class="set-row">
+          <div class="set-label">
+            <span>AI base URL</span>
+            <small>For example, https://api.openai.com/v1</small>
+          </div>
+          <input
+                  id="setAiBaseUrl"
+                  class="settings-text-input"
+                  type="url"
+                  inputmode="url"
+                  spellcheck="false"
+                  autocomplete="url"
+          />
+        </div>
+        <div class="set-row">
+          <div class="set-label">
+            <span>AI model</span>
+            <small>For example, gpt-5-mini.</small>
+          </div>
+          <input
+                  id="setAiModel"
+                  class="settings-text-input"
+                  type="text"
+                  spellcheck="false"
+                  autocomplete="off"
+          />
+        </div>
+        <div class="set-row">
+          <div class="set-label">
+            <span>AI HTTP proxy</span>
+            <small>Optional. Example: http://127.0.0.1:8080</small>
+          </div>
+          <input
+                  id="setAiProxyUrl"
+                  class="settings-text-input"
+                  type="url"
+                  inputmode="url"
+                  spellcheck="false"
+                  autocomplete="off"
+                  placeholder="No proxy"
+          />
+        </div>
+        <div class="set-row">
+          <div class="set-label">
+            <span>Authentication</span>
+            <small>Bearer keys are stored in the system keychain.</small>
+          </div>
+          <select id="setAiAuthentication" class="select">
+            <option value="bearer">Bearer API key</option>
+            <option value="none">No authentication</option>
+          </select>
+        </div>
+        <div id="aiApiKeyRow" class="set-row">
+          <div class="set-label">
+            <span>API key</span>
+            <small id="aiKeyStatus">Not saved.</small>
+          </div>
+          <div class="ai-api-key-controls">
+            <input
+                    id="setAiApiKey"
+                    class="settings-text-input ai-api-key-input"
+                    type="password"
+                    spellcheck="false"
+                    autocomplete="new-password"
+                    placeholder="Paste a new key"
+            />
+            <button id="saveAiApiKeyBtn" class="btn ghost" type="button">Save</button>
+            <button id="deleteAiApiKeyBtn" class="btn ghost" type="button">Remove</button>
+          </div>
+        </div>
+        <div class="set-note">
+          API keys are saved only in your operating system’s credential store.
+          Schema metadata and your selected request are sent to the configured AI service.
+        </div>
         <div class="set-note">
           Large CSV files can need substantially more memory and temporary disk
           space than their file size.

@@ -8,6 +8,21 @@ DuckView is a powerful, modern Parquet file viewer and SQL editor built with Tau
 It started as a complete rewrite and expansion of the excellent parquetview (an OSX Parquet viewer),
 supercharging it with multi-tab support and analytical capabilities.
 
+## Features
+- **Built for large datasets**  
+  Parquet files are read on demand with paged rows and columns, so you can browse large files without loading the entire dataset into the UI at once.
+- **Large CSV import support**  
+  Open CSV files and convert them to Parquet for efficient browsing and querying. The maximum CSV import size is configurable in Settings (default: 4 GiB), and several text encodings are supported.
+- **SQL workspace powered by DuckDB**  
+  Query opened files with a read-only SQL editor, keep multiple SQL tabs, and export query results as Parquet or CSV.
+- **AI-assisted SQL generation**  
+  Select one or more SQL comments (or place the cursor on a comment), right-click, and choose **AI: Generate SQL from Comment** to generate a SQL suggestion from your request. Press <kbd>Tab</kbd> to accept it or <kbd>Esc</kbd> to dismiss it.
+- **Secure API key storage**  
+  AI API keys are stored in the operating system’s secure keychain / credential store rather than in DuckView’s application settings.
+- **Multiple workspaces and tabs**  
+  Keep multiple files, SQL tabs, saved views, and workspaces open while preserving your local workspace layout.
+
+
 ## Getting Started
 - **Open a Parquet or CSV file**
   Drag and drop a file into the window, or select **Choose File…**.

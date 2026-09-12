@@ -3,6 +3,7 @@
 
 mod csv;
 mod duck;
+mod chat;
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -15,7 +16,9 @@ use duckdb::arrow::compute::{SortOptions, concat, sort_to_indices, take};
 use duckdb::arrow::datatypes::{DataType, SchemaRef};
 use duckdb::arrow::record_batch::RecordBatch;
 use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
-
+use crate::chat::chat_client::{
+    ai_key_status, delete_ai_api_key, generate_sql_from_prompt, save_ai_api_key,
+};
 use crate::duck::{
     DuckDbState, DuckTable, configure_duckdb_memory_limit, execute_duckdb_query,
     export_duckdb_query, get_duckdb_query_rows, get_duckdb_query_rows_arrow,
@@ -1362,6 +1365,10 @@ fn main() {
             remove_duckdb_result_table,
             restore_duckdb_view,
             configure_duckdb_memory_limit,
+            ai_key_status,
+            save_ai_api_key,
+            delete_ai_api_key,
+            generate_sql_from_prompt,
             take_startup_file,
             pick_file,
             pick_parquet_file,

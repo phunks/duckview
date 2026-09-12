@@ -268,6 +268,15 @@ const setDuckDbMemoryLimit = $("setDuckDbMemoryLimit");
 const setCsvImportMaxSize = $("setCsvImportMaxSize");
 const setCsvMaxLineSize = $("setCsvMaxLineSize");
 const setCsvConversionProfile = $("setCsvConversionProfile");
+const setAiBaseUrl = $("setAiBaseUrl");
+const setAiModel = $("setAiModel");
+const setAiAuthentication = $("setAiAuthentication");
+const setAiProxyUrl = $("setAiProxyUrl");
+const aiApiKeyRow = $("aiApiKeyRow");
+const setAiApiKey = $("setAiApiKey");
+const saveAiApiKeyBtn = $("saveAiApiKeyBtn");
+const deleteAiApiKeyBtn = $("deleteAiApiKeyBtn");
+const aiKeyStatus = $("aiKeyStatus");
 
 // ---- State ------------------------------------------------------------------
 let currentPath = null;
@@ -304,11 +313,19 @@ let pendingCsvImportPath = null;
 let sqlPaneResizeState = null;
 let workspaceDialogResolve = null;
 
+// Wait until scroll input has settled before reading Parquet pages. This avoids
+// queuing expensive requests for every intermediate scrollbar position.
+const SCROLL_LOAD_DELAY_MS = 150;
+let scrollLoadTimer = null;
+let deferVisiblePageLoads = false;
+
 let sqlEditor = null;
 let sqlCompletionTables = [];
 let pendingSqlEditorValue = null;
 const sqlTableColumns = new Map();
 const sqlTableColumnRequests = new Map();
+let aiInlineSuggestion = null;
+let aiSuggestionRequestId = 0;
 
 const SQL_KEYWORDS = [
   "SELECT",
@@ -704,6 +721,9 @@ function resetWorkspaceUi() {
   sortState = null;
   filterState = null;
   truncated = false;
+  clearTimeout(scrollLoadTimer);
+  scrollLoadTimer = null;
+  deferVisiblePageLoads = false;
   cache = new Map();
   rowIndices = new Map();
   pending = new Set();
@@ -1241,6 +1261,203 @@ function sqlCursorOffset() {
   return position && model ? model.getOffsetAt(position) : 0;
 }
 
+function dismissAiInlineSuggestion() {
+  if (!aiInlineSuggestion) return;
+
+  aiInlineSuggestion = null;
+  aiSuggestionRequestId += 1;
+  sqlEditor?.getAction("editor.action.inlineSuggest.hide")?.run();
+}
+
+function aiCommentTarget() {
+  if (!sqlEditor) return null;
+
+  const model = sqlEditor.getModel();
+  const selection = sqlEditor.getSelection();
+  const position = sqlEditor.getPosition();
+
+  if (!model || !selection || !position) return null;
+
+  const hasSelection = !selection.isEmpty();
+  const selectedText = hasSelection
+      ? model.getValueInRange(selection).trim()
+      : "";
+  const source = selectedText || model.getLineContent(position.lineNumber).trim();
+
+  if (!source) return null;
+
+  let request = "";
+  let finalCommentLine = position.lineNumber;
+
+  const blockComment = /^\/\*([\s\S]*?)\*\/$/.exec(source);
+
+  if (blockComment) {
+    request = blockComment[1]
+        .split(/\r?\n/)
+        .map((line) => line.replace(/^\s*\*\s?/, ""))
+        .join("\n")
+        .trim();
+  } else {
+    const lines = source.split(/\r?\n/);
+
+    if (!lines.every((line) => /^\s*--/.test(line))) {
+      return null;
+    }
+
+    request = lines
+        .map((line) => line.replace(/^\s*--\s?/, ""))
+        .join("\n")
+        .trim();
+  }
+
+  if (!request) return null;
+
+  if (hasSelection) {
+    // A selection ending at column 1 means its final newline was selected;
+    // insert after the preceding comment line instead.
+    finalCommentLine =
+        selection.endColumn === 1 &&
+        selection.endLineNumber > selection.startLineNumber
+            ? selection.endLineNumber - 1
+            : selection.endLineNumber;
+  }
+
+  return {
+    request,
+    model,
+    modelVersion: model.getVersionId(),
+    insertPosition: {
+      lineNumber: finalCommentLine,
+      column: model.getLineMaxColumn(finalCommentLine),
+    },
+  };
+}
+
+
+
+function requestFromSqlEditor() {
+  if (!sqlEditor) return "";
+
+  const model = sqlEditor.getModel();
+  const selection = sqlEditor.getSelection();
+  const position = sqlEditor.getPosition();
+
+  if (!model || !selection || !position) return "";
+
+  const selected = selection.isEmpty()
+      ? ""
+      : model.getValueInRange(selection).trim();
+  const source = selected || model.getLineContent(position.lineNumber).trim();
+
+  if (!source) return "";
+
+  const lineComment = source
+      .split(/\r?\n/)
+      .map((line) => line.replace(/^\s*--\s?/, ""))
+      .join("\n")
+      .trim();
+
+  if (selected && lineComment) {
+    return lineComment;
+  }
+
+  const blockComment = /^\/\*([\s\S]*?)\*\/$/.exec(source);
+  if (blockComment) {
+    return blockComment[1]
+        .split(/\r?\n/)
+        .map((line) => line.replace(/^\s*\*\s?/, ""))
+        .join("\n")
+        .trim();
+  }
+
+  return source.startsWith("--") ? lineComment : "";
+}
+
+async function aiSchema() {
+  const tables = await invoke("list_duckdb_tables");
+
+  return Promise.all(tables.map(async (table) => ({
+    name: table.name,
+    columns: await getSqlTableColumns(table.name),
+  })));
+}
+
+async function generateSqlFromEditorRequest() {
+  const tab = activeTab();
+  const target = aiCommentTarget();
+
+  if (!tab || tab.kind !== "sql" || !target) {
+    showToast("Select one or more SQL comments, or place the cursor on a SQL comment.");
+    return;
+  }
+
+  if (!settings.aiBaseUrl.trim() || !settings.aiModel.trim()) {
+    showToast("Configure the AI base URL and model in Settings first.");
+    openSettings();
+    return;
+  }
+
+  if (
+      settings.aiAuthentication === "bearer" &&
+      !(await invoke("ai_key_status").catch(() => false))
+  ) {
+    showToast("Save an AI API key in Settings first.");
+    openSettings();
+    return;
+  }
+
+  dismissAiInlineSuggestion();
+  const requestId = ++aiSuggestionRequestId;
+  setLoading(true, "Generating SQL…");
+
+  try {
+    const schema = await aiSchema();
+    const sql = await invoke("generate_sql_from_prompt", {
+      settings: {
+        baseUrl: settings.aiBaseUrl,
+        model: settings.aiModel,
+        authentication: settings.aiAuthentication,
+        proxyUrl: settings.aiProxyUrl,
+      },
+      request: target.request,
+      schema,
+    });
+
+    // Do not display a result against a document edited while its request
+    // was in flight. This prevents accepting SQL at a stale position.
+    if (
+        requestId !== aiSuggestionRequestId ||
+        activeTab() !== tab ||
+        sqlEditor?.getModel() !== target.model ||
+        target.model.getVersionId() !== target.modelVersion
+    ) {
+      return;
+    }
+
+    // Collapse a previous selection and place the ghost text only after
+    // the source comment. The request itself is never replaced by Tab.
+    sqlEditor.setPosition(target.insertPosition);
+    sqlEditor.focus();
+
+    aiInlineSuggestion = {
+      model: target.model,
+      position: target.insertPosition,
+      sql: `\n${sql}`,
+    };
+
+    await sqlEditor.getAction("editor.action.inlineSuggest.trigger")?.run();
+    showToast("SQL suggestion ready. Press Tab to accept or Esc to dismiss.");
+  } catch (error) {
+    if (requestId === aiSuggestionRequestId) {
+      showToast(`Could not generate SQL: ${error}`);
+    }
+  } finally {
+    if (requestId === aiSuggestionRequestId) {
+      setLoading(false);
+    }
+  }
+}
+
 function setSqlEditorValue(value) {
   const sql = String(value ?? "");
 
@@ -1588,6 +1805,10 @@ function initSqlEditor() {
         comments: false,
         strings: false,
       },
+      inlineSuggest: {
+        enabled: true,
+        mode: "subwordSmart",
+      },
       suggestOnTriggerCharacters: true,
       padding: {
         top: 12,
@@ -1678,6 +1899,58 @@ function initSqlEditor() {
         monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter,
       ],
       run: () => runSql(),
+    });
+
+    monaco.languages.registerInlineCompletionsProvider(
+        LanguageIdEnum.GENERIC,
+        {
+          provideInlineCompletions(model, position) {
+            const suggestion = aiInlineSuggestion;
+
+            if (
+                !suggestion ||
+                suggestion.model !== model ||
+                suggestion.position.lineNumber !== position.lineNumber ||
+                suggestion.position.column !== position.column
+            ) {
+              return { items: [] };
+            }
+
+            return {
+              items: [{
+                insertText: suggestion.sql,
+                range: new monaco.Range(
+                    position.lineNumber,
+                    position.column,
+                    position.lineNumber,
+                    position.column,
+                ),
+              }],
+            };
+          },
+          freeInlineCompletions() {},
+        },
+    );
+
+    sqlEditor.addAction({
+      id: "duckview.generate-sql-from-comment",
+      label: "AI: Generate SQL from Comment",
+      contextMenuGroupId: "navigation",
+      contextMenuOrder: 1,
+      keybindings: [
+        monaco.KeyMod.CtrlCmd |
+        monaco.KeyMod.Shift |
+        monaco.KeyCode.Enter,
+      ],
+      run: () => generateSqlFromEditorRequest(),
+    });
+
+    sqlEditor.onDidChangeCursorPosition(() => {
+      dismissAiInlineSuggestion();
+    });
+
+    sqlEditor.onDidChangeModelContent(() => {
+      dismissAiInlineSuggestion();
     });
 
     sqlEditor.addAction({
@@ -3351,7 +3624,10 @@ function renderRows() {
   }
 
   rows.innerHTML = html;
-  ensureVisibleLoaded(first, last, firstColumn, lastColumn);
+
+  if (!deferVisiblePageLoads) {
+    ensureVisibleLoaded(first, last, firstColumn, lastColumn);
+  }
 }
 
 function scheduleRender() {
@@ -3363,6 +3639,29 @@ function scheduleRender() {
     renderHeader();
     renderRows();
   });
+}
+
+function scheduleVisiblePageLoad() {
+  clearTimeout(scrollLoadTimer);
+  deferVisiblePageLoads = true;
+
+  scrollLoadTimer = setTimeout(() => {
+    scrollLoadTimer = null;
+    deferVisiblePageLoads = false;
+
+    const tab = activeTab();
+    if (!tab || tab.kind !== "parquet" || !fileMeta) return;
+
+    const firstRow = Math.max(
+        0,
+        Math.floor(viewport.scrollTop / ROW_H) - BUFFER,
+    );
+    const visibleRows = Math.ceil(viewport.clientHeight / ROW_H) + BUFFER * 2;
+    const lastRow = Math.min(totalRows, firstRow + visibleRows);
+    const { start: firstColumn, end: lastColumn } = visibleColumnRange();
+
+    ensureVisibleLoaded(firstRow, lastRow, firstColumn, lastColumn);
+  }, SCROLL_LOAD_DELAY_MS);
 }
 
 // ---- Paging -----------------------------------------------------------------
@@ -3746,6 +4045,10 @@ const DEFAULT_SETTINGS = {
   csvImportMaxSizeGiB: 4,
   csvMaxLineSizeMiB: 8,
   csvConversionProfile: "auto",
+  aiBaseUrl: "https://api.openai.com/v1",
+  aiModel: "gpt-5-mini",
+  aiAuthentication: "bearer",
+  aiProxyUrl: "",
 };
 let settings = { ...DEFAULT_SETTINGS };
 const DENSITY_PX = { compact: 24, default: 30, comfortable: 38 };
@@ -3793,6 +4096,66 @@ function applySettings(rerender) {
     scheduleRender();
   }
 }
+
+async function refreshAiKeyStatus() {
+  if (!aiKeyStatus) return;
+
+  if (settings.aiAuthentication === "none") {
+    aiKeyStatus.textContent = "No key is used.";
+    saveAiApiKeyBtn.disabled = true;
+    deleteAiApiKeyBtn.disabled = true;
+    return;
+  }
+
+  saveAiApiKeyBtn.disabled = false;
+  deleteAiApiKeyBtn.disabled = false;
+
+  try {
+    const saved = await invoke("ai_key_status");
+    aiKeyStatus.textContent = saved
+        ? "Saved securely in the system keychain."
+        : "Not saved.";
+  } catch (error) {
+    aiKeyStatus.textContent = `Keychain unavailable: ${error}`;
+  }
+}
+
+async function saveAiApiKey() {
+  const apiKey = setAiApiKey.value.trim();
+
+  if (!apiKey) {
+    showToast("Enter an API key first.");
+    setAiApiKey.focus();
+    return;
+  }
+
+  saveAiApiKeyBtn.disabled = true;
+
+  try {
+    await invoke("save_ai_api_key", { apiKey });
+    setAiApiKey.value = "";
+    showToast("AI API key saved securely.");
+  } catch (error) {
+    showToast(`Could not save the AI API key: ${error}`);
+  } finally {
+    await refreshAiKeyStatus();
+  }
+}
+
+async function deleteAiApiKey() {
+  deleteAiApiKeyBtn.disabled = true;
+
+  try {
+    await invoke("delete_ai_api_key");
+    setAiApiKey.value = "";
+    showToast("AI API key removed.");
+  } catch (error) {
+    showToast(`Could not remove the AI API key: ${error}`);
+  } finally {
+    await refreshAiKeyStatus();
+  }
+}
+
 function initSettingsControls() {
   setTheme.value = settings.theme;
   setDensity.value = settings.density;
@@ -3802,6 +4165,10 @@ function initSettingsControls() {
   setCsvImportMaxSize.value = String(settings.csvImportMaxSizeGiB);
   setCsvMaxLineSize.value = String(settings.csvMaxLineSizeMiB);
   setCsvConversionProfile.value = settings.csvConversionProfile;
+  setAiBaseUrl.value = settings.aiBaseUrl;
+  setAiModel.value = settings.aiModel;
+  setAiAuthentication.value = settings.aiAuthentication;
+  setAiProxyUrl.value = settings.aiProxyUrl;
 
   setTheme.addEventListener("change", () => {
     settings.theme = setTheme.value;
@@ -3847,10 +4214,49 @@ function initSettingsControls() {
     settings.csvConversionProfile = setCsvConversionProfile.value;
     saveSettings();
   });
+
+  setAiBaseUrl.addEventListener("change", () => {
+    settings.aiBaseUrl = setAiBaseUrl.value.trim();
+    saveSettings();
+  });
+
+  setAiModel.addEventListener("change", () => {
+    settings.aiModel = setAiModel.value.trim();
+    saveSettings();
+  });
+
+  setAiProxyUrl.addEventListener("change", () => {
+    settings.aiProxyUrl = setAiProxyUrl.value.trim();
+    saveSettings();
+  });
+
+  setAiAuthentication.addEventListener("change", () => {
+    settings.aiAuthentication = setAiAuthentication.value;
+    aiApiKeyRow.classList.toggle(
+        "hidden",
+        settings.aiAuthentication === "none",
+    );
+    saveSettings();
+    void refreshAiKeyStatus();
+  });
+
+  saveAiApiKeyBtn.addEventListener("click", () => {
+    void saveAiApiKey();
+  });
+  deleteAiApiKeyBtn.addEventListener("click", () => {
+    void deleteAiApiKey();
+  });
+
+  aiApiKeyRow.classList.toggle(
+      "hidden",
+      settings.aiAuthentication === "none",
+  );
+  void refreshAiKeyStatus();
 }
 function openSettings() {
   settingsWin.classList.add("open");
   settingsBackdrop.classList.add("open");
+  void refreshAiKeyStatus();
 }
 function closeSettings() {
   settingsWin.classList.remove("open");
@@ -4142,6 +4548,16 @@ viewport.addEventListener(
       if (tab?.kind === "parquet") {
         tab.scrollTop = viewport.scrollTop;
         tab.scrollLeft = viewport.scrollLeft;
+
+        // Invalidate responses for intermediate scrollbar positions once per
+        // continuous scroll gesture. Old backend work may still finish, but its
+        // result will not replace the final viewport's data.
+        if (scrollLoadTimer === null) {
+          tab.viewToken += 1;
+          viewToken = tab.viewToken;
+        }
+
+        scheduleVisiblePageLoad();
       }
 
       scheduleRender();
@@ -4159,6 +4575,10 @@ window.addEventListener("resize", () => {
 
 window.addEventListener("keydown", (e) => {
   const mod = e.metaKey || e.ctrlKey;
+
+  if (e.key === "Escape") {
+    dismissAiInlineSuggestion();
+  }
 
   if (mod && e.key === "Enter" && activeTab()?.kind === "sql") {
     e.preventDefault();

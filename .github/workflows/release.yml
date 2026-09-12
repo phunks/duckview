@@ -47,6 +47,8 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev \
             patchelf \
+            libdbus-1-dev \
+            pkg-config \
             xdg-utils
 
       - name: Install just
