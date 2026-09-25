@@ -29,7 +29,8 @@
     --bg: #1c1d21;
     --panel: #26272c;
     --toolbar-bg: rgba(30, 31, 36, 0.86);
-    --border: #34363d;
+    /*--border: #34363d;*/
+    --border: #5c6278;
     --border-strong: #3f424b;
     --text: #e8e9ec;
     --text-dim: #9a9ea9;
@@ -243,6 +244,235 @@ body {
   color: var(--accent);
   background: var(--accent-weak);
 }
+
+/* ---------- Pivot workspace ---------- */
+
+.pivot-workspace {
+  flex: 1 1 auto;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  background: var(--panel);
+}
+
+.pivot-workspace-head {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 52px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--toolbar-bg);
+}
+
+.pivot-source {
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pivot-workspace-body {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.pivot-fields-pane {
+  min-width: 0;
+  overflow: auto;
+  padding: 12px;
+  border-right: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.pivot-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 9px;
+}
+
+.pivot-field {
+  overflow: hidden;
+  padding: 6px 8px;
+  border-radius: 5px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pivot-field:hover {
+  background: var(--row-hover);
+}
+
+.pivot-field-type {
+  margin-left: 6px;
+  color: var(--text-dim);
+  font-family: var(--sans);
+  font-size: 10px;
+}
+
+.pivot-content {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px;
+}
+
+.pivot-status {
+  margin-bottom: 12px;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.pivot-status.dirty {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.pivot-status.error {
+  color: #d64545;
+}
+
+.pivot-ui-host {
+  min-width: max-content;
+}
+
+.pivot-result-host {
+  min-width: max-content;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.pivot-empty {
+  max-width: 580px;
+  padding: 16px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 9px;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.pivot-empty strong {
+  color: var(--text);
+}
+
+.pivot-error {
+  color: #d64545;
+}
+
+/* ---------- Standalone React Pivot ---------- */
+.pivot-react-host {
+  width: 100%;
+  min-width: 0;
+  color: var(--text);
+  font-family: var(--sans);
+
+  /*
+   * The React Pivot originated as a Streamlit component. Keep its styling
+   * self-contained by translating DuckView theme tokens at this boundary,
+   * rather than making the rest of DuckView depend on Streamlit variables.
+   */
+  --st-font: var(--sans);
+  --st-code-font: var(--mono);
+  --st-base-font-size: 12px;
+  --st-base-radius: 7px;
+
+  --st-background-color: var(--panel);
+  --st-secondary-background-color: var(--bg);
+  --st-text-color: var(--text);
+  --st-primary-color: var(--accent);
+  --st-border-color: var(--border);
+  --st-dataframe-border-color: var(--border);
+  --st-dataframe-header-background-color: var(--header-bg);
+
+  --st-yellow-background-color: color-mix(
+          in srgb,
+          var(--accent-weak) 82%,
+          var(--panel)
+  );
+  --st-yellow-color: var(--accent);
+}
+
+.pivot-result-host:has(.pivot-react-host) {
+  width: 100%;
+  min-width: 0;
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.pivot-react-host *,
+.pivot-react-host *::before,
+.pivot-react-host *::after {
+  box-sizing: border-box;
+}
+
+/* Warnings are forwarded to DuckView's toast instead of taking table space. */
+.pivot-react-host [data-testid="pivot-warning-banner"] {
+  display: none;
+}
+
+/* The regular table must be allowed to grow wider than its viewport rather
+   than squeezing every column into 100%. Virtualized tables have their own
+   explicit widths and must keep their existing layout. */
+.pivot-react-host table[data-testid="pivot-table"] {
+  width: max-content;
+  min-width: 100%;
+  table-layout: auto;
+}
+
+.pivot-react-host table[data-testid="pivot-table"] th,
+.pivot-react-host table[data-testid="pivot-table"] td {
+  max-width: calc(10ch + 20px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pivot-react-host table[data-testid="pivot-table"] [class*="headerCellInner"] {
+  min-width: 0;
+  max-width: 10ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pivot-react-host table[data-testid="pivot-table"] [class*="headerCellInner"] > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pivot-react-host button,
+.pivot-react-host input,
+.pivot-react-host select {
+  font: inherit;
+}
+
+.pivot-react-host button {
+  color: var(--st-text-color);
+}
+
+.pivot-react-host input,
+.pivot-react-host select {
+  color: var(--st-text-color);
+  background: var(--st-background-color);
+}
+
 /* ---------- SQL workspace ---------- */
 .sql-workspace {
   flex: 1 1 auto;
@@ -557,6 +787,59 @@ body {
   color: var(--text);
   background: var(--border);
 }
+
+.sql-table-context-menu {
+  position: fixed;
+  z-index: 58;
+  display: none;
+  min-width: 210px;
+  overflow: hidden;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+.sql-table-context-menu.open {
+  display: block;
+}
+.sql-table-context-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 57;
+  display: none;
+}
+.sql-table-context-menu-backdrop.open {
+  display: block;
+}
+.sql-table-context-menu-item {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 9px;
+  color: var(--text);
+  background: transparent;
+  font-family: var(--sans);
+  font-size: 12px;
+  text-align: left;
+}
+.sql-table-context-menu-item:hover {
+  background: var(--row-hover);
+}
+.sql-table-context-menu-item.danger {
+  color: #d64545;
+}
+.sql-table-context-menu-item.danger:hover {
+  background: rgba(214, 69, 69, 0.1);
+}
+.sql-table-context-menu-separator {
+  height: 1px;
+  margin: 5px 4px;
+  background: var(--border);
+}
+
 .sql-empty-tables,
 .sql-result-empty {
   padding: 12px;
@@ -622,6 +905,8 @@ body {
   position: sticky;
   top: -1px;
   z-index: 1;
+  height: 34px;
+  box-sizing: border-box;
   padding: 8px 10px;
   border-right: 1px solid var(--border);
   border-bottom: 1px solid var(--border-strong);
@@ -633,6 +918,24 @@ body {
   text-align: left;
   white-space: nowrap;
 }
+.sql-result-grid th:not(.sql-row-number) {
+  padding-right: 16px;
+}
+.sql-result-resize {
+  position: absolute;
+  top: 0;
+  right: -4px;
+  z-index: 3;
+  width: 9px;
+  height: 100%;
+  cursor: col-resize;
+  touch-action: none;
+}
+.sql-result-resize:hover,
+.sql-result-resize:focus-visible {
+  background: var(--border-strong);
+  outline: none;
+}
 .sql-result-grid td {
   max-width: 420px;
   padding: 7px 10px;
@@ -643,10 +946,25 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.sql-result-grid tbody tr:nth-child(even) {
+.sql-result-grid.sql-result-locked td {
+  max-width: none;
+}
+.sql-result-grid tbody tr:not(.sql-result-spacer) {
+  height: 30px;
+}
+.sql-result-grid tbody tr:not(.sql-result-spacer) td {
+  height: 30px;
+  box-sizing: border-box;
+  line-height: 15px;
+}
+.sql-result-grid tbody tr.sql-result-even {
   background: var(--row-alt);
 }
-.sql-result-grid tbody tr:hover {
+.sql-result-grid .sql-result-spacer td {
+  padding: 0;
+  border: 0;
+}
+.sql-result-grid tbody tr:not(.sql-result-spacer):hover {
   background: var(--row-hover);
 }
 .sql-result-grid td.sql-null {
@@ -661,6 +979,11 @@ body {
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
   text-align: right;
+}
+.sql-result-grid.sql-result-locked th.sql-row-number,
+.sql-result-grid.sql-result-locked td.sql-row-number {
+  width: auto;
+  min-width: 0;
 }
 .sql-result-grid th.sql-row-number {
   position: sticky;
@@ -1120,6 +1443,7 @@ body {
   font-weight: 550;
   box-shadow: var(--shadow);
   max-width: 70vw;
+  white-space: pre-line;
   user-select: text;
   -webkit-user-select: text;
 }

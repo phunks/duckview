@@ -23,12 +23,17 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420 https://*.tauri.localhost; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; img-src 'self' data:; connect-src 'self' ipc: pivot-data: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420 https://*.tauri.localhost; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
     }
   },
   "bundle": {
     "active": true,
     "targets": ["app"],
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../licenses/streamlit-pivot-table/LICENSE": "licenses/streamlit-pivot-table/LICENSE",
+      "../licenses/streamlit-pivot-table/NOTICES": "licenses/streamlit-pivot-table/NOTICES"
+    },
     "icon": [
       "icons/icon_128x128.png",
       "icons/icon_128x128@2x.png",

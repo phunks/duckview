@@ -4,11 +4,13 @@
 mod csv;
 mod duck;
 mod chat;
+mod pivot;
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read};
+use std::io::{BufReader, Read};
 use std::sync::Mutex;
 
 use duckdb::arrow::array::{Array, ArrayRef, UInt32Array, new_empty_array};
@@ -19,19 +21,16 @@ use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
 use crate::chat::chat_client::{
     ai_key_status, delete_ai_api_key, generate_sql_from_prompt, save_ai_api_key,
 };
-use crate::duck::{
-    DuckDbState, DuckTable, configure_duckdb_memory_limit, execute_duckdb_query,
-    export_duckdb_query, get_duckdb_query_rows, get_duckdb_query_rows_arrow,
-    get_duckdb_table_columns, list_duckdb_tables, register_duckdb_query_as_table,
-    remove_duckdb_result_table, restore_duckdb_view, run_filter_duckdb, run_sort_duckdb,
-};
+use crate::duck::{DuckDbState, DuckTable, configure_duckdb_memory_limit, execute_duckdb_query, execute_duckdb_pivot, export_duckdb_query, get_duckdb_query_rows, get_duckdb_query_rows_arrow, get_duckdb_table_columns, list_duckdb_tables, register_duckdb_query_as_table, remove_duckdb_result_table, restore_duckdb_view, run_filter_duckdb, run_sort_duckdb, get_duckdb_pivot_filter_values};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
     RowSelector,
 };
 use serde::{Deserialize, Serialize};
+use tauri::http::{Method, Request, Response, StatusCode};
 use tauri::{Emitter, Manager, State};
+use crate::pivot::validate_duckdb_client_pivot_values;
 
 // Cap on how many matching rows a search will collect, to bound memory/time on
 // huge files. Beyond this the result set is marked truncated.
@@ -1088,6 +1087,7 @@ fn ensure_csv_import_size(path: &str, max_csv_import_mib: u64) -> Result<(), Str
     Ok(())
 }
 
+#[allow(unused)]
 fn csv_line_size_bytes(max_csv_line_size_mib: u64) -> Result<u64, String> {
     const MIN_CSV_LINE_SIZE_MIB: u64 = 1;
     const MAX_CSV_LINE_SIZE_MIB: u64 = 64;
@@ -1339,6 +1339,113 @@ fn normalize_read_only_sql(sql: &str) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// pivot
+// ---------------------------------------------------------------------------
+fn pivot_data_response(
+    status: StatusCode,
+    content_type: &str,
+    body: impl Into<Vec<u8>>,
+) -> Response<Cow<'static, [u8]>> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", content_type)
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        .header("Access-Control-Allow-Headers", "Content-Type")
+        .header(
+            "Access-Control-Expose-Headers",
+            "Content-Type, Content-Length",
+        )
+        .header("Cache-Control", "no-store")
+        .body(Cow::Owned(body.into()))
+        .expect("Pivot data protocol response must be valid")
+}
+
+fn pivot_data_error(status: StatusCode, message: impl Into<String>) -> Response<Cow<'static, [u8]>> {
+    pivot_data_response(status, "text/plain; charset=utf-8", message.into())
+}
+
+fn pivot_data_query_parameter(
+    request: &Request<Vec<u8>>,
+    name: &str,
+    default: Option<usize>,
+) -> Result<usize, String> {
+    let value = request
+        .uri()
+        .query()
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|entry| entry.split_once('='))
+                .and_then(|(key, value)| (key == name).then_some(value))
+        });
+
+    match value {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| format!("Query parameter \"{name}\" must be a non-negative integer.")),
+        None => default.ok_or_else(|| format!("Missing query parameter \"{name}\".")),
+    }
+}
+
+fn pivot_data_protocol(
+    duckdb: &DuckDbState,
+    request: Request<Vec<u8>>,
+) -> Response<Cow<'static, [u8]>> {
+    if request.method() == Method::OPTIONS {
+        return pivot_data_response(StatusCode::NO_CONTENT, "text/plain", Vec::new());
+    }
+
+    if request.method() != Method::GET {
+        return pivot_data_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Only GET and OPTIONS are supported.",
+        );
+    }
+
+    if request.uri().host() != Some("localhost") {
+        return pivot_data_error(StatusCode::NOT_FOUND, "Unknown Pivot data host.");
+    }
+
+    let Some(query_id) = request.uri().path().strip_prefix("/query/") else {
+        return pivot_data_error(StatusCode::NOT_FOUND, "Unknown Pivot data resource.");
+    };
+
+    if query_id.is_empty() || query_id.contains('/') {
+        return pivot_data_error(StatusCode::BAD_REQUEST, "Invalid query id.");
+    }
+
+    let offset = match pivot_data_query_parameter(&request, "offset", Some(0)) {
+        Ok(value) => value,
+        Err(error) => return pivot_data_error(StatusCode::BAD_REQUEST, error),
+    };
+
+    //　TODO　
+    let limit = match pivot_data_query_parameter(&request, "limit", Some(MAX_PAGE)) {
+        Ok(value) if (1..=MAX_PAGE).contains(&value) => value,
+        Ok(_) => {
+            return pivot_data_error(
+                StatusCode::BAD_REQUEST,
+                format!("\"limit\" must be between 1 and {MAX_PAGE}."),
+            );
+        }
+        Err(error) => return pivot_data_error(StatusCode::BAD_REQUEST, error),
+    };
+
+    match duck::get_duckdb_query_rows_arrow_bytes(duckdb, query_id, offset, limit) {
+        Ok(bytes) => pivot_data_response(
+            StatusCode::OK,
+            "application/vnd.apache.arrow.stream",
+            bytes,
+        ),
+        Err(error) if error == "Query result is no longer available." => {
+            pivot_data_error(StatusCode::NOT_FOUND, error)
+        }
+        Err(error) => pivot_data_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1350,6 +1457,10 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .manage(duckdb)
+        .register_uri_scheme_protocol("pivot-data", |context, request| {
+            let duckdb = context.app_handle().state::<DuckDbState>();
+            pivot_data_protocol(duckdb.inner(), request)
+        })
         .invoke_handler(tauri::generate_handler![
             open_file,
             get_rows,
@@ -1357,7 +1468,9 @@ fn main() {
             parquet_file_exists,
             list_duckdb_tables,
             get_duckdb_table_columns,
+            get_duckdb_pivot_filter_values,
             execute_duckdb_query,
+            execute_duckdb_pivot,
             get_duckdb_query_rows,
             get_duckdb_query_rows_arrow,
             export_duckdb_query,
@@ -1372,7 +1485,8 @@ fn main() {
             take_startup_file,
             pick_file,
             pick_parquet_file,
-            import_csv_as_parquet
+            import_csv_as_parquet,
+            validate_duckdb_client_pivot_values,
         ])
         .setup(|app| {
             // A file path may arrive as a CLI arg when launched via `open -a`.

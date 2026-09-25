@@ -1,0 +1,3946 @@
+diff --git a/streamlit_pivot/frontend/src/PivotRoot.test.tsx b/streamlit_pivot/frontend/src/PivotRoot.test.tsx
+index c409902..9e0b156 100644
+--- a/streamlit_pivot/frontend/src/PivotRoot.test.tsx
++++ b/streamlit_pivot/frontend/src/PivotRoot.test.tsx
+@@ -21,14 +21,15 @@ import { tableToIPC, tableFromArrays } from "apache-arrow";
+ import PivotRoot from "./PivotRoot";
+ import type { PivotRootProps } from "./PivotRoot";
+ import { makeConfig } from "./test-utils";
++import { COLUMN_VIRTUALIZATION_THRESHOLD, DEFAULT_BUDGETS } from "./engine/perf";
+ 
+ function makeArrowBytes(data: Record<string, unknown[]>): Uint8Array {
+   return tableToIPC(tableFromArrays(data));
+ }
+ 
+ // ---------------------------------------------------------------------------
+-// Rendering-budget boundary: < 5 000 cells → TableRenderer (non-virtual),
+-// > 5 000 cells → VirtualizedTableRenderer (virtual-scroll-container present)
++// Small pivots use TableRenderer; exceeding the column windowing threshold
++// uses VirtualizedTableRenderer (virtual-scroll-container present).
+ // ---------------------------------------------------------------------------
+ 
+ function makeBigArrowBytes(numRegions: number, numYears: number): Uint8Array {
+@@ -46,8 +47,8 @@ function makeBigArrowBytes(numRegions: number, numYears: number): Uint8Array {
+ }
+ 
+ describe("PivotRoot - rendering budget (non-virtual vs virtual path)", () => {
+-  it("small dataset (< 5 000 cells) uses non-virtual TableRenderer", async () => {
+-    // 5 regions × 5 years = 25 cells — well below the 5 000-cell DOM budget.
++  it("small dataset uses non-virtual TableRenderer", async () => {
++    // 5 regions × 5 years = 25 cells — well below the DOM budget.
+     const dataframe = makeBigArrowBytes(5, 5);
+     const config = makeConfig({ show_totals: false });
+ 
+@@ -72,9 +73,9 @@ describe("PivotRoot - rendering budget (non-virtual vs virtual path)", () => {
+     expect(screen.getByTestId("pivot-table")).toBeInTheDocument();
+   });
+ 
+-  it("large dataset (> 5 000 cells) uses VirtualizedTableRenderer", async () => {
+-    // 100 regions × 51 years = 5 100 unique pivot cells — above the 5 000-cell budget.
+-    const dataframe = makeBigArrowBytes(100, 51);
++  it("wide dataset uses VirtualizedTableRenderer", async () => {
++    // Exceed the horizontal windowing threshold without building 50,000 cells.
++    const dataframe = makeBigArrowBytes(5, COLUMN_VIRTUALIZATION_THRESHOLD + 1);
+     const config = makeConfig({ show_totals: false });
+ 
+     render(
+@@ -95,9 +96,9 @@ describe("PivotRoot - rendering budget (non-virtual vs virtual path)", () => {
+   });
+ 
+   it("virtualized table has colgroup elements for column alignment", async () => {
+-    // Same large dataset — verify the colgroup fix is wired end-to-end from
++    // Same wide dataset — verify the colgroup fix is wired end-to-end from
+     // PivotRoot → VirtualizedTableRenderer → VirtualScroll.
+-    const dataframe = makeBigArrowBytes(100, 51);
++    const dataframe = makeBigArrowBytes(5, COLUMN_VIRTUALIZATION_THRESHOLD + 1);
+     const config = makeConfig({ show_totals: false });
+ 
+     const { container } = render(
+@@ -130,7 +131,7 @@ describe("PivotRoot - rendering budget (non-virtual vs virtual path)", () => {
+   });
+ 
+   it("all virtual-path tables have table-layout: fixed", async () => {
+-    const dataframe = makeBigArrowBytes(100, 51);
++    const dataframe = makeBigArrowBytes(5, COLUMN_VIRTUALIZATION_THRESHOLD + 1);
+     const config = makeConfig({ show_totals: false });
+ 
+     const { container } = render(
+@@ -694,8 +695,11 @@ describe("PivotRoot - suppress_warnings", () => {
+   it("perf_metrics still records suppressed virtualization warning", async () => {
+     // Even when suppress_warnings hides informational banners from the UI,
+     // the virtualization warning must remain in perf_metrics for debugging.
+-    // 80 regions × 80 years = 6 400 cells — exceeds the 5 000-cell DOM budget.
+-    const dataframe = makeBigArrowBytes(80, 80);
++    // 251 × 200 = 50,200 cells, exceeding the current DOM budget.
++    const dataframe = makeBigArrowBytes(
++      Math.floor(DEFAULT_BUDGETS.maxVisibleCells / COLUMN_VIRTUALIZATION_THRESHOLD) + 1,
++      COLUMN_VIRTUALIZATION_THRESHOLD,
++    );
+     const config = makeConfig({ show_totals: false });
+ 
+     let container: HTMLElement;
+diff --git a/streamlit_pivot/frontend/src/PivotRoot.tsx b/streamlit_pivot/frontend/src/PivotRoot.tsx
+index ced8b93..11e7508 100644
+--- a/streamlit_pivot/frontend/src/PivotRoot.tsx
++++ b/streamlit_pivot/frontend/src/PivotRoot.tsx
+@@ -15,7 +15,6 @@
+  * limitations under the License.
+  */
+ 
+-import { FrontendRendererArgs } from "@streamlit/component-v2-lib";
+ import {
+   FC,
+   ReactElement,
+@@ -88,48 +87,64 @@ export type PivotRootState = {
+   drilldown_request?: DrilldownRequest | null;
+ };
+ 
+-export type PivotRootProps = Pick<
+-  FrontendRendererArgs<PivotRootState, PivotTableData>,
+-  "setStateValue" | "setTriggerValue"
+-> &
+-  PivotTableData & {
+-    /** Stable per-instance key from the component framework; used for localStorage namespacing. */
+-    instanceKey?: string;
+-  };
++// export type PivotRootProps = Pick<
++//   FrontendRendererArgs<PivotRootState, PivotTableData>,
++//   "setStateValue" | "setTriggerValue"
++// > &
++//   PivotTableData & {
++//     /** Stable per-instance key from the component framework; used for localStorage namespacing. */
++//     instanceKey?: string;
++//   };
++
++export type PivotStateCallback = (key: string, value: unknown) => void;
++
++export type PivotRootProps = PivotTableData & {
++  /** Stable local-storage namespace for one standalone Pivot instance. */
++  instanceKey?: string;
++  /** Receives config and drilldown state changes from the Pivot UI. */
++  setStateValue: PivotStateCallback;
++  /** Receives transient interaction events from the Pivot UI. */
++  setTriggerValue: PivotStateCallback;
++  /** Called immediately after a user changes the standalone Pivot configuration. */
++  onConfigChange?: (config: PivotConfigV1) => void;
++  onCreateDrilldownView?: (event: React.MouseEvent, payload: CellClickPayload, config: PivotConfigV1, columnTypes: ColumnTypeMap, adaptiveDateGrains?: Record<string, DateGrain>) => void;
++};
+ 
+ const PivotRoot: FC<PivotRootProps> = ({
+-  instanceKey,
+-  config: configProp,
+-  dataframe,
+-  height,
+-  max_height,
+-  null_handling,
+-  hidden_attributes,
+-  hidden_from_aggregators,
+-  hidden_from_drag_drop,
+-  sorters,
+-  locked,
+-  menu_limit,
+-  enable_drilldown,
+-  suppress_warnings,
+-  export_filename,
+-  execution_mode,
+-  server_mode_reason,
+-  drilldown_records,
+-  drilldown_columns,
+-  drilldown_total_count,
+-  drilldown_page,
+-  drilldown_page_size,
+-  drilldown_request_id,
+-  hybrid_totals,
+-  hybrid_agg_remap,
+-  filter_field_values,
+-  source_row_count,
+-  original_column_types,
+-  adaptive_date_grains,
+-  setStateValue,
+-  setTriggerValue,
+-}): ReactElement => {
++                                         instanceKey,
++                                         config: configProp,
++                                         dataframe,
++                                         height,
++                                         max_height,
++                                         null_handling,
++                                         hidden_attributes,
++                                         hidden_from_aggregators,
++                                         hidden_from_drag_drop,
++                                         sorters,
++                                         locked,
++                                         menu_limit,
++                                         enable_drilldown,
++                                         suppress_warnings,
++                                         export_filename,
++                                         execution_mode,
++                                         server_mode_reason,
++                                         drilldown_records,
++                                         drilldown_columns,
++                                         drilldown_total_count,
++                                         drilldown_page,
++                                         drilldown_page_size,
++                                         drilldown_request_id,
++                                         hybrid_totals,
++                                         hybrid_agg_remap,
++                                         filter_field_values,
++                                         source_row_count,
++                                         original_column_types,
++                                         adaptive_date_grains,
++                                         setStateValue,
++                                         setTriggerValue,
++                                         onConfigChange,
++                                         onCreateDrilldownView,
++                                       }): ReactElement => {
+   // Local override for user-initiated config changes. Without this, calling
+   // setStateValue("config", ...) triggers a Python rerun that re-sends the
+   // original config prop, immediately overwriting the user's change (especially
+@@ -624,18 +639,20 @@ const PivotRoot: FC<PivotRootProps> = ({
+   const pendingFlushRef = useRef<PivotConfigV1 | null>(null);
+ 
+   const handleConfigChange = useCallback(
+-    (newConfig: PivotConfigV1) => {
+-      if (stringifyPivotConfig(newConfig) !== currentConfigJson) {
+-        setLocalConfig(newConfig);
+-        if (isFullscreen) {
+-          pendingFlushRef.current = newConfig;
+-        } else {
+-          pendingFlushRef.current = null;
+-          setStateValue("config", newConfig);
++      (newConfig: PivotConfigV1) => {
++        if (stringifyPivotConfig(newConfig) !== currentConfigJson) {
++          setLocalConfig(newConfig);
++          onConfigChange?.(newConfig);
++
++          if (isFullscreen) {
++            pendingFlushRef.current = newConfig;
++          } else {
++            pendingFlushRef.current = null;
++            setStateValue("config", newConfig);
++          }
+         }
+-      }
+-    },
+-    [setStateValue, currentConfigJson, isFullscreen],
++      },
++      [setStateValue, onConfigChange, currentConfigJson, isFullscreen],
+   );
+ 
+   const drilldownEnabled = enable_drilldown == null || !!enable_drilldown;
+@@ -1270,6 +1287,7 @@ const PivotRoot: FC<PivotRootProps> = ({
+           <DrilldownPanel
+             pivotData={pivotData}
+             payload={drilldownPayload}
++            onCreateView={onCreateDrilldownView ? (event, payload) => onCreateDrilldownView(event, payload, currentConfig, mergedColumnTypes, typedAdaptiveGrains) : undefined}
+             sortColumn={drilldownSortColumn}
+             sortDirection={drilldownSortDirection}
+             onSortChange={handleDrilldownSortChange}
+diff --git a/streamlit_pivot/frontend/src/config/SettingsPanel.tsx b/streamlit_pivot/frontend/src/config/SettingsPanel.tsx
+index dc76560..3ca7dcf 100644
+--- a/streamlit_pivot/frontend/src/config/SettingsPanel.tsx
++++ b/streamlit_pivot/frontend/src/config/SettingsPanel.tsx
+@@ -49,6 +49,9 @@ import { CSS } from "@dnd-kit/utilities";
+ import {
+   getDimensionLabel,
+   getRenderedValueLabel,
++  getValueChipLabel,
++  getValueSource,
++  addValueInstance,
+   normalizeAggregationConfig,
+   reconcileValueOrder,
+   stringifyPivotConfig,
+@@ -232,6 +235,11 @@ export function cleanupConfigAfterFieldChanges(
+   newConfig: PivotConfigV1,
+ ): PivotConfigV1 {
+   let updated = { ...newConfig };
++  if (updated.value_sources) {
++    updated.value_sources = Object.fromEntries(
++      Object.entries(updated.value_sources).filter(([id]) => updated.values.includes(id)),
++    );
++  }
+ 
+   // Normalize aggregation for current values + formula source fields
+   const allAggFields = [
+@@ -595,7 +603,7 @@ const ZoneChip: FC<ZoneChipProps> = ({
+       {!isFrozen && <GripDotsIcon />}
+       {displayLabel ?? field}
+       {isValues && aggLabel && (
+-        <span className={styles.chipAggLabel}>({aggLabel})</span>
++        <span className={styles.chipAggLabel}> ({aggLabel})</span>
+       )}
+       {groupCount !== undefined && groupCount > 0 && (
+         <button
+@@ -1815,6 +1823,7 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+   const [localRows, setLocalRows] = useState<string[]>(config.rows);
+   const [localCols, setLocalCols] = useState<string[]>(config.columns);
+   const [localVals, setLocalVals] = useState<string[]>(config.values);
++  const [localValueSources, setLocalValueSources] = useState(config.value_sources);
+   const [localAgg, setLocalAgg] = useState<AggregationConfig>(
+     config.aggregation,
+   );
+@@ -1880,6 +1889,7 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+       setLocalRows(config.rows);
+       setLocalCols(config.columns);
+       setLocalVals(config.values);
++      setLocalValueSources(config.value_sources);
+       setLocalAgg(config.aggregation);
+       setLocalShowAs(config.show_values_as ?? {});
+       setLocalSynthetics(config.synthetic_measures ?? []);
+@@ -1939,6 +1949,17 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+   // -- Available fields computation --
+   const numericSet = useMemo(() => new Set(numericColumns), [numericColumns]);
+ 
++  const addValue = useCallback((source: string) => {
++    if (!numericSet.has(source)) return;
++    const next = addValueInstance({
++      ...config, values: localVals, value_sources: localValueSources,
++      aggregation: localAgg, synthetic_measures: localSynthetics,
++    }, source);
++    setLocalVals(next.values);
++    setLocalValueSources(next.value_sources);
++    setLocalAgg(next.aggregation);
++  }, [config, localVals, localValueSources, localAgg, localSynthetics, numericSet]);
++
+   const availableFields = useMemo(() => {
+     return allColumns;
+   }, [allColumns]);
+@@ -1998,25 +2019,20 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+         if (localRows.includes(field)) return;
+         if (!localCols.includes(field)) setLocalCols((c) => [...c, field]);
+       } else if (zone === "values") {
+-        if (!numericSet.has(field)) return;
+-        if (!localVals.includes(field)) {
+-          const nextVals = [...localVals, field];
+-          setLocalVals(nextVals);
+-          setLocalAgg((agg) => normalizeAggregationConfig(agg, nextVals));
+-        }
++        addValue(field);
+       } else if (zone === "filters") {
+         // No mutual exclusion — filters zone allows dual-role fields
+         if (!localFilterFields.includes(field))
+           setLocalFilterFields((f) => [...f, field]);
+       }
+     },
+-    [localRows, localCols, localVals, localFilterFields, numericSet],
++    [localRows, localCols, localFilterFields, addValue],
+   );
+ 
+   // -- Remove from zone --
+   const removeFromZone = useCallback(
+     (field: string, zone: ZoneKey) => {
+-      if (frozenColumns?.has(field)) return;
++      if (frozenColumns?.has(zone === "values" ? getValueSource({ ...config, value_sources: localValueSources }, field) : field)) return;
+       if (zone === "rows") {
+         setLocalRows((r) => r.filter((f) => f !== field));
+       } else if (zone === "columns") {
+@@ -2024,6 +2040,9 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+       } else if (zone === "values") {
+         const nextVals = localVals.filter((f) => f !== field);
+         setLocalVals(nextVals);
++        setLocalValueSources((prev) => Object.fromEntries(
++          Object.entries(prev ?? {}).filter(([id]) => id !== field),
++        ));
+         setLocalAgg((agg) => normalizeAggregationConfig(agg, nextVals));
+         setLocalShowAs((prev) => {
+           if (!prev[field]) return prev;
+@@ -2035,34 +2054,35 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+         removeFromFilterZone(field);
+       }
+     },
+-    [frozenColumns, localVals, removeFromFilterZone],
++    [frozenColumns, localVals, removeFromFilterZone, config, localValueSources],
+   );
+ 
+   // -- Move between zones (validates constraints before mutating) --
+   const moveToZone = useCallback(
+     (field: string, fromZone: ZoneKey, toZone: ZoneKey) => {
+-      if (frozenColumns?.has(field) || fromZone === toZone) return;
++      if (frozenColumns?.has(getValueSource({ ...config, value_sources: localValueSources }, field)) || fromZone === toZone) return;
+ 
+-      if (toZone === "values" && !numericSet.has(field)) return;
++      if (toZone === "values" && !numericSet.has(getValueSource({ ...config, value_sources: localValueSources }, field))) return;
+ 
+       if (
+         toZone === "rows" &&
+         fromZone !== "columns" &&
+-        localCols.includes(field)
++        localCols.includes(getValueSource({ ...config, value_sources: localValueSources }, field))
+       )
+         return;
+       if (
+         toZone === "columns" &&
+         fromZone !== "rows" &&
+-        localRows.includes(field)
++        localRows.includes(getValueSource({ ...config, value_sources: localValueSources }, field))
+       )
+         return;
+ 
+       // Filters zone: add to filter_fields from source zone, but don't remove
+       // from source zone (dual-role: field can be in both rows/cols AND filters).
+       if (toZone === "filters") {
++        const source = getValueSource({ ...config, value_sources: localValueSources }, field);
+         setLocalFilterFields((arr) =>
+-          arr.includes(field) ? arr : [...arr, field],
++          arr.includes(source) ? arr : [...arr, source],
+         );
+         return;
+       }
+@@ -2070,48 +2090,28 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+       // Moving OUT of filters zone to another zone
+       if (fromZone === "filters") {
+         removeFromFilterZone(field);
+-        const setterTo =
+-          toZone === "rows"
+-            ? setLocalRows
+-            : toZone === "columns"
+-              ? setLocalCols
+-              : setLocalVals;
+-        setterTo((arr) => (arr.includes(field) ? arr : [...arr, field]));
+         if (toZone === "values") {
+-          const nextVals = [...localVals, field];
+-          setLocalAgg((agg) => normalizeAggregationConfig(agg, nextVals));
++          addValue(field);
++          return;
+         }
++        const setterTo = toZone === "rows" ? setLocalRows : setLocalCols;
++        setterTo((arr) => (arr.includes(field) ? arr : [...arr, field]));
+         return;
+       }
+ 
+-      const setterFor = (z: ZoneKey) =>
+-        z === "rows"
+-          ? setLocalRows
+-          : z === "columns"
+-            ? setLocalCols
+-            : setLocalVals;
++      if (toZone === "values") {
++        addValue(getValueSource({ ...config, value_sources: localValueSources }, field));
++        return;
++      }
++      if (fromZone === "values") {
++        addToZone(getValueSource({ ...config, value_sources: localValueSources }, field), toZone);
++        return;
++      }
++
++      const setterFor = (z: ZoneKey) => z === "rows" ? setLocalRows : setLocalCols;
+ 
+       setterFor(fromZone)((arr) => arr.filter((f) => f !== field));
+       setterFor(toZone)((arr) => (arr.includes(field) ? arr : [...arr, field]));
+-
+-      if (fromZone === "values") {
+-        const nextVals = localVals.filter((f) => f !== field);
+-        setLocalAgg((agg) => {
+-          const next = { ...agg };
+-          delete next[field];
+-          return normalizeAggregationConfig(next, nextVals);
+-        });
+-        setLocalShowAs((prev) => {
+-          if (!prev[field]) return prev;
+-          const next = { ...prev };
+-          delete next[field];
+-          return next;
+-        });
+-      }
+-      if (toZone === "values") {
+-        const nextVals = [...localVals, field];
+-        setLocalAgg((agg) => normalizeAggregationConfig(agg, nextVals));
+-      }
+     },
+     [
+       frozenColumns,
+@@ -2119,6 +2119,10 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+       localVals,
+       localRows,
+       localCols,
++      addValue,
++      addToZone,
++      config,
++      localValueSources,
+       removeFromFilterZone,
+     ],
+   );
+@@ -2157,7 +2161,7 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+         label: "Move to Columns",
+         action: () => moveToZone(field, "rows", "columns"),
+       });
+-      if (numericSet.has(field) && !localVals.includes(field)) {
++      if (numericSet.has(field)) {
+         items.push({
+           label: "Also add to Values",
+           action: () => addToZone(field, "values"),
+@@ -2165,7 +2169,7 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+       }
+       return items;
+     },
+-    [moveToZone, addToZone, numericSet, localVals],
++    [moveToZone, addToZone, numericSet],
+   );
+ 
+   const getColChipMenu = useCallback(
+@@ -2175,7 +2179,7 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+         label: "Move to Rows",
+         action: () => moveToZone(field, "columns", "rows"),
+       });
+-      if (numericSet.has(field) && !localVals.includes(field)) {
++      if (numericSet.has(field)) {
+         items.push({
+           label: "Also add to Values",
+           action: () => addToZone(field, "values"),
+@@ -2183,22 +2187,23 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+       }
+       return items;
+     },
+-    [moveToZone, addToZone, numericSet, localVals],
++    [moveToZone, addToZone, numericSet],
+   );
+ 
+   const getValChipMenu = useCallback(
+     (field: string) => {
+       const items: { label: string; action: () => void }[] = [];
+-      const inRows = localRows.includes(field);
+-      const inCols = localCols.includes(field);
++      const source = getValueSource({ ...config, value_sources: localValueSources }, field);
++      const inRows = localRows.includes(source);
++      const inCols = localCols.includes(source);
+       if (!inRows && !inCols) {
+         items.push({
+           label: "Also add to Rows",
+-          action: () => addToZone(field, "rows"),
++          action: () => addToZone(source, "rows"),
+         });
+         items.push({
+           label: "Also add to Columns",
+-          action: () => addToZone(field, "columns"),
++          action: () => addToZone(source, "columns"),
+         });
+       }
+       if (!inCols) {
+@@ -2215,7 +2220,7 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+       }
+       return items;
+     },
+-    [localRows, localCols, moveToZone, addToZone],
++    [localRows, localCols, moveToZone, addToZone, config, localValueSources],
+   );
+ 
+   const getAvailableChipMenu = useCallback(
+@@ -2237,7 +2242,7 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+         ];
+       }
+ 
+-      if (!inRows && !inCols && !inVals) {
++      if (!inRows && !inCols) {
+         const items: { label: string; action: () => void }[] = [
+           { label: "Add to Rows", action: () => addToZone(field, "rows") },
+           {
+@@ -2526,14 +2531,14 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+   const canDropToZone = useCallback(
+     (field: string, fromZone: ZoneKey | undefined, toZone: ZoneKey): boolean =>
+       canDropFieldToZone({
+-        field,
++        field: fromZone === "values" ? getValueSource({ ...config, value_sources: localValueSources }, field) : field,
+         fromZone,
+         toZone,
+         numericFields: numericSet,
+         rowFields: localRows,
+         columnFields: localCols,
+       }),
+-    [numericSet, localCols, localRows],
++    [numericSet, localCols, localRows, config, localValueSources],
+   );
+ 
+   // Unified ordered list of measure ids (real fields + synthetic ids) for the
+@@ -2774,6 +2779,7 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+       rows: localRows,
+       columns: localCols,
+       values: localVals,
++      value_sources: localValueSources,
+       aggregation: localAgg,
+       show_values_as:
+         Object.keys(localShowAs).length > 0 ? localShowAs : undefined,
+@@ -2830,6 +2836,7 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+     localRows,
+     localCols,
+     localVals,
++    localValueSources,
+     localAgg,
+     localSynthetics,
+     localValueOrder,
+@@ -2947,6 +2954,7 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+     if (!arrEq(localRows, config.rows)) return true;
+     if (!arrEq(localCols, config.columns)) return true;
+     if (!arrEq(localVals, config.values)) return true;
++    if (JSON.stringify(localValueSources ?? {}) !== JSON.stringify(config.value_sources ?? {})) return true;
+     if (JSON.stringify(localAgg) !== JSON.stringify(config.aggregation))
+       return true;
+     if (JSON.stringify(localSynthetics) !== JSON.stringify(initSynthetics))
+@@ -2983,6 +2991,7 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+     localRows,
+     localCols,
+     localVals,
++    localValueSources,
+     localAgg,
+     localSynthetics,
+     localValueOrder,
+@@ -3338,8 +3347,8 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+                       id={makeZoneItemId("values", field)}
+                       zone="values"
+                       field={field}
+-                      displayLabel={getRenderedValueLabel(config, field)}
+-                      isFrozen={frozenColumns?.has(field)}
++                      displayLabel={getValueChipLabel({ ...config, value_sources: localValueSources, aggregation: localAgg }, field)}
++                      isFrozen={frozenColumns?.has(getValueSource({ ...config, value_sources: localValueSources }, field))}
+                       isValues
+                       aggLabel={
+                         AGG_LABELS[localAgg?.[field] ?? "sum"]
+@@ -3347,7 +3356,7 @@ const SettingsPanel: FC<SettingsPanelProps> = ({
+                           : "Sum"
+                       }
+                       aggregationControl={
+-                        !frozenColumns?.has(field) ? (
++                        !frozenColumns?.has(getValueSource({ ...config, value_sources: localValueSources }, field)) ? (
+                           <>
+                             <InlineDisplayPicker
+                               field={field}
+diff --git a/streamlit_pivot/frontend/src/config/Toolbar.module.css b/streamlit_pivot/frontend/src/config/Toolbar.module.css
+index 74bc73a..937535f 100644
+--- a/streamlit_pivot/frontend/src/config/Toolbar.module.css
++++ b/streamlit_pivot/frontend/src/config/Toolbar.module.css
+@@ -41,6 +41,73 @@
+ 
+ /* --- Section cards (Rows/Columns/Values/Aggregate/Options) --- */
+ 
++.fieldPalette {
++  /*grid-column: 1 / -1;*/
++  min-width: 300px;
++  margin-bottom: 0px;
++  border: 1px solid var(--st-border-color);
++  border-radius: var(--st-base-radius);
++  background: var(--st-secondary-background-color);
++  transition: border-color 120ms ease, box-shadow 120ms ease;
++}
++
++.fieldPaletteOver {
++  border-color: var(--st-primary-color);
++  box-shadow: 0 0 0 2px
++  color-mix(in srgb, var(--st-primary-color) 25%, transparent);
++}
++
++.fieldPaletteTitle {
++  display: flex;
++  align-items: center;
++  gap: 7px;
++  padding: 8px 10px 6px;
++  color: var(--st-text-color);
++  font-size: 0.78rem;
++  font-weight: 700;
++}
++
++.fieldPaletteCount {
++  min-width: 18px;
++  border-radius: 9px;
++  padding: 1px 5px;
++  color: var(--st-primary-color);
++  background: color-mix(in srgb, var(--st-primary-color) 12%, transparent);
++  font-size: 0.68rem;
++  text-align: center;
++}
++
++.fieldPaletteItems {
++  display: flex;
++  min-height: 38px;
++  flex-wrap: wrap;
++  gap: 6px;
++  padding: 0 8px 8px;
++}
++
++.fieldPaletteEmpty {
++  display: flex;
++  align-items: center;
++  min-height: 30px;
++  color: color-mix(in srgb, var(--st-text-color) 55%, transparent);
++  font-size: 0.75rem;
++  font-style: italic;
++}
++
++.zoneGrid {
++  /*grid-column: 1 / -1;*/
++  display: grid;
++  /*grid-template-columns: repeat(3, minmax(0, 1fr));*/
++  gap: 8px;
++  min-width: 300px;
++}
++
++@media (max-width: 760px) {
++  .zoneGrid {
++    grid-template-columns: 1fr;
++  }
++}
++
+ .fieldGroup {
+   position: relative;
+   display: flex;
+@@ -49,8 +116,9 @@
+   flex: 1 1 0;
+   min-width: 100px;
+   padding: 6px 8px;
+-  border: 1px solid color-mix(in srgb, var(--st-text-color) 10%, transparent);
++  border: 1px solid var(--st-border-color);
+   border-radius: var(--st-base-radius);
++  background: var(--st-secondary-background-color);
+ }
+ 
+ .sectionHeader {
+@@ -276,10 +344,13 @@
+   height: 24px;
+   box-sizing: border-box;
+   border-radius: 12px;
+-  background: var(--st-secondary-background-color);
++  background: color-mix(
++    in srgb,
++    var(--st-secondary-background-color) 10%,
++    var(--st-background-color)
++  );
+   color: var(--st-text-color);
+   font-family: var(--st-font);
+-  font-size: 0.75em;
+   white-space: nowrap;
+   max-width: 100%;
+   overflow: hidden;
+@@ -427,7 +498,6 @@
+   border-radius: 12px;
+   color: var(--st-text-color);
+   opacity: 0.45;
+-  font-size: 0.72em;
+   font-style: italic;
+   padding: 3px 10px;
+ }
+diff --git a/streamlit_pivot/frontend/src/config/Toolbar.test.tsx b/streamlit_pivot/frontend/src/config/Toolbar.test.tsx
+index 0ff38be..9b9847a 100644
+--- a/streamlit_pivot/frontend/src/config/Toolbar.test.tsx
++++ b/streamlit_pivot/frontend/src/config/Toolbar.test.tsx
+@@ -813,6 +813,25 @@ describe("Toolbar - display checkboxes (inside settings panel)", () => {
+   });
+ });
+ 
++describe("Toolbar - duplicate value labels", () => {
++  it("shows only one aggregation suffix on the second value chip", () => {
++    render(
++      <Toolbar
++        config={makeConfig({
++          values: ["revenue", "revenue #2"],
++          value_sources: { "revenue #2": "revenue" },
++          field_labels: { revenue: "単価" },
++          aggregation: { revenue: "sum", "revenue #2": "avg" },
++        })}
++        allColumns={ALL_COLUMNS}
++        numericColumns={NUMERIC_COLUMNS}
++        onConfigChange={vi.fn()}
++      />,
++    );
++    expect(screen.getByTestId("toolbar-values-chip-label-revenue #2").textContent).toBe("単価 (Avg)");
++  });
++});
++
+ describe("Toolbar - value aggregation labels", () => {
+   it("does not render the old global aggregation control", () => {
+     render(
+@@ -2302,7 +2321,7 @@ describe("applyDragMove – cross-zone moves", () => {
+     expect(result!.columns).toEqual(["year", "region"]);
+   });
+ 
+-  it("moves Rows -> Values (numeric field)", () => {
++  it("adds a numeric row field to Values without removing it from Rows", () => {
+     const cfg = makeConfig({
+       rows: ["region", "revenue"],
+       values: ["profit"],
+@@ -2316,7 +2335,7 @@ describe("applyDragMove – cross-zone moves", () => {
+       numericColumns: NUMERIC_COLUMNS,
+     });
+     expect(result).not.toBeNull();
+-    expect(result!.rows).toEqual(["region"]);
++    expect(result!.rows).toEqual(["region", "revenue"]);
+     expect(result!.values).toEqual(["profit", "revenue"]);
+     expect(result!.aggregation.revenue).toBe("sum");
+   });
+@@ -2333,7 +2352,7 @@ describe("applyDragMove – cross-zone moves", () => {
+     expect(result).toBeNull();
+   });
+ 
+-  it("moves Values -> Rows and prunes aggregation + show_values_as", () => {
++  it("adds a value field to Rows while retaining its measure settings", () => {
+     const cfg = makeConfig({
+       rows: ["region"],
+       values: ["revenue", "profit"],
+@@ -2348,10 +2367,10 @@ describe("applyDragMove – cross-zone moves", () => {
+       numericColumns: NUMERIC_COLUMNS,
+     });
+     expect(result).not.toBeNull();
+-    expect(result!.values).toEqual(["profit"]);
++    expect(result!.values).toEqual(["revenue", "profit"]);
+     expect(result!.rows).toEqual(["region", "revenue"]);
+-    expect(result!.aggregation).toEqual({ profit: "avg" });
+-    expect(result!.show_values_as?.revenue).toBeUndefined();
++    expect(result!.aggregation).toEqual({ revenue: "sum", profit: "avg" });
++    expect(result!.show_values_as?.revenue).toBe("pct_of_total");
+   });
+ 
+   it("moves Columns -> Rows", () => {
+@@ -2407,7 +2426,7 @@ describe("applyDragMove – config cleanup: sort", () => {
+     });
+     const result = applyDragMove({
+       sourceZone: "values",
+-      targetZone: "rows",
++      targetZone: "unselected",
+       field: "revenue",
+       config: cfg,
+       numericColumns: NUMERIC_COLUMNS,
+@@ -2422,7 +2441,7 @@ describe("applyDragMove – config cleanup: sort", () => {
+     });
+     const result = applyDragMove({
+       sourceZone: "values",
+-      targetZone: "columns",
++      targetZone: "unselected",
+       field: "profit",
+       config: cfg,
+       numericColumns: NUMERIC_COLUMNS,
+@@ -2458,7 +2477,7 @@ describe("applyDragMove – config cleanup: totals", () => {
+     });
+     const result = applyDragMove({
+       sourceZone: "values",
+-      targetZone: "rows",
++      targetZone: "unselected",
+       field: "revenue",
+       config: cfg,
+       numericColumns: NUMERIC_COLUMNS,
+@@ -2473,7 +2492,7 @@ describe("applyDragMove – config cleanup: totals", () => {
+     });
+     const result = applyDragMove({
+       sourceZone: "values",
+-      targetZone: "rows",
++      targetZone: "unselected",
+       field: "revenue",
+       config: cfg,
+       numericColumns: NUMERIC_COLUMNS,
+@@ -2488,7 +2507,7 @@ describe("applyDragMove – config cleanup: totals", () => {
+     });
+     const result = applyDragMove({
+       sourceZone: "values",
+-      targetZone: "columns",
++      targetZone: "unselected",
+       field: "profit",
+       config: cfg,
+       numericColumns: NUMERIC_COLUMNS,
+@@ -2576,7 +2595,7 @@ describe("applyDragMove – config cleanup: conditional_formatting", () => {
+     });
+     const result = applyDragMove({
+       sourceZone: "values",
+-      targetZone: "rows",
++      targetZone: "unselected",
+       field: "revenue",
+       config: cfg,
+       numericColumns: NUMERIC_COLUMNS,
+@@ -2605,7 +2624,7 @@ describe("applyDragMove – config cleanup: conditional_formatting", () => {
+     });
+     const result = applyDragMove({
+       sourceZone: "values",
+-      targetZone: "rows",
++      targetZone: "unselected",
+       field: "revenue",
+       config: cfg,
+       numericColumns: NUMERIC_COLUMNS,
+@@ -3577,7 +3596,7 @@ describe("Toolbar - sections collapse/expand", () => {
+ // ---------------------------------------------------------------------------
+ 
+ describe("applyDragMove – analytical filter cleanup", () => {
+-  it("drops top_n_filter whose by field is dragged out of values", () => {
++  it("drops top_n_filter when its measure is removed from Values", () => {
+     const cfg = makeConfig({
+       rows: ["region"],
+       values: ["revenue", "profit"],
+@@ -3593,7 +3612,7 @@ describe("applyDragMove – analytical filter cleanup", () => {
+     });
+     const result = applyDragMove({
+       sourceZone: "values",
+-      targetZone: "rows",
++      targetZone: "unselected",
+       field: "revenue",
+       config: cfg,
+       numericColumns: NUMERIC_COLUMNS,
+@@ -3636,7 +3655,7 @@ describe("applyDragMove – analytical filter cleanup", () => {
+     });
+     const result = applyDragMove({
+       sourceZone: "values",
+-      targetZone: "columns",
++      targetZone: "unselected",
+       field: "revenue",
+       config: cfg,
+       numericColumns: NUMERIC_COLUMNS,
+@@ -3740,7 +3759,7 @@ describe("applyDragMove – analytical filter cleanup", () => {
+     });
+     const result = applyDragMove({
+       sourceZone: "values",
+-      targetZone: "columns",
++      targetZone: "unselected",
+       field: "revenue",
+       config: cfg,
+       numericColumns: NUMERIC_COLUMNS,
+diff --git a/streamlit_pivot/frontend/src/config/Toolbar.tsx b/streamlit_pivot/frontend/src/config/Toolbar.tsx
+index 3822d95..848f424 100644
+--- a/streamlit_pivot/frontend/src/config/Toolbar.tsx
++++ b/streamlit_pivot/frontend/src/config/Toolbar.tsx
+@@ -54,6 +54,9 @@ import {
+   getDimensionLabel,
+   getRenderedValueFields,
+   getRenderedValueLabel,
++  getValueChipLabel,
++  getValueSource,
++  addValueInstance,
+   normalizeAggregationConfig,
+   reconcileValueOrder,
+   stringifyPivotConfig,
+@@ -197,7 +200,150 @@ const AGG_CHIP_LABELS: Record<AggregationType, string> = {
+   percentile_90: "P90",
+ };
+ 
+-type ZoneKey = "rows" | "columns" | "values" | "filters";
++type ZoneKey = "unselected" | "rows" | "columns" | "values" | "filters";
++
++export function moveFieldToZone(
++    config: PivotConfigV1,
++    field: string,
++    sourceZone: ZoneKey,
++    targetZone: ZoneKey,
++    numericColumns: ReadonlySet<string>,
++): PivotConfigV1 | null {
++  if (targetZone === "values" && !numericColumns.has(getValueSource(config, field))) {
++    return null;
++  }
++
++  // Rows and Columns are exclusive; Values is an independent measure role.
++  if (sourceZone === "values" && (targetZone === "rows" || targetZone === "columns")) {
++    const source = getValueSource(config, field);
++    if (config.rows.includes(source) && targetZone === "columns") return null;
++    if (config.columns.includes(source) && targetZone === "rows") return null;
++    if (config[targetZone].includes(source)) return null;
++    return { ...config, [targetZone]: [...config[targetZone], source] };
++  }
++
++  if (sourceZone === "values" && targetZone === "filters") {
++    const source = getValueSource(config, field);
++    return { ...config, filter_fields: (config.filter_fields ?? []).includes(source)
++      ? config.filter_fields : [...(config.filter_fields ?? []), source] };
++  }
++  const rows = targetZone === "rows" || targetZone === "columns" ||
++    (targetZone === "unselected" && sourceZone === "rows")
++    ? config.rows.filter((value) => value !== field)
++    : config.rows;
++  const columns = targetZone === "rows" || targetZone === "columns" ||
++    (targetZone === "unselected" && sourceZone === "columns")
++    ? config.columns.filter((value) => value !== field)
++    : config.columns;
++  const values = sourceZone === "values" && targetZone === "unselected"
++    ? config.values.filter((value) => value !== field)
++    : config.values;
++
++  if (targetZone === "unselected") {
++    return cleanupConfigAfterFieldChanges(config, {
++      ...config,
++      rows,
++      columns,
++      values,
++      value_sources: sourceZone === "values" ? Object.fromEntries(
++        Object.entries(config.value_sources ?? {}).filter(([id]) => id !== field),
++      ) : config.value_sources,
++      aggregation: normalizeAggregationConfig(config.aggregation, values),
++    });
++  }
++
++  const next = {
++    rows,
++    columns,
++    values,
++  };
++
++  if (targetZone === "values") return addValueInstance(config, getValueSource(config, field));
++  if (targetZone === "filters") return null;
++  if (next[targetZone].includes(field)) return null;
++  next[targetZone] = [...next[targetZone], field];
++
++  return {
++    ...config,
++    ...next,
++    aggregation: normalizeAggregationConfig(config.aggregation, next.values),
++  };
++}
++
++export function getUnselectedFields(
++    allColumns: readonly string[],
++    config: PivotConfigV1,
++): string[] {
++  const assigned = new Set([
++    ...config.rows,
++    ...config.columns,
++  ]);
++
++  return allColumns.filter((field) => !assigned.has(field));
++}
++
++interface FieldPaletteProps {
++  fields: string[];
++  config: PivotConfigV1;
++  locked?: boolean;
++  frozenColumns?: Set<string>;
++}
++
++const FieldPalette: FC<FieldPaletteProps> = ({
++    fields,
++    config,
++    locked,
++    frozenColumns,
++  }): ReactElement => {
++  const { setNodeRef, isOver } = useDroppable({
++    id: "unselected",
++    data: { zone: "unselected" satisfies ZoneKey },
++  });
++
++  const itemIds = fields.map((field) => makeItemId("unselected", field));
++
++  return (
++      <section
++          ref={setNodeRef}
++          className={`${styles.fieldPalette} ${isOver ? styles.fieldPaletteOver : ""}`}
++          data-testid="pivot-field-palette"
++          aria-label="Fields available for dimensions and values"
++      >
++        <div className={styles.fieldPaletteTitle}>
++          Fields
++          <span className={styles.fieldPaletteCount}>
++          {fields.length.toLocaleString()}
++        </span>
++        </div>
++
++        <SortableContext
++            items={itemIds}
++            strategy={horizontalListSortingStrategy}
++        >
++          <div className={styles.fieldPaletteItems}>
++            {fields.length === 0 ? (
++                <span className={styles.fieldPaletteEmpty}>
++              All fields are assigned to Rows or Columns.
++            </span>
++            ) : (
++                fields.map((field) => (
++                    <SortableFieldChip
++                        key={field}
++                        id={makeItemId("unselected", field)}
++                        zone="unselected"
++                        field={field}
++                        displayLabel={config.field_labels?.[field] ?? field}
++                        testId="pivot-field-palette"
++                        disabled={locked}
++                        isFrozen={frozenColumns?.has(field)}
++                    />
++                ))
++            )}
++          </div>
++        </SortableContext>
++      </section>
++  );
++};
+ 
+ export interface DragMoveParams {
+   sourceZone: ZoneKey;
+@@ -210,7 +356,7 @@ export interface DragMoveParams {
+ }
+ 
+ /** Returns the array for a given zone key, handling 'filters' → filter_fields. */
+-function getZoneArray(zone: ZoneKey, cfg: PivotConfigV1): string[] {
++function getZoneArray(zone: Exclude<ZoneKey, "unselected">, cfg: PivotConfigV1): string[] {
+   return zone === "filters" ? (cfg.filter_fields ?? []) : cfg[zone];
+ }
+ 
+@@ -227,6 +373,7 @@ export function applyDragMove({
+   numericColumns,
+ }: DragMoveParams): PivotConfigV1 | null {
+   if (sourceZone === targetZone) {
++    if (sourceZone === "unselected") return null;
+     const arr = getZoneArray(sourceZone, config);
+     const oldIndex = arr.indexOf(field);
+     const newIndex = overField ? arr.indexOf(overField) : -1;
+@@ -252,9 +399,17 @@ export function applyDragMove({
+   }
+ 
+   // Cross-zone move
++  if (sourceZone === "unselected") {
++    if (targetZone === "values") return addValueInstance(config, field);
++    if (targetZone === "filters") return { ...config, filter_fields: [...(config.filter_fields ?? []), field] };
++    return moveFieldToZone(config, field, sourceZone, targetZone, new Set(numericColumns));
++  }
++  if (targetZone === "unselected") {
++    return moveFieldToZone(config, field, sourceZone, targetZone, new Set(numericColumns));
++  }
+   if (
+     !canDropFieldToZone({
+-      field,
++      field: sourceZone === "values" ? getValueSource(config, field) : field,
+       fromZone: sourceZone,
+       toZone: targetZone,
+       numericFields: new Set(numericColumns),
+@@ -265,6 +420,25 @@ export function applyDragMove({
+     return null;
+   }
+ 
++  // Measures can also be dimensions. Adding to Values (or assigning a measure
++  // to an axis) does not remove the field from its other role.
++  if (targetZone === "values") {
++    return addValueInstance(config, getValueSource(config, field));
++  }
++  if (sourceZone === "values" && (targetZone === "rows" || targetZone === "columns")) {
++    const source = getValueSource(config, field);
++    if (config.rows.includes(source) && targetZone === "columns") return null;
++    if (config.columns.includes(source) && targetZone === "rows") return null;
++    if (config[targetZone].includes(source)) return null;
++    return { ...config, [targetZone]: [...config[targetZone], source] };
++  }
++
++  if (sourceZone === "values" && targetZone === "filters") {
++    const source = getValueSource(config, field);
++    return { ...config, filter_fields: (config.filter_fields ?? []).includes(source)
++      ? config.filter_fields : [...(config.filter_fields ?? []), source] };
++  }
++
+   const srcArr = getZoneArray(sourceZone, config);
+   const tgtArr = getZoneArray(targetZone, config);
+ 
+@@ -303,12 +477,11 @@ export function applyDragMove({
+   const syncAgg = (values: string[], agg: AggregationConfig) =>
+     normalizeAggregationConfig(agg, values);
+ 
+-  if (targetZone === "values") {
+-    updated.aggregation = syncAgg(updated.values, updated.aggregation);
+-  }
+-
+   if (sourceZone === "values") {
+     updated.aggregation = syncAgg(updated.values, updated.aggregation);
++    updated.value_sources = Object.fromEntries(
++      Object.entries(updated.value_sources ?? {}).filter(([id]) => id !== field),
++    );
+     if (updated.show_values_as?.[field]) {
+       updated.show_values_as = { ...updated.show_values_as };
+       delete updated.show_values_as[field];
+@@ -482,7 +655,7 @@ const Toolbar: FC<ToolbarProps> = ({
+ 
+   const handleRemoveField = useCallback(
+     (zone: ZoneKey, field: string) => {
+-      if (frozenColumns?.has(field)) return;
++      if (frozenColumns?.has(zone === "values" ? getValueSource(config, field) : field)) return;
+       const nextConfig =
+         zone === "rows"
+           ? { ...config, rows: config.rows.filter((item) => item !== field) }
+@@ -495,6 +668,11 @@ const Toolbar: FC<ToolbarProps> = ({
+                 ...config,
+                 values: config.values.filter((item) => item !== field),
+               };
++      if (zone === "values" && nextConfig.value_sources) {
++        nextConfig.value_sources = Object.fromEntries(
++          Object.entries(nextConfig.value_sources).filter(([id]) => id !== field),
++        );
++      }
+       emitIfChanged(cleanupConfigAfterFieldChanges(config, nextConfig));
+     },
+     [config, emitIfChanged, frozenColumns],
+@@ -579,7 +757,24 @@ const Toolbar: FC<ToolbarProps> = ({
+     activationConstraint: { distance: 5 },
+   });
+   const keyboardSensor = useSensor(KeyboardSensor);
+-  const sensors = useSensors(pointerSensor, keyboardSensor);
++  // const sensors = useSensors(pointerSensor, keyboardSensor);
++
++  const unselectedFields = useMemo(
++      () => getUnselectedFields(allColumns, config),
++      [allColumns, config],
++  );
++
++  const numericFieldSet = useMemo(
++      () => new Set(numericColumns),
++      [numericColumns],
++  );
++
++  const sensors = useSensors(
++      useSensor(PointerSensor, {
++        activationConstraint: { distance: 4 },
++      }),
++      useSensor(KeyboardSensor),
++  );
+ 
+   const activeField = useMemo(() => {
+     if (!activeId) return null;
+@@ -592,10 +787,15 @@ const Toolbar: FC<ToolbarProps> = ({
+     setActiveId(String(event.active.id));
+   }, []);
+ 
++  const handleDragCancel = useCallback(() => {
++    setActiveId(null);
++    setActiveOverZone(null);
++  }, []);
++
+   const handleDragOver = useCallback(
+-    (event: DragOverEvent) => {
+-      const { active, over } = event;
+-      const activeData = active.data.current as
++      (event: DragOverEvent) => {
++        const { active, over } = event;
++        const activeData = active.data.current as
+         | { zone?: string; field?: string; type?: string }
+         | undefined;
+       // Synthetic chips only participate in Values-zone reordering.
+@@ -622,7 +822,7 @@ const Toolbar: FC<ToolbarProps> = ({
+         return;
+       }
+ 
+-      if (targetZone === "values" && field && !numericColumns.includes(field)) {
++      if (targetZone === "values" && field && !numericColumns.includes(getValueSource(config, field))) {
+         setActiveOverZone(null);
+         return;
+       }
+@@ -633,76 +833,74 @@ const Toolbar: FC<ToolbarProps> = ({
+   );
+ 
+   const handleDragEnd = useCallback(
+-    (event: DragEndEvent) => {
+-      const { active, over } = event;
+-      setActiveId(null);
+-      setActiveOverZone(null);
+-
+-      if (!over) return;
+-
+-      const activeData = active.data.current as
+-        | {
+-            zone?: string;
+-            field?: string;
+-            type?: string;
+-            syntheticId?: string;
+-          }
+-        | undefined;
+-      const overData = over.data.current as
+-        | {
+-            zone?: string;
+-            field?: string;
+-            type?: string;
+-            syntheticId?: string;
+-          }
+-        | undefined;
++      (event: DragEndEvent) => {
++        const { active, over } = event;
+ 
+-      const activeMeasureId = getMeasureIdFromDragData(activeData);
+-      const overMeasureId = getMeasureIdFromDragData(overData);
+-
+-      // Values-zone reorder: any combination of real/synthetic measures.
+-      if (
+-        activeMeasureId &&
+-        overMeasureId &&
+-        activeMeasureId !== overMeasureId
+-      ) {
+-        const currentOrder = getRenderedValueFields(config);
+-        const oldIdx = currentOrder.indexOf(activeMeasureId);
+-        const newIdx = currentOrder.indexOf(overMeasureId);
+-        if (oldIdx !== -1 && newIdx !== -1) {
+-          const nextOrder = arrayMove(currentOrder, oldIdx, newIdx);
+-          emitIfChanged(withValueOrder(config, nextOrder));
+-        }
+-        return;
+-      }
++        setActiveId(null);
++        setActiveOverZone(null);
+ 
+-      // Synthetic chips cannot leave the Values zone.
+-      if (activeData?.type === "synthetic") return;
++        if (!over) return;
++
++        const activeData = active.data.current as
++            | { zone?: string; field?: string }
++            | undefined;
++        const overData = over.data.current as
++            | { zone?: string; field?: string; type?: string }
++            | undefined;
++
++        const isZoneKey = (value: unknown): value is ZoneKey =>
++            value === "unselected" ||
++            value === "rows" ||
++            value === "columns" ||
++            value === "values" ||
++            value === "filters";
++
++        const sourceZone = isZoneKey(activeData?.zone)
++            ? activeData.zone
++            : undefined;
++        const targetCandidate =
++            overData?.type === "container" ? over.id : overData?.zone;
++        const targetZone = isZoneKey(targetCandidate)
++            ? targetCandidate
++            : undefined;
++        const field = activeData?.field;
++
++        if (!sourceZone || !targetZone || !field) return;
++
++        // Unselected palette is an assignment-only zone. Its move behavior is
++        // intentionally kept separate from sortable-zone reordering.
++        if (
++            (sourceZone === "unselected" || targetZone === "unselected") &&
++            sourceZone !== "filters" &&
++            targetZone !== "filters"
++        ) {
++          const nextConfig = moveFieldToZone(
++              config,
++              field,
++              sourceZone,
++              targetZone,
++              numericFieldSet,
++          );
+ 
+-      const sourceZone = activeData?.zone;
+-      const field = activeData?.field;
+-      if (!sourceZone || !field) return;
++          if (nextConfig && !configsEqual(config, nextConfig)) {
++            emitIfChanged(nextConfig);
++          }
++          return;
++        }
+ 
+-      let targetZone: string | undefined;
+-      if (over.data.current?.type === "container") {
+-        targetZone = String(over.id);
+-      } else {
+-        targetZone = (over.data.current as { zone?: string })?.zone;
+-      }
+-      if (!targetZone) return;
+-
+-      const overField = (over.data.current as { field?: string })?.field;
+-      const updated = applyDragMove({
+-        sourceZone: sourceZone as ZoneKey,
+-        targetZone: targetZone as ZoneKey,
+-        field,
+-        overField,
+-        config,
+-        numericColumns,
+-      });
+-      if (updated) emitIfChanged(updated);
+-    },
+-    [config, emitIfChanged, numericColumns],
++        const overField = overData?.field;
++        const updated = applyDragMove({
++          sourceZone,
++          targetZone,
++          field,
++          overField,
++          config,
++          numericColumns,
++        });
++
++        if (updated) emitIfChanged(updated);
++      },
++      [config, emitIfChanged, numericColumns, numericFieldSet],
+   );
+ 
+   const utilGroupRef = useRef<HTMLDivElement>(null);
+@@ -810,6 +1008,7 @@ const Toolbar: FC<ToolbarProps> = ({
+   const valueOrder = useMemo(() => getRenderedValueFields(config), [config]);
+   const emptyHint = locked ? undefined : "Apply fields in settings menu";
+ 
++  // @ts-ignore
+   return (
+     <div
+       ref={toolbarRef}
+@@ -853,84 +1052,95 @@ const Toolbar: FC<ToolbarProps> = ({
+           )}
+         </div>
+       ) : (
+-        <DndContext
+-          sensors={sensors}
+-          collisionDetection={pointerWithin}
+-          onDragStart={handleDragStartWithSettingsClose}
+-          onDragOver={handleDragOver}
+-          onDragEnd={handleDragEnd}
+-        >
+-          <ZoneCard
+-            label="Rows"
+-            testId="toolbar-rows"
+-            zoneId="rows"
+-            selected={config.rows}
+-            disabled={locked}
+-            frozenColumns={frozenColumns}
+-            sortConfig={getPrimarySortConfig(config.row_sort)}
+-            filters={config.filters}
+-            isDropHighlighted={activeOverZone === "rows"}
+-            activeId={activeId}
+-            emptyHint={emptyHint}
+-            onRemove={(field) => handleRemoveField("rows", field)}
+-            displayLabelForField={(field) =>
+-              getDimensionLabel(
+-                config,
+-                field,
+-                columnTypes?.get(field),
+-                adaptiveDateGrains?.[field],
+-              )
+-            }
+-            showFilterIndicators={!suppressPerFieldIndicators}
+-          />
+-          <ZoneCard
+-            label="Columns"
+-            testId="toolbar-columns"
+-            zoneId="columns"
+-            selected={config.columns}
+-            disabled={locked}
+-            frozenColumns={frozenColumns}
+-            sortConfig={getPrimarySortConfig(config.col_sort)}
+-            filters={config.filters}
+-            isDropHighlighted={activeOverZone === "columns"}
+-            activeId={activeId}
+-            emptyHint={emptyHint}
+-            onRemove={(field) => handleRemoveField("columns", field)}
+-            displayLabelForField={(field) =>
+-              getDimensionLabel(
+-                config,
+-                field,
+-                columnTypes?.get(field),
+-                adaptiveDateGrains?.[field],
+-              )
+-            }
+-            showFilterIndicators={!suppressPerFieldIndicators}
+-          />
+-          <ZoneCard
+-            label="Values"
+-            testId="toolbar-values"
+-            zoneId="values"
+-            selected={config.values}
+-            disabled={locked}
+-            frozenColumns={frozenColumns}
+-            isDropHighlighted={activeOverZone === "values"}
+-            activeId={activeId}
+-            emptyHint={emptyHint}
+-            isValues
+-            aggregation={config.aggregation}
+-            showValuesAs={config.show_values_as}
+-            syntheticMeasures={syntheticMeasures}
+-            renderedMeasures={valueOrder}
+-            onAggregationChange={handleValueAggChange}
+-            onShowValuesAsChange={handleValueShowAsChange}
+-            onRemove={(field) => handleRemoveField("values", field)}
+-            onRemoveSynthetic={handleRemoveSynthetic}
+-            aggPortalTarget={toolbarRef.current}
+-            aggTestIdPrefix="toolbar-values-agg"
+-            displayLabelForField={(field) =>
+-              getRenderedValueLabel(config, field)
+-            }
+-          />
++          <DndContext
++              sensors={sensors}
++              collisionDetection={pointerWithin}
++              onDragStart={handleDragStart}
++              onDragOver={handleDragOver}
++              onDragEnd={handleDragEnd}
++              onDragCancel={handleDragCancel}
++          >
++            <FieldPalette
++                fields={unselectedFields}
++                config={config}
++                locked={locked}
++                frozenColumns={frozenColumns}
++            />
++
++            <div className={styles.zoneGrid}>
++              <ZoneCard
++                  label="Rows"
++                  testId="toolbar-rows"
++                  zoneId="rows"
++                  selected={config.rows}
++                  disabled={locked}
++                  frozenColumns={frozenColumns}
++                  sortConfig={getPrimarySortConfig(config.row_sort)}
++                  filters={config.filters}
++                  isDropHighlighted={activeOverZone === "rows"}
++                  activeId={activeId}
++                  emptyHint={emptyHint}
++                  onRemove={(field) => handleRemoveField("rows", field)}
++                  displayLabelForField={(field) =>
++                      getDimensionLabel(
++                          config,
++                          field,
++                          columnTypes?.get(field),
++                          adaptiveDateGrains?.[field],
++                      )
++                  }
++                  showFilterIndicators={!suppressPerFieldIndicators}
++              />
++            <ZoneCard
++              label="Columns"
++              testId="toolbar-columns"
++              zoneId="columns"
++              selected={config.columns}
++              disabled={locked}
++              frozenColumns={frozenColumns}
++              sortConfig={getPrimarySortConfig(config.col_sort)}
++              filters={config.filters}
++              isDropHighlighted={activeOverZone === "columns"}
++              activeId={activeId}
++              emptyHint={emptyHint}
++              onRemove={(field) => handleRemoveField("columns", field)}
++              displayLabelForField={(field) =>
++                getDimensionLabel(
++                  config,
++                  field,
++                  columnTypes?.get(field),
++                  adaptiveDateGrains?.[field],
++                )
++              }
++              showFilterIndicators={!suppressPerFieldIndicators}
++            />
++            <ZoneCard
++              label="Values"
++              testId="toolbar-values"
++              zoneId="values"
++              selected={config.values}
++              disabled={locked}
++              frozenColumns={frozenColumns}
++              isDropHighlighted={activeOverZone === "values"}
++              activeId={activeId}
++              emptyHint={emptyHint}
++              isValues
++              aggregation={config.aggregation}
++              showValuesAs={config.show_values_as}
++              syntheticMeasures={syntheticMeasures}
++              renderedMeasures={valueOrder}
++              valueSources={config.value_sources}
++              onAggregationChange={handleValueAggChange}
++              onShowValuesAsChange={handleValueShowAsChange}
++              onRemove={(field) => handleRemoveField("values", field)}
++              onRemoveSynthetic={handleRemoveSynthetic}
++              aggPortalTarget={toolbarRef.current}
++              aggTestIdPrefix="toolbar-values-agg"
++              displayLabelForField={(field) =>
++                getValueChipLabel(config, field)
++              }
++            />
++          </div>
+           <DragOverlay dropAnimation={{ duration: 200 }}>
+             {activeField ? (
+               activeField.zone === "synthetic" ? (
+@@ -1225,6 +1435,7 @@ interface ZoneCardProps {
+    * and synthetic measure ids). Only consulted when `isValues` is true.
+    */
+   renderedMeasures?: readonly string[];
++  valueSources?: Record<string, string>;
+   isDropHighlighted?: boolean;
+   activeId?: string | null;
+   onAggregationChange?: (field: string, agg: AggregationType) => void;
+@@ -1252,6 +1463,7 @@ const ZoneCard: FC<ZoneCardProps> = ({
+   aggregation,
+   syntheticMeasures = [],
+   renderedMeasures,
++  valueSources,
+   isDropHighlighted,
+   activeId,
+   onAggregationChange,
+@@ -1354,7 +1566,7 @@ const ZoneCard: FC<ZoneCardProps> = ({
+               // in `selected` (guards against transient ordering states).
+               if (isValues && !valuesSet.has(id)) return null;
+               const col = id;
+-              const isFrozen = frozenColumns?.has(col);
++              const isFrozen = frozenColumns?.has(valueSources?.[col] ?? col);
+               const hasFilter =
+                 showFilterIndicators &&
+                 filters?.[col] &&
+diff --git a/streamlit_pivot/frontend/src/engine/PivotData.test.ts b/streamlit_pivot/frontend/src/engine/PivotData.test.ts
+index 1479673..26804ea 100644
+--- a/streamlit_pivot/frontend/src/engine/PivotData.test.ts
++++ b/streamlit_pivot/frontend/src/engine/PivotData.test.ts
+@@ -776,6 +776,97 @@ describe("PivotData - mixed-type sort", () => {
+     // C=50, A=100, B=null(last)
+     expect(keys).toEqual(["C", "A", "B"]);
+   });
++
++  it("sorts dimension labels by the numeric first regex capture group", () => {
++    const data: DataRecord[] = [
++      { chapter: "第10章", revenue: 10 },
++      { chapter: "第11章", revenue: 11 },
++      { chapter: "第1章", revenue: 1 },
++      { chapter: "第20章", revenue: 20 },
++      { chapter: "その他", revenue: 0 },
++    ];
++    const pd = new PivotData(
++      data,
++      makeConfig({
++        rows: ["chapter"],
++        columns: [],
++        values: ["revenue"],
++        row_sort: {
++          by: "regex_number",
++          direction: "asc",
++          regex_pattern: "第(\\d+)",
++        },
++      }),
++    );
++
++    expect(pd.getRowKeys()).toEqual([
++      ["第1章"],
++      ["第10章"],
++      ["第11章"],
++      ["第20章"],
++      ["その他"],
++    ]);
++  });
++
++  it("sorts captured alphanumeric codes naturally, in either direction", () => {
++    const data: DataRecord[] = [
++      { chapter: "分類(P00-P96)", revenue: 1 },
++      { chapter: "分類(J10-J99)", revenue: 1 },
++      { chapter: "分類(K00-J93)", revenue: 1 },
++      { chapter: "分類(J2-J99)", revenue: 1 },
++      { chapter: "分類(J00-J99)", revenue: 1 },
++      { chapter: "その他", revenue: 1 },
++    ];
++    const asc = ["分類(J00-J99)", "分類(J2-J99)", "分類(J10-J99)", "分類(K00-J93)", "分類(P00-P96)", "その他"];
++    for (const direction of ["asc", "desc"] as const) {
++      const pd = new PivotData(data, makeConfig({
++        rows: ["chapter"], columns: [], values: ["revenue"],
++        row_sort: { by: "regex_number", direction, regex_pattern: String.raw`.*?\((.*?)-` },
++      }));
++      expect(pd.getRowKeys().map(([chapter]) => chapter)).toEqual(
++        direction === "asc" ? asc : [...asc.slice(0, -1)].reverse().concat("その他"),
++      );
++    }
++  });
++
++  it("keeps numeric captures numeric and breaks ties with the full label", () => {
++    const data: DataRecord[] = [
++      { chapter: "B(2)", revenue: 1 },
++      { chapter: "A(02)", revenue: 1 },
++      { chapter: "Z(10)", revenue: 1 },
++      { chapter: "その他", revenue: 1 },
++    ];
++    const pd = new PivotData(data, makeConfig({
++      rows: ["chapter"], columns: [], values: ["revenue"],
++      row_sort: { by: "regex_number", direction: "asc", regex_pattern: String.raw`\((\d+)\)` },
++    }));
++    expect(pd.getRowKeys().map(([chapter]) => chapter)).toEqual([
++      "A(02)", "B(2)", "Z(10)", "その他",
++    ]);
++  });
++
++  it("uses key ordering in both directions when the regex pattern is empty", () => {
++    const data: DataRecord[] = [
++      { chapter: "第10章", revenue: 10 },
++      { chapter: "第2章", revenue: 2 },
++      { chapter: "第1章", revenue: 1 },
++    ];
++    for (const direction of ["asc", "desc"] as const) {
++      const pd = new PivotData(data, makeConfig({
++        rows: ["chapter"],
++        columns: [],
++        values: ["revenue"],
++        row_sort: { by: "regex_number", direction, regex_pattern: "" },
++      }));
++      const keySort = new PivotData(data, makeConfig({
++        rows: ["chapter"],
++        columns: [],
++        values: ["revenue"],
++        row_sort: { by: "key", direction },
++      }));
++      expect(pd.getRowKeys()).toEqual(keySort.getRowKeys());
++    }
++  });
+ });
+ 
+ describe("mixedCompare", () => {
+diff --git a/streamlit_pivot/frontend/src/engine/PivotData.ts b/streamlit_pivot/frontend/src/engine/PivotData.ts
+index 669d396..888cbbe 100644
+--- a/streamlit_pivot/frontend/src/engine/PivotData.ts
++++ b/streamlit_pivot/frontend/src/engine/PivotData.ts
+@@ -29,6 +29,7 @@ import {
+   type DateGrain,
+   getEffectiveDateGrain,
+   getAggregationForField,
++  getValueSource,
+   getSyntheticSourceFields,
+   type DimensionFilter,
+   type HybridTotals,
+@@ -501,12 +502,7 @@ export class PivotData {
+    * Checked before expensive group logic to avoid unnecessary Map lookups.
+    */
+   private readonly _hasMemberGroups: boolean;
+-  /** Precomputed record indexes by field/value for common interaction fields. */
+-  private readonly _recordIndexesByFieldValue: Map<
+-    string,
+-    Map<string, number[]>
+-  > = new Map();
+-  /** Fields whose distinct values/indexes are worth precomputing. */
++  /** Fields whose distinct values are needed for interactive filters. */
+   private readonly _indexedFields: ReadonlySet<string>;
+   /** Columns present in the data source — used to guard _shouldIncludeRow in hybrid mode. */
+   private readonly _columnSet: ReadonlySet<string>;
+@@ -814,6 +810,39 @@ export class PivotData {
+     return mixedCompare(a, b);
+   }
+ 
++  /** Compare the first capture group as a number or a natural-sort string.
++   * Unmatched members sort last; equal captures use the full label as a tiebreaker.
++   */
++  private _compareRegexNumbers(
++    regex: RegExp,
++    a: string,
++    b: string,
++    direction: "asc" | "desc",
++  ): number {
++    const captureFor = (value: string): string | null => {
++      regex.lastIndex = 0;
++      const capture = regex.exec(value)?.[1];
++      return capture ? capture : null;
++    };
++    const aCapture = captureFor(a);
++    const bCapture = captureFor(b);
++    if (aCapture === null && bCapture === null) return mixedCompare(a, b);
++    if (aCapture === null) return 1;
++    if (bCapture === null) return -1;
++    const aNumber = Number(aCapture);
++    const bNumber = Number(bCapture);
++    const aIsNumber = Number.isFinite(aNumber);
++    const bIsNumber = Number.isFinite(bNumber);
++    let cmp: number;
++    if (aIsNumber && bIsNumber) cmp = aNumber - bNumber;
++    else if (aIsNumber) cmp = -1;
++    else if (bIsNumber) cmp = 1;
++    else cmp = aCapture.localeCompare(bCapture, undefined, { numeric: true });
++    return cmp === 0
++      ? mixedCompare(a, b)
++      : cmp * (direction === "desc" ? -1 : 1);
++  }
++
+   private _resolveDimKey(field: string, raw: unknown): string {
+     if (raw == null || raw === "") {
+       const mode = getNullMode(field, this._options.nullHandling);
+@@ -942,7 +971,7 @@ export class PivotData {
+   // ---------------------------------------------------------------------------
+ 
+   private _pushAggValue(agg: Aggregator, valField: string, raw: unknown): void {
+-    agg.push(this._resolveAggValue(valField, raw));
++    agg.push(this._resolveAggValue(getValueSource(this._config, valField), raw));
+   }
+ 
+   private _getValueArrays(): Map<string, Float64Array | null> {
+@@ -951,7 +980,7 @@ export class PivotData {
+       for (const vf of this._allAggregatedFields) {
+         this._valueFloatArrays.set(
+           vf,
+-          this._dataSource.getFloat64Column?.(vf) ?? null,
++          this._dataSource.getFloat64Column?.(getValueSource(this._config, vf)) ?? null,
+         );
+       }
+     }
+@@ -965,7 +994,7 @@ export class PivotData {
+   ): unknown {
+     const arr = valueArrays.get(valField);
+     if (arr) return arr[rowIndex];
+-    return this._dataSource.getValue(rowIndex, valField);
++    return this._dataSource.getValue(rowIndex, getValueSource(this._config, valField));
+   }
+ 
+   private _materializeRow(rowIndex: number): DataRecord {
+@@ -1021,7 +1050,6 @@ export class PivotData {
+     const uniqueValueSets = new Map<string, Set<string>>();
+     for (const field of this._indexedFields) {
+       uniqueValueSets.set(field, new Set());
+-      this._recordIndexesByFieldValue.set(field, new Map());
+     }
+ 
+     for (let recordIndex = 0; recordIndex < numRows; recordIndex++) {
+@@ -1031,14 +1059,6 @@ export class PivotData {
+           this._dataSource.getValue(recordIndex, field),
+         );
+         uniqueValueSets.get(field)?.add(resolved);
+-        const perField = this._recordIndexesByFieldValue.get(field);
+-        if (!perField) continue;
+-        const existing = perField.get(resolved);
+-        if (existing) {
+-          existing.push(recordIndex);
+-        } else {
+-          perField.set(resolved, [recordIndex]);
+-        }
+       }
+ 
+       if (!this._shouldIncludeRow(recordIndex)) continue;
+@@ -1174,6 +1194,10 @@ export class PivotData {
+     const direction = sortConfig?.direction ?? "asc";
+     const sorters = this._options.sorters;
+     const sign = direction === "desc" ? -1 : 1;
++    const regex =
++      by === "regex_number" && sortConfig?.regex_pattern
++        ? new RegExp(sortConfig.regex_pattern)
++        : undefined;
+ 
+     if (by === "value") {
+       const numDims = dimensions.length;
+@@ -1244,10 +1268,17 @@ export class PivotData {
+           const ob = ib === -1 ? customOrder.length : ib;
+           cmp = oa - ob;
+           if (cmp === 0) cmp = this._compareDimKeys(dim ?? "", ai, bi);
++        } else if (regex && (targetDimIdx === -1 || i === targetDimIdx)) {
++          cmp = this._compareRegexNumbers(regex, ai, bi, direction);
+         } else {
+           cmp = this._compareDimKeys(dim ?? "", ai, bi);
+         }
+-        const levelSign = targetDimIdx === -1 || i === targetDimIdx ? sign : 1;
++        const levelSign =
++          regex
++            ? 1
++            : targetDimIdx === -1 || i === targetDimIdx
++              ? sign
++              : 1;
+         if (cmp !== 0) return cmp * levelSign;
+       }
+       return 0;
+@@ -2916,31 +2947,11 @@ export class PivotData {
+     const matched: DataRecord[] = [];
+     let totalCount = 0;
+     const numRows = this._dataSource.numRows;
+-    let candidateIndexes: number[] | null = null;
+-    for (const [field, value] of Object.entries(filters)) {
+-      const indexed = this._recordIndexesByFieldValue.get(field)?.get(value);
+-      if (!indexed) {
+-        // Group names (e.g. "East Coast") are synthetic labels that do not
+-        // exist in the raw-value index; fall back to scan-based matching where
+-        // `_resolveAndGroupDimKey` can map raw members to group labels.
+-        if (this._hasMemberGroups && this._memberGroupLookup.has(field))
+-          continue;
+-        candidateIndexes = [];
+-        break;
+-      }
+-      if (
+-        candidateIndexes === null ||
+-        indexed.length < candidateIndexes.length
+-      ) {
+-        candidateIndexes = indexed;
+-      }
+-    }
+-
+-    const useFullScan = candidateIndexes === null;
+-    const scanLength = useFullScan ? numRows : candidateIndexes!.length;
+-
+-    for (let i = 0; i < scanLength; i++) {
+-      const recordIndex = useFullScan ? i : candidateIndexes![i]!;
++    // Drill-down is requested on demand. Keeping an array of every row index
++    // for every axis/filter field multiplies live JS heap by the row count and
++    // triggers full GCs on large Arrow tables. Scan columnar data only when a
++    // user actually opens a cell, materializing at most `limit` records.
++    for (let recordIndex = 0; recordIndex < numRows; recordIndex++) {
+       if (!this._shouldIncludeRow(recordIndex)) continue;
+ 
+       let matchesClick = true;
+diff --git a/streamlit_pivot/frontend/src/engine/parseArrow.ts b/streamlit_pivot/frontend/src/engine/parseArrow.ts
+index ccb6139..75bb7f6 100644
+--- a/streamlit_pivot/frontend/src/engine/parseArrow.ts
++++ b/streamlit_pivot/frontend/src/engine/parseArrow.ts
+@@ -88,11 +88,58 @@ export class ArrowDataSource implements ColumnarDataSource {
+     return this.table.numRows;
+   }
+ 
++  // getValue(rowIndex: number, fieldName: string): unknown {
++  //   const vec = this.columnMap.get(fieldName);
++  //   return vec ? vec.get(rowIndex) : undefined;
++  // }
+   getValue(rowIndex: number, fieldName: string): unknown {
+     const vec = this.columnMap.get(fieldName);
+-    return vec ? vec.get(rowIndex) : undefined;
++    const value = vec?.get(rowIndex);
++
++    if (typeof value === "bigint") {
++      return this.toSafeInteger(fieldName, value);
++    }
++
++    // DuckDB returns SUM(INTEGER) as HUGEINT. Its Arrow exporter represents
++    // HUGEINT as Decimal128, whose Arrow JS value is a BN object rather than a
++    // JS number. Passing that object to the Pivot aggregator makes it ignore
++    // the value, whereas SUM(...::DOUBLE) happens to work as Float64.
++    if (vec?.type.typeId === 7 && value != null) {
++      const text = value.toString();
++      const numericValue = Number(text);
++      if (!Number.isFinite(numericValue)) {
++        throw new RangeError(
++          `Column "${fieldName}" contains ${text}, which cannot be represented ` +
++          "as a finite JavaScript number.",
++        );
++      }
++
++      if (vec.type.scale === 0 && !Number.isSafeInteger(numericValue)) {
++        throw new RangeError(
++          `Column "${fieldName}" contains ${text}, which cannot ` +
++          "be represented exactly as a JavaScript number.",
++        );
++      }
++
++      return numericValue;
++    }
++
++    return value;
+   }
+ 
++  private toSafeInteger(fieldName: string, value: bigint): number {
++    const numericValue = Number(value);
++    if (!Number.isSafeInteger(numericValue)) {
++      throw new RangeError(
++        `Column "${fieldName}" contains ${value.toString()}, which cannot ` +
++        "be represented exactly as a JavaScript number.",
++      );
++    }
++
++    return numericValue;
++  }
++
++
+   getColumnNames(): string[] {
+     return this.table.schema.fields.map((f) => f.name);
+   }
+@@ -106,6 +153,13 @@ export class ArrowDataSource implements ColumnarDataSource {
+       this.float64Cache.set(fieldName, null);
+       return null;
+     }
++    // Decimal128 is physically represented as Uint32 words. Treating those
++    // words as a per-row numeric array bypasses getValue() and shifts/drops
++    // values after the first row. Let PivotData read it row by row instead.
++    if (vec.type.typeId === 7) {
++      this.float64Cache.set(fieldName, null);
++      return null;
++    }
+     try {
+       const arr = vec.toArray();
+       if (arr instanceof Float64Array) {
+diff --git a/streamlit_pivot/frontend/src/engine/perf.test.ts b/streamlit_pivot/frontend/src/engine/perf.test.ts
+index 0104ce1..c3d35af 100644
+--- a/streamlit_pivot/frontend/src/engine/perf.test.ts
++++ b/streamlit_pivot/frontend/src/engine/perf.test.ts
+@@ -36,10 +36,10 @@ describe("DEFAULT_BUDGETS", () => {
+   it("matches expected values", () => {
+     expect(DEFAULT_BUDGETS).toMatchInlineSnapshot(`
+       {
+-        "maxColumnCardinality": 1000,
++        "maxColumnCardinality": 10000,
+         "maxComputeMs": 500,
+-        "maxRenderMs": 200,
+-        "maxVisibleCells": 5000,
++        "maxRenderMs": 500,
++        "maxVisibleCells": 50000,
+       }
+     `);
+   });
+@@ -66,19 +66,19 @@ describe("checkBudgets", () => {
+   });
+ 
+   it("warns when render time exceeds budget", () => {
+-    const warnings = checkBudgets({ ...okMetrics, renderMs: 300 });
++    const warnings = checkBudgets({ ...okMetrics, renderMs: DEFAULT_BUDGETS.maxRenderMs + 100 });
+     expect(warnings).toHaveLength(1);
+     expect(warnings[0]).toContain("Render took");
+   });
+ 
+   it("warns when cell count exceeds DOM budget", () => {
+-    const warnings = checkBudgets({ ...okMetrics, totalCells: 6000 });
++    const warnings = checkBudgets({ ...okMetrics, totalCells: DEFAULT_BUDGETS.maxVisibleCells + 1000 });
+     expect(warnings).toHaveLength(1);
+     expect(warnings[0]).toContain("cells exceed DOM budget");
+   });
+ 
+   it("warns when column cardinality exceeds cap", () => {
+-    const warnings = checkBudgets({ ...okMetrics, totalCols: 1200 });
++    const warnings = checkBudgets({ ...okMetrics, totalCols: DEFAULT_BUDGETS.maxColumnCardinality + 200 });
+     expect(warnings).toHaveLength(1);
+     expect(warnings[0]).toContain("column values exceed cardinality cap");
+   });
+@@ -86,10 +86,10 @@ describe("checkBudgets", () => {
+   it("returns multiple warnings when multiple budgets exceeded", () => {
+     const badMetrics: PerfMetrics = {
+       pivotComputeMs: 800,
+-      renderMs: 400,
++      renderMs: DEFAULT_BUDGETS.maxRenderMs + 100,
+       totalRows: 5000,
+-      totalCols: 1200,
+-      totalCells: 10000,
++      totalCols: DEFAULT_BUDGETS.maxColumnCardinality + 200,
++      totalCells: DEFAULT_BUDGETS.maxVisibleCells + 1000,
+     };
+     const warnings = checkBudgets(badMetrics);
+     expect(warnings).toHaveLength(4);
+diff --git a/streamlit_pivot/frontend/src/engine/perf.ts b/streamlit_pivot/frontend/src/engine/perf.ts
+index 4d4fe89..36f1ea1 100644
+--- a/streamlit_pivot/frontend/src/engine/perf.ts
++++ b/streamlit_pivot/frontend/src/engine/perf.ts
+@@ -69,9 +69,11 @@ export const COLUMN_VIRTUALIZATION_THRESHOLD = 200;
+ 
+ export const DEFAULT_BUDGETS: PerfBudgets = {
+   maxComputeMs: 500,
+-  maxRenderMs: 200,
+-  maxVisibleCells: 5000,
+-  maxColumnCardinality: 1000,
++  // DuckView accepts wider client-side pivots; rendering remains virtualized
++  // once the visible-cell budget is exceeded.
++  maxRenderMs: 500,
++  maxVisibleCells: 50_000,
++  maxColumnCardinality: 10_000,
+ };
+ 
+ /** Runtime feature toggles for pivot performance / layout behavior. */
+diff --git a/streamlit_pivot/frontend/src/engine/types.test.ts b/streamlit_pivot/frontend/src/engine/types.test.ts
+index 4d83b8a..2a83c85 100644
+--- a/streamlit_pivot/frontend/src/engine/types.test.ts
++++ b/streamlit_pivot/frontend/src/engine/types.test.ts
+@@ -425,6 +425,32 @@ describe("validatePivotConfigV1", () => {
+     expect(result.col_sort).toEqual(sc);
+   });
+ 
++  it("accepts regex-number sorts with a numeric capture group", () => {
++    const sc: SortConfig = {
++      by: "regex_number",
++      direction: "asc",
++      regex_pattern: "第(\\d+)",
++    };
++    const result = validatePivotConfigV1({ ...DEFAULT_CONFIG, row_sort: sc });
++    expect(result.row_sort).toEqual(sc);
++  });
++
++  it("accepts regex-number sorts with an empty pattern for key ordering", () => {
++    const sc: SortConfig = {
++      by: "regex_number",
++      direction: "asc",
++      regex_pattern: "",
++    };
++    expect(validatePivotConfigV1({ ...DEFAULT_CONFIG, row_sort: sc }).row_sort).toEqual(sc);
++  });
++
++  it("rejects regex-number sorts without a pattern", () => {
++    expect(() => validatePivotConfigV1({
++      ...DEFAULT_CONFIG,
++      row_sort: { by: "regex_number", direction: "asc" },
++    })).toThrow("'row_sort.regex_pattern' is required");
++  });
++
+   it("accepts legacy string row_sort and migrates to SortConfig", () => {
+     const result = validatePivotConfigV1({
+       ...DEFAULT_CONFIG,
+@@ -1475,6 +1501,19 @@ describe("validatePivotConfigV1 — formula synthetic measures", () => {
+   });
+ });
+ 
++describe("duplicate value labels", () => {
++  it("uses the source label and a single aggregation suffix for a duplicate", () => {
++    const config = makeConfig({
++      values: ["unit_price", "unit_price #2"],
++      value_sources: { "unit_price #2": "unit_price" },
++      field_labels: { unit_price: "単価" },
++      aggregation: { unit_price: "sum", "unit_price #2": "avg" },
++    });
++    expect(getRenderedValueLabel(config, "unit_price #2")).toBe("単価 (Avg)");
++    expect(getRenderedValueLabel(config, "unit_price")).toBe("単価");
++  });
++});
++
+ describe("getRenderedValueLabel with field_labels", () => {
+   it("returns field id when no override is set", () => {
+     const config = makeConfig({ values: ["Revenue"] });
+diff --git a/streamlit_pivot/frontend/src/engine/types.ts b/streamlit_pivot/frontend/src/engine/types.ts
+index be9c963..73e3b59 100644
+--- a/streamlit_pivot/frontend/src/engine/types.ts
++++ b/streamlit_pivot/frontend/src/engine/types.ts
+@@ -178,6 +178,8 @@ export interface PivotConfigV1 {
+   rows: string[];
+   columns: string[];
+   values: string[];
++  /** Additional value ids mapped to their source columns. Legacy ids are their own source. */
++  value_sources?: Record<string, string>;
+   /** Auto-apply a default hierarchy to temporal fields placed on rows/columns. */
+   auto_date_hierarchy?: boolean;
+   /** Per-field temporal grain override. Null explicitly opts out to Original/raw values. */
+@@ -365,8 +367,8 @@ export interface DimensionFilter {
+ // ---------------------------------------------------------------------------
+ 
+ export interface SortConfig {
+-  /** "key" = alphabetical on labels, "value" = by aggregated measure */
+-  by: "key" | "value";
++  /** "key" = alphabetical on labels, "value" = by aggregated measure, "regex_number" = first regex capture (numeric or natural string) */
++  by: "key" | "value" | "regex_number";
+   direction: "asc" | "desc";
+   /** Required when by="value": which value field to sort by */
+   value_field?: string;
+@@ -374,6 +376,8 @@ export interface SortConfig {
+   col_key?: string[];
+   /** Which dimension the sort was triggered from (key sort only applies direction at this level). */
+   dimension?: string;
++  /** Required when by="regex_number": first capture is compared naturally; empty means key sorting. */
++  regex_pattern?: string;
+ }
+ 
+ /**
+@@ -510,8 +514,10 @@ function validateSortConfig(
+   if (isLegacySortDirection(raw)) return migrateSortDirection(raw);
+   if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+     const o = raw as Record<string, unknown>;
+-    if (o.by !== "key" && o.by !== "value") {
+-      throw new Error(`'${fieldName}.by' must be "key" or "value"`);
++    if (o.by !== "key" && o.by !== "value" && o.by !== "regex_number") {
++      throw new Error(
++        `'${fieldName}.by' must be "key", "value", or "regex_number"`,
++      );
+     }
+     if (o.direction !== "asc" && o.direction !== "desc") {
+       throw new Error(`'${fieldName}.direction' must be "asc" or "desc"`);
+@@ -536,6 +542,26 @@ function validateSortConfig(
+         throw new Error(`'${fieldName}.dimension' must be a string`);
+       sc.dimension = o.dimension;
+     }
++    if (o.regex_pattern !== undefined) {
++      if (typeof o.regex_pattern !== "string") {
++        throw new Error(`'${fieldName}.regex_pattern' must be a string`);
++      }
++      if (o.regex_pattern !== "") {
++        try {
++          new RegExp(o.regex_pattern);
++        } catch {
++          throw new Error(`'${fieldName}.regex_pattern' must be a valid regular expression`);
++        }
++        const captureCount = new RegExp(`(?:${o.regex_pattern})|`).exec("")!.length - 1;
++        if (captureCount < 1) {
++          throw new Error(`'${fieldName}.regex_pattern' must contain a capture group`);
++        }
++      }
++      sc.regex_pattern = o.regex_pattern;
++    }
++    if (sc.by === "regex_number" && sc.regex_pattern === undefined) {
++      throw new Error(`'${fieldName}.regex_pattern' is required when by is "regex_number"`);
++    }
+     return sc;
+   }
+   throw new Error(
+@@ -625,6 +651,40 @@ export function getAggregationForField(
+   return config.aggregation[valField] ?? DEFAULT_AGGREGATION;
+ }
+ 
++/** Resolve a displayed measure id to the original data column. */
++export function getValueSource(config: PivotConfigV1, id: string): string {
++  return config.value_sources?.[id] ?? id;
++}
++
++/** Add another independently configurable instance of a source column. */
++export function addValueInstance(config: PivotConfigV1, source: string): PivotConfigV1 {
++  const reserved = new Set([
++    ...config.values,
++    ...config.rows,
++    ...config.columns,
++    ...(config.synthetic_measures ?? []).map((m) => m.id),
++  ]);
++  let id = source;
++  if (
++    config.values.includes(source) ||
++    (config.synthetic_measures ?? []).some((m) => m.id === source)
++  ) {
++    let index = 2;
++    while (reserved.has(`${source} #${index}`)) index++;
++    id = `${source} #${index}`;
++  }
++  const values = [...config.values, id];
++  return {
++    ...config,
++    values,
++    value_sources:
++      id === source
++        ? config.value_sources
++        : { ...config.value_sources, [id]: source },
++    aggregation: normalizeAggregationConfig(config.aggregation, values),
++  };
++}
++
+ export function stringifyPivotConfig(config: PivotConfigV1): string {
+   const allAggFields = [
+     ...new Set([
+@@ -1076,9 +1136,21 @@ export function getRenderedValueLabel(
+   const synthetic = getSyntheticMeasureMap(config).get(valueField);
+   const override = resolveLabelOverride(config, valueField);
+   if (override !== undefined) return override;
++  if (config.value_sources?.[valueField]) {
++    const source = config.value_sources[valueField];
++    const aggregation = config.aggregation[valueField] ?? "sum";
++    return `${resolveLabelOverride(config, source) ?? source} (${aggregation === "avg" ? "Avg" : aggregation})`;
++  }
+   return synthetic?.label ?? valueField;
+ }
+ 
++/** Base label for a value chip, which renders its aggregation separately. */
++export function getValueChipLabel(config: PivotConfigV1, valueField: string): string {
++  const source = config.value_sources?.[valueField];
++  if (!source) return getRenderedValueLabel(config, valueField);
++  return resolveLabelOverride(config, valueField) ?? resolveLabelOverride(config, source) ?? source;
++}
++
+ export function isSyntheticMeasure(
+   config: PivotConfigV1,
+   valueField: string,
+@@ -1386,7 +1458,26 @@ export function validatePivotConfigV1(obj: unknown): PivotConfigV1 {
+   const rows = o.rows as string[];
+   const columns = o.columns as string[];
+   const values = o.values as string[];
++  if (new Set(values).size !== values.length && o.value_sources !== undefined) {
++    throw new Error("'values' must contain unique measure ids");
++  }
++  let valueSources: Record<string, string> | undefined;
++  if (o.value_sources !== undefined) {
++    if (!o.value_sources || typeof o.value_sources !== "object" || Array.isArray(o.value_sources))
++      throw new Error("'value_sources' must be an object");
++    valueSources = {};
++    for (const [id, source] of Object.entries(o.value_sources)) {
++      if (!values.includes(id) || typeof source !== "string" || !source || source === id)
++        throw new Error(`Invalid value_sources entry: ${id}`);
++      valueSources[id] = source;
++    }
++    if (values.some((id) => valueSources?.[id] &&
++      [...(o.rows as string[]), ...(o.columns as string[])].includes(id)))
++      throw new Error("Value instance ids cannot shadow dimension fields");
++  }
+   const syntheticMeasures = validateSyntheticMeasures(o.synthetic_measures);
++  if (syntheticMeasures.some((measure) => values.includes(measure.id)))
++    throw new Error("Value instance ids cannot shadow synthetic measures");
+ 
+   const allAggFields = [
+     ...new Set([...values, ...getSyntheticSourceFields(syntheticMeasures)]),
+@@ -1397,6 +1488,7 @@ export function validatePivotConfigV1(obj: unknown): PivotConfigV1 {
+     rows,
+     columns,
+     values,
++    ...(valueSources ? { value_sources: valueSources } : {}),
+     auto_date_hierarchy:
+       typeof o.auto_date_hierarchy === "boolean"
+         ? o.auto_date_hierarchy
+diff --git a/streamlit_pivot/frontend/src/renderers/DrilldownPanel.test.tsx b/streamlit_pivot/frontend/src/renderers/DrilldownPanel.test.tsx
+index 9c64779..f4a4489 100644
+--- a/streamlit_pivot/frontend/src/renderers/DrilldownPanel.test.tsx
++++ b/streamlit_pivot/frontend/src/renderers/DrilldownPanel.test.tsx
+@@ -90,6 +90,14 @@ function getCellText(row: Element, columnIndex: number): string {
+ }
+ 
+ describe("DrilldownPanel", () => {
++  it("offers the DuckView context action with the current cell filters", () => {
++    const onCreateView = vi.fn();
++    const payload = makePayload({ filters: { region: "US" } });
++    render(<DrilldownPanel pivotData={makePivotData()} payload={payload} onClose={vi.fn()} onCreateView={onCreateView} />);
++    fireEvent.contextMenu(screen.getByTestId("drilldown-panel"));
++    expect(onCreateView).toHaveBeenCalledWith(expect.anything(), payload);
++  });
++
+   it("renders the panel with header and table", () => {
+     const pd = makePivotData();
+     render(
+@@ -262,7 +270,7 @@ describe("DrilldownPanel — server mode (hybrid drill-down)", () => {
+         isLoading
+       />,
+     );
+-    expect(document.querySelector(".spinner")).toBeInTheDocument();
++    expect(screen.getAllByText("Loading…")).toHaveLength(2);
+     expect(screen.queryByTestId("drilldown-table")).not.toBeInTheDocument();
+   });
+ 
+diff --git a/streamlit_pivot/frontend/src/renderers/DrilldownPanel.tsx b/streamlit_pivot/frontend/src/renderers/DrilldownPanel.tsx
+index fa6074b..e9be48e 100644
+--- a/streamlit_pivot/frontend/src/renderers/DrilldownPanel.tsx
++++ b/streamlit_pivot/frontend/src/renderers/DrilldownPanel.tsx
+@@ -46,6 +46,7 @@ export interface DrilldownPanelProps {
+   pivotData: PivotData;
+   payload: CellClickPayload;
+   onClose: () => void;
++  onCreateView?: (event: React.MouseEvent, payload: CellClickPayload) => void;
+   onMeasured?: (action: PerfActionMeasurement) => void;
+   sortColumn?: string;
+   sortDirection?: DrilldownSortDirection;
+@@ -232,6 +233,7 @@ const DrilldownPanel: FC<DrilldownPanelProps> = ({
+   pivotData,
+   payload,
+   onClose,
++  onCreateView,
+   onMeasured,
+   sortColumn,
+   sortDirection,
+@@ -367,6 +369,7 @@ const DrilldownPanel: FC<DrilldownPanelProps> = ({
+       className={styles.panel}
+       data-testid="drilldown-panel"
+       onKeyDown={handleKeyDown}
++      onContextMenu={onCreateView ? (event) => onCreateView(event, payload) : undefined}
+     >
+       <div className={styles.header}>
+         <div className={styles.headerInfo}>
+diff --git a/streamlit_pivot/frontend/src/renderers/HeaderMenu.module.css b/streamlit_pivot/frontend/src/renderers/HeaderMenu.module.css
+index ead7ab9..635f755 100644
+--- a/streamlit_pivot/frontend/src/renderers/HeaderMenu.module.css
++++ b/streamlit_pivot/frontend/src/renderers/HeaderMenu.module.css
+@@ -158,6 +158,35 @@
+   outline: none;
+ }
+ 
++.regexSortConfig {
++  display: flex;
++  flex-direction: column;
++  gap: 3px;
++  padding: 4px 12px 4px 34px;
++  font-size: 0.8em;
++  color: color-mix(in srgb, var(--st-text-color) 78%, transparent);
++}
++
++.regexSortInput {
++  box-sizing: border-box;
++  width: 100%;
++  padding: 2px 4px;
++  border: 1px solid var(--st-border-color);
++  border-radius: calc(var(--st-base-radius) - 2px);
++  background: var(--st-background-color);
++  color: var(--st-text-color);
++  font: inherit;
++}
++
++.regexSortInput:focus-visible {
++  box-shadow: 0 0 0 2px color-mix(in srgb, var(--st-primary-color) 50%, transparent);
++  outline: none;
++}
++
++.regexSortError {
++  color: var(--st-error-color, #d64545);
++}
++
+ /* ---- Date section (grain dropdown + drill buttons) ---- */
+ 
+ .dateSection {
+diff --git a/streamlit_pivot/frontend/src/renderers/HeaderMenu.test.tsx b/streamlit_pivot/frontend/src/renderers/HeaderMenu.test.tsx
+index e022e1d..0d0dc4f 100644
+--- a/streamlit_pivot/frontend/src/renderers/HeaderMenu.test.tsx
++++ b/streamlit_pivot/frontend/src/renderers/HeaderMenu.test.tsx
+@@ -39,6 +39,8 @@ describe("HeaderMenu - rendering", () => {
+     render(<HeaderMenu {...baseProps} />);
+     expect(screen.getByTestId("header-sort-key-asc")).toBeInTheDocument();
+     expect(screen.getByTestId("header-sort-key-desc")).toBeInTheDocument();
++    expect(screen.getByTestId("header-sort-regex-number-asc")).toBeInTheDocument();
++    expect(screen.getByTestId("header-sort-regex-number-desc")).toBeInTheDocument();
+   });
+ 
+   it("renders value sort options when valueFields provided", () => {
+@@ -96,6 +98,90 @@ describe("HeaderMenu - sort interactions", () => {
+     expect(onSortChange).toHaveBeenCalledWith({ by: "key", direction: "desc" });
+   });
+ 
++  it("sorts by the first regex capture group with the default chapter pattern", () => {
++    const onSortChange = vi.fn();
++    render(<HeaderMenu {...baseProps} onSortChange={onSortChange} />);
++    fireEvent.click(screen.getByTestId("header-sort-regex-number-asc"));
++    expect(onSortChange).toHaveBeenCalledWith({
++      by: "regex_number",
++      direction: "asc",
++      regex_pattern: "chapter (\\d+)",
++    });
++  });
++
++  it("accepts an alphanumeric capture pattern for regex sorting", () => {
++    const onSortChange = vi.fn();
++    render(
++      <HeaderMenu
++        {...baseProps}
++        onSortChange={onSortChange}
++        sortConfig={{ by: "regex_number", direction: "asc", regex_pattern: "第(\\d+)" }}
++      />,
++    );
++    const pattern = String.raw`.*?\((.*?)-`;
++    fireEvent.change(screen.getByTestId("header-sort-regex-number-pattern"), {
++      target: { value: pattern },
++    });
++    expect(onSortChange).toHaveBeenLastCalledWith({
++      by: "regex_number", direction: "asc", regex_pattern: pattern,
++    });
++  });
++
++  it("keeps regex sort selected with key ordering when the pattern is cleared", () => {
++    const onSortChange = vi.fn();
++    render(
++      <HeaderMenu
++        {...baseProps}
++        onSortChange={onSortChange}
++        sortConfig={{
++          by: "regex_number",
++          direction: "desc",
++          regex_pattern: "第(\\d+)",
++        }}
++      />,
++    );
++
++    fireEvent.change(screen.getByTestId("header-sort-regex-number-pattern"), {
++      target: { value: "" },
++    });
++
++    expect(onSortChange).toHaveBeenCalledWith({
++      by: "regex_number",
++      direction: "desc",
++      regex_pattern: "",
++    });
++  });
++
++  it("can select regex sort with an empty pattern without losing the pivot", () => {
++    const onSortChange = vi.fn();
++    const { rerender } = render(
++      <HeaderMenu
++        {...baseProps}
++        onSortChange={onSortChange}
++        sortConfig={{ by: "regex_number", direction: "desc", regex_pattern: "第(\\d+)" }}
++      />,
++    );
++    fireEvent.change(screen.getByTestId("header-sort-regex-number-pattern"), {
++      target: { value: "" },
++    });
++    fireEvent.click(screen.getByTestId("header-sort-regex-number-asc"));
++    expect(onSortChange).toHaveBeenLastCalledWith({
++      by: "regex_number",
++      direction: "asc",
++      regex_pattern: "",
++    });
++
++    rerender(
++      <HeaderMenu
++        {...baseProps}
++        onSortChange={onSortChange}
++        sortConfig={{ by: "regex_number", direction: "asc", regex_pattern: "" }}
++      />,
++    );
++    expect(screen.getByTestId("header-sort-regex-number-pattern")).toHaveValue("");
++    expect(screen.getByTestId("header-sort-regex-number-asc")).toHaveAttribute("aria-pressed", "true");
++  });
++
+   it("clears sort when clicking already-active sort option", () => {
+     const onSortChange = vi.fn();
+     render(
+@@ -273,28 +359,32 @@ describe("HeaderMenu - keyboard", () => {
+     render(<HeaderMenu {...baseProps} />);
+     const menu = screen.getByTestId("header-menu-Year");
+     const allNavItems = menu.querySelectorAll("[data-menu-nav]");
+-    // Sort A→Z, Sort Z→A, search input, Select All, Clear, 2022, 2023, 2024
+-    expect(allNavItems.length).toBe(8);
++    // Key and regex sort actions, search input, Select All, Clear, and three filter values.
++    expect(allNavItems.length).toBe(10);
+ 
+     // Focus Sort Z→A (index 1), press ArrowDown repeatedly to reach filter items
+     const sortZA = screen.getByTestId("header-sort-key-desc");
+     sortZA.focus();
+ 
+-    // ArrowDown → search input (index 2)
++    // ArrowDown → regex sort ascending (index 2)
+     fireEvent.keyDown(menu, { key: "ArrowDown" });
+-    expect(document.activeElement).toBe(allNavItems[2]); // search input
++    expect(document.activeElement).toBe(allNavItems[2]);
+ 
+-    // ArrowDown → Select All (index 3)
++    // ArrowDown → regex sort descending (index 3)
+     fireEvent.keyDown(menu, { key: "ArrowDown" });
+     expect(document.activeElement).toBe(allNavItems[3]);
+ 
+-    // ArrowDown → Clear (index 4)
++    // ArrowDown → search input (index 4)
+     fireEvent.keyDown(menu, { key: "ArrowDown" });
+     expect(document.activeElement).toBe(allNavItems[4]);
+ 
+-    // ArrowDown → 2022 filter item (index 5)
++    // ArrowDown → Select All (index 5)
+     fireEvent.keyDown(menu, { key: "ArrowDown" });
+     expect(document.activeElement).toBe(allNavItems[5]);
++    fireEvent.keyDown(menu, { key: "ArrowDown" });
++    expect(document.activeElement).toBe(allNavItems[6]); // Clear
++    fireEvent.keyDown(menu, { key: "ArrowDown" });
++    expect(document.activeElement).toBe(allNavItems[7]); // 2022
+   });
+ 
+   it("ArrowUp from filter section returns to sort section", () => {
+@@ -302,23 +392,26 @@ describe("HeaderMenu - keyboard", () => {
+     const menu = screen.getByTestId("header-menu-Year");
+     const allNavItems = menu.querySelectorAll("[data-menu-nav]");
+ 
+-    // Focus 2022 filter item (index 5), ArrowUp until we reach sort
+-    (allNavItems[5] as HTMLElement).focus();
++    // Focus 2022 filter item (index 7), ArrowUp until we reach sort
++    (allNavItems[7] as HTMLElement).focus();
++    expect(document.activeElement).toBe(allNavItems[7]);
++
++    // ArrowUp → Clear (index 6)
++    fireEvent.keyDown(menu, { key: "ArrowUp" });
++    expect(document.activeElement).toBe(allNavItems[6]);
++
++    // ArrowUp → Select All (index 5)
++    fireEvent.keyDown(menu, { key: "ArrowUp" });
+     expect(document.activeElement).toBe(allNavItems[5]);
+ 
+-    // ArrowUp → Clear (index 4)
++    // ArrowUp → search input (index 4)
+     fireEvent.keyDown(menu, { key: "ArrowUp" });
+     expect(document.activeElement).toBe(allNavItems[4]);
+ 
+-    // ArrowUp → Select All (index 3)
++    // ArrowUp through regex sort options to Sort Z→A (index 1)
+     fireEvent.keyDown(menu, { key: "ArrowUp" });
+     expect(document.activeElement).toBe(allNavItems[3]);
+-
+-    // ArrowUp → search input (index 2)
+     fireEvent.keyDown(menu, { key: "ArrowUp" });
+-    expect(document.activeElement).toBe(allNavItems[2]);
+-
+-    // ArrowUp → Sort Z→A (index 1)
+     fireEvent.keyDown(menu, { key: "ArrowUp" });
+     expect(document.activeElement).toBe(allNavItems[1]);
+   });
+diff --git a/streamlit_pivot/frontend/src/renderers/HeaderMenu.tsx b/streamlit_pivot/frontend/src/renderers/HeaderMenu.tsx
+index 391f1b6..f42ea01 100644
+--- a/streamlit_pivot/frontend/src/renderers/HeaderMenu.tsx
++++ b/streamlit_pivot/frontend/src/renderers/HeaderMenu.tsx
+@@ -111,7 +111,13 @@ export interface HeaderMenuProps {
+   onClose: () => void;
+ }
+ 
+-type SortPreset = "key_asc" | "key_desc" | "value_asc" | "value_desc";
++type SortPreset =
++  | "key_asc"
++  | "key_desc"
++  | "value_asc"
++  | "value_desc"
++  | "regex_number_asc"
++  | "regex_number_desc";
+ 
+ function sortConfigToPreset(sc: SortConfig | undefined): SortPreset | null {
+   if (!sc) return null;
+@@ -119,6 +125,8 @@ function sortConfigToPreset(sc: SortConfig | undefined): SortPreset | null {
+   if (sc.by === "key" && sc.direction === "desc") return "key_desc";
+   if (sc.by === "value" && sc.direction === "asc") return "value_asc";
+   if (sc.by === "value" && sc.direction === "desc") return "value_desc";
++  if (sc.by === "regex_number" && sc.direction === "asc") return "regex_number_asc";
++  if (sc.by === "regex_number" && sc.direction === "desc") return "regex_number_desc";
+   return null;
+ }
+ 
+@@ -178,6 +186,10 @@ const HeaderMenu: FC<HeaderMenuProps> = ({
+   const [vfValue2, setVfValue2] = useState<string>(
+     valueFilter?.value2 !== undefined ? String(valueFilter.value2) : "",
+   );
++  const [regexPattern, setRegexPattern] = useState(
++    sortConfig?.regex_pattern ?? "chapter (\\d+)",
++  );
++  const [regexError, setRegexError] = useState<string | null>(null);
+ 
+   const showSort = !!onSortChange;
+   const containerRef = useRef<HTMLDivElement>(null);
+@@ -275,6 +287,13 @@ const HeaderMenu: FC<HeaderMenuProps> = ({
+           by: "key",
+           direction: preset === "key_asc" ? "asc" : "desc",
+         });
++      } else if (preset === "regex_number_asc" || preset === "regex_number_desc") {
++        if (regexError) return;
++        onSortChange({
++          by: "regex_number",
++          direction: preset === "regex_number_asc" ? "asc" : "desc",
++          regex_pattern: regexPattern,
++        });
+       } else {
+         const vf = sortConfig?.value_field ?? valueFields?.[0];
+         onSortChange({
+@@ -285,7 +304,45 @@ const HeaderMenu: FC<HeaderMenuProps> = ({
+         });
+       }
+     },
+-    [onSortChange, sortConfig, valueFields],
++    [onSortChange, regexError, regexPattern, sortConfig, valueFields],
++  );
++
++  const handleRegexPatternChange = useCallback(
++    (pattern: string) => {
++      setRegexPattern(pattern);
++      // An empty pattern keeps the regex sort selected but uses key comparison.
++      if (pattern === "") {
++        setRegexError(null);
++        if (sortConfig?.by === "regex_number") {
++          onSortChange?.({
++            by: "regex_number",
++            direction: sortConfig.direction,
++            regex_pattern: "",
++          });
++        }
++        return;
++      }
++      try {
++        new RegExp(pattern);
++        const captureCount = new RegExp(`(?:${pattern})|`).exec("")!.length - 1;
++        if (captureCount < 1) {
++          setRegexError("The pattern must contain a capture group for the sort key.");
++          return;
++        }
++        setRegexError(null);
++      } catch {
++        setRegexError("Enter a valid regular expression.");
++        return;
++      }
++      if (sortConfig?.by === "regex_number" && pattern) {
++        onSortChange?.({
++          by: "regex_number",
++          direction: sortConfig.direction,
++          regex_pattern: pattern,
++        });
++      }
++    },
++    [onSortChange, sortConfig],
+   );
+ 
+   const handleValueFieldChange = useCallback(
+@@ -314,6 +371,7 @@ const HeaderMenu: FC<HeaderMenuProps> = ({
+   );
+ 
+   const isValueSort = sortConfig?.by === "value";
++  const isRegexNumberSort = sortConfig?.by === "regex_number";
+ 
+   // ---- Filter state (draft-based) ----
+   const [search, setSearch] = useState("");
+@@ -537,6 +595,49 @@ const HeaderMenu: FC<HeaderMenuProps> = ({
+               <span className={styles.menuItemLabel}>Sort Z → A</span>
+               {currentPreset === "key_desc" && <CheckIcon />}
+             </button>
++            <button
++              type="button"
++              role="menuitem"
++              aria-pressed={currentPreset === "regex_number_asc"}
++              tabIndex={-1}
++              data-menu-nav
++              className={`${styles.menuItem} ${currentPreset === "regex_number_asc" ? styles.menuItemActive : ""}`}
++              onClick={() => handleSort("regex_number_asc")}
++              data-testid="header-sort-regex-number-asc"
++            >
++              <SortAscIcon />
++              <span className={styles.menuItemLabel}>Sort by regex capture ↑</span>
++              {currentPreset === "regex_number_asc" && <CheckIcon />}
++            </button>
++            <button
++              type="button"
++              role="menuitem"
++              aria-pressed={currentPreset === "regex_number_desc"}
++              tabIndex={-1}
++              data-menu-nav
++              className={`${styles.menuItem} ${currentPreset === "regex_number_desc" ? styles.menuItemActive : ""}`}
++              onClick={() => handleSort("regex_number_desc")}
++              data-testid="header-sort-regex-number-desc"
++            >
++              <SortDescIcon />
++              <span className={styles.menuItemLabel}>Sort by regex capture ↓</span>
++              {currentPreset === "regex_number_desc" && <CheckIcon />}
++            </button>
++            {isRegexNumberSort && (
++              <label className={styles.regexSortConfig}>
++                <span>Regex (capture 1):</span>
++                <input
++                  className={styles.regexSortInput}
++                  data-menu-nav
++                  tabIndex={-1}
++                  value={regexPattern}
++                  onChange={(e) => handleRegexPatternChange(e.target.value)}
++                  aria-invalid={regexError ? true : undefined}
++                  data-testid="header-sort-regex-number-pattern"
++                />
++                {regexError && <span className={styles.regexSortError}>{regexError}</span>}
++              </label>
++            )}
+             {hasValueFields && (
+               <>
+                 <button
+diff --git a/streamlit_pivot/frontend/src/renderers/TableRenderer.module.css b/streamlit_pivot/frontend/src/renderers/TableRenderer.module.css
+index 869130c..2471055 100644
+--- a/streamlit_pivot/frontend/src/renderers/TableRenderer.module.css
++++ b/streamlit_pivot/frontend/src/renderers/TableRenderer.module.css
+@@ -993,6 +993,15 @@
+ .headerMenuOverlay {
+   position: fixed;
+   z-index: 30;
++  width: max-content;
++  max-width: calc(100vw - 16px);
++}
++
++.headerMenuOverlay > :first-child {
++  box-sizing: border-box;
++  min-width: min(210px, calc(100vw - 16px));
++  max-width: 100%;
++  max-height: inherit;
+ }
+ 
+ /* --- Column resize handle --- */
+diff --git a/streamlit_pivot/frontend/src/renderers/TableRenderer.test.tsx b/streamlit_pivot/frontend/src/renderers/TableRenderer.test.tsx
+index 2096fd3..36e0ccb 100644
+--- a/streamlit_pivot/frontend/src/renderers/TableRenderer.test.tsx
++++ b/streamlit_pivot/frontend/src/renderers/TableRenderer.test.tsx
+@@ -17,13 +17,14 @@
+ 
+ import { describe, expect, it, vi } from "vitest";
+ import { render, screen, fireEvent, act, within } from "@testing-library/react";
+-import { useState } from "react";
++import { useRef, useState } from "react";
+ import TableRenderer, {
+   computeRowHeaderSpans,
+   computeColSlots,
+   renderDataRow,
+   renderTotalsRow,
+   renderSubtotalRow,
++  useRowStickyOffsets,
+ } from "./TableRenderer";
+ import { PivotData, type DataRecord, makeKeyString } from "../engine/PivotData";
+ import type { PivotConfigV1 } from "../engine/types";
+@@ -45,6 +46,130 @@ function createPivotData(
+ }
+ 
+ describe("TableRenderer - rendering", () => {
++  it("recomputes cumulative offsets after row header widths change", () => {
++    let notify: ResizeObserverCallback | undefined;
++    const disconnect = vi.fn();
++    const previous = globalThis.ResizeObserver;
++    vi.stubGlobal("ResizeObserver", class {
++      constructor(callback: ResizeObserverCallback) {
++        notify = callback;
++      }
++      observe() {}
++      disconnect = disconnect;
++    });
++    const widths = [80, 120, 60];
++    function Fixture() {
++      const ref = useRef<HTMLDivElement>(null);
++      useRowStickyOffsets(ref);
++      return (
++        <div ref={ref}>
++          {widths.map((_, index) => (
++            <div key={index} data-pivot-sticky-col={index} />
++          ))}
++        </div>
++      );
++    }
++    const rect = vi
++      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
++      .mockImplementation(function (this: HTMLElement) {
++        return {
++          width: widths[Number(this.dataset.pivotStickyCol)] ?? 0,
++        } as DOMRect;
++      });
++    try {
++      const { container, unmount } = render(<Fixture />);
++      const wrapper = container.firstElementChild as HTMLElement;
++      expect(wrapper.style.getPropertyValue("--pivot-row-sticky-2")).toBe("200px");
++      widths[0] = 150;
++      act(() => notify?.([], {} as ResizeObserver));
++      expect(wrapper.style.getPropertyValue("--pivot-row-sticky-2")).toBe("270px");
++      unmount();
++      expect(disconnect).toHaveBeenCalled();
++    } finally {
++      rect.mockRestore();
++      vi.stubGlobal("ResizeObserver", previous);
++    }
++  });
++
++  it.each([1, 3])("pins all %i row dimensions including subtotal and total rows", (count) => {
++    const data: DataRecord[] = [
++      { region: "US", category: "A", group: "X", year: "2024", revenue: 100 },
++      { region: "US", category: "B", group: "Y", year: "2024", revenue: 200 },
++    ];
++    const config = makeConfig({
++      rows: ["region", "category", "group"].slice(0, count),
++      columns: ["year"],
++      values: ["revenue"],
++      show_subtotals: count > 1,
++    });
++    const { container } = render(
++      <TableRenderer pivotData={createPivotData(data, config)} config={config} />,
++    );
++    const headers = container.querySelectorAll('[data-pivot-sticky-col]');
++    expect(headers).toHaveLength(count);
++    const cells = screen
++      .getAllByTestId("pivot-data-row")[0]
++      .querySelectorAll('th[data-testid="pivot-row-header"]');
++    expect(cells).toHaveLength(count);
++    cells.forEach((cell, index) => {
++      expect(cell).toHaveStyle(`left: var(--pivot-row-sticky-${index}, 0px)`);
++      expect(cell.className).toContain("rowHeaderCellPinned");
++    });
++    if (count > 1) {
++      expect(
++        Array.from(
++          screen.getAllByTestId("pivot-subtotal-row")[0].querySelectorAll('th[scope="row"]'),
++        ).some(
++          (cell) =>
++            (cell as HTMLElement).style.left === "var(--pivot-row-sticky-1, 0px)",
++        ),
++      ).toBe(true);
++    }
++    expect(
++      screen.getByTestId("pivot-totals-row").querySelector("th"),
++    ).toHaveAttribute("colspan", String(count));
++  });
++
++  it("keeps the hierarchy layout as one pinned row dimension", () => {
++    const config = makeConfig({
++      rows: ["region", "category", "group"],
++      row_layout: "hierarchy",
++    });
++    const pd = createPivotData(
++      [{ region: "US", category: "A", group: "X", year: "2024", revenue: 100 }],
++      config,
++    );
++    const { container } = render(<TableRenderer pivotData={pd} config={config} />);
++    expect(container.querySelectorAll('[data-pivot-sticky-col]')).toHaveLength(1);
++    expect(screen.getAllByTestId("pivot-row-header")[0]).toHaveStyle(
++      "left: var(--pivot-row-sticky-0, 0px)",
++    );
++  });
++
++  it("accounts for the leading Values column when values are on rows", () => {
++    const config = makeConfig({
++      rows: ["region", "category", "group"],
++      columns: ["year"],
++      values: ["revenue"],
++      values_axis: "rows",
++    });
++    const pd = createPivotData(
++      [{ region: "US", category: "A", group: "X", year: "2024", revenue: 100 }],
++      config,
++    );
++    const { container } = render(<TableRenderer pivotData={pd} config={config} />);
++    expect(container.querySelectorAll('[data-pivot-sticky-col]')).toHaveLength(4);
++    const row = screen.getAllByTestId("pivot-data-row")[0];
++    expect(row.querySelector('[data-testid="pivot-values-axis-label"]')).toHaveStyle(
++      "left: 0",
++    );
++    row.querySelectorAll('th[data-testid="pivot-row-header"]').forEach((cell, index) => {
++      expect(cell).toHaveStyle(
++        `left: var(--pivot-row-sticky-${index + 1}, 0px)`,
++      );
++    });
++  });
++
+   it("renders a table with data-testid", () => {
+     const pd = createPivotData();
+     render(<TableRenderer pivotData={pd} config={makeConfig()} />);
+@@ -1289,13 +1414,14 @@ describe("TableRenderer - header hierarchy styling hooks", () => {
+       columns: ["year"],
+       values: ["revenue"],
+       show_subtotals: true,
++      row_layout: "hierarchy",
+     });
+     const pd = new PivotData(MULTI_DIM_DATA, config);
+     const { container } = render(
+       <TableRenderer pivotData={pd} config={config} />,
+     );
+ 
+-    const subtotalHeader = container.querySelector("th.subtotalHeaderCell");
++    const subtotalHeader = container.querySelector('th[class*="subtotalHeaderCell"]');
+     expect(subtotalHeader).toBeInTheDocument();
+     expect(subtotalHeader?.className).toMatch(/rowHeader(Primary|Secondary)/);
+   });
+@@ -1316,6 +1442,22 @@ describe("TableRenderer - border fix (Total header with multiple values)", () =>
+   });
+ });
+ 
++describe("TableRenderer - duplicate value menu title", () => {
++  it("uses the rendered value label rather than the internal #2 id", () => {
++    const config = makeConfig({
++      values: ["revenue", "revenue #2"],
++      value_sources: { "revenue #2": "revenue" },
++      field_labels: { revenue: "単価" },
++      aggregation: { revenue: "sum", "revenue #2": "avg" },
++    });
++    const pd = createPivotData(SAMPLE_DATA, config);
++    render(<TableRenderer pivotData={pd} config={config} onSortChange={vi.fn()} />);
++    const trigger = screen.getAllByTestId("header-menu-trigger-revenue #2")[0];
++    fireEvent.click(trigger);
++    expect(screen.getByTestId("header-menu-title").textContent).toBe("単価 (Avg)");
++  });
++});
++
+ describe("TableRenderer - value label menu triggers", () => {
+   const noop = vi.fn();
+ 
+@@ -2697,7 +2839,7 @@ describe("TableRenderer - conditional formatting rendering", () => {
+     render(<TableRenderer pivotData={pd} config={config} />);
+ 
+     const dataCells = screen.getAllByTestId("pivot-data-cell");
+-    const styledCells = dataCells.filter((cell) => cell.style.background);
++    const styledCells = dataCells.filter((cell) => cell.style.backgroundColor);
+     expect(styledCells.length).toBeGreaterThan(0);
+   });
+ 
+diff --git a/streamlit_pivot/frontend/src/renderers/TableRenderer.tsx b/streamlit_pivot/frontend/src/renderers/TableRenderer.tsx
+index e4cbc20..50bd400 100644
+--- a/streamlit_pivot/frontend/src/renderers/TableRenderer.tsx
++++ b/streamlit_pivot/frontend/src/renderers/TableRenderer.tsx
+@@ -85,6 +85,7 @@ import {
+ } from "../engine/showValuesAs";
+ import HeaderMenu from "./HeaderMenu";
+ import { useHeaderMenu } from "./useHeaderMenu";
++import { useHeaderMenuPlacement } from "./useHeaderMenuPlacement";
+ import {
+   computeTemporalColInfos,
+   computeHeaderLevels,
+@@ -1090,6 +1091,7 @@ export function renderColumnHeaders(
+                 className={`${styles.headerCell} ${styles.rowHeaderSecondary} ${styles.headerRowPinned}`}
+                 rowSpan={numColLevels}
+                 style={stickyTop}
++                data-pivot-sticky-col="0"
+                 data-testid="pivot-values-axis-header"
+               >
+                 <div className={styles.headerCellContent}>
+@@ -1130,7 +1132,8 @@ export function renderColumnHeaders(
+               className={`${styles.headerCell} ${styles.rowHeaderPrimary} ${styles.headerRowPinned}`}
+               rowSpan={cornerFullRowSpan}
+               data-testid="pivot-row-dim-label-hierarchy"
+-              style={hierarchyResizeCellStyle}
++              style={{ ...hierarchyResizeCellStyle, ...rowStickyStyle(0, config) }}
++              data-pivot-sticky-col={config.values_axis === "rows" ? 1 : 0}
+             >
+               <div
+                 className={styles.headerCellInner}
+@@ -1283,6 +1286,7 @@ export function renderColumnHeaders(
+                 className={`${styles.headerCell} ${styles.rowHeaderSecondary} ${styles.headerRowPinned}`}
+                 rowSpan={valuesColRowSpan}
+                 style={stickyTop}
++                data-pivot-sticky-col="0"
+                 data-testid="pivot-values-axis-header"
+               >
+                 <div className={styles.headerCellContent}>
+@@ -1336,23 +1340,25 @@ export function renderColumnHeaders(
+               columnWidthMap?.get(rowDimResizeIdx),
+               resolveFieldWidth(config, dim),
+             );
+-            const rowDimCellStyle: React.CSSProperties | undefined =
++            const rowDimCellStyle: React.CSSProperties =
+               rowDimResizeWidth != null
+                 ? {
+                     ...stickyTop,
++                    ...rowStickyStyle(rowHeaderIdx, config),
+                     width: rowDimResizeWidth,
+                     minWidth: rowDimResizeWidth,
+                     maxWidth: rowDimResizeWidth,
+                   }
+-                : stickyTop;
++                : { ...stickyTop, ...rowStickyStyle(rowHeaderIdx, config) };
+ 
+             const rowDimHelp = config.field_help?.[dim];
+             cells.push(
+               <th
+                 key={`row-dim-${rowHeaderIdx}`}
+-                className={`${styles.headerCell} ${isPrimaryRowHierarchy ? styles.rowHeaderPrimary : styles.rowHeaderSecondary} ${rowSortDir ? styles.headerSorted : ""} ${isFirstRowDim ? styles.headerRowPinned : ""} ${canToggleThisDim ? styles.dimensionToggleCell : ""} ${isGroupingDimHeader ? styles.groupingDimHeader : ""}`}
++                className={`${styles.headerCell} ${isPrimaryRowHierarchy ? styles.rowHeaderPrimary : styles.rowHeaderSecondary} ${rowSortDir ? styles.headerSorted : ""} ${styles.headerRowPinned} ${canToggleThisDim ? styles.dimensionToggleCell : ""} ${isGroupingDimHeader ? styles.groupingDimHeader : ""}`}
+                 rowSpan={cornerFullRowSpan}
+                 style={rowDimCellStyle}
++                data-pivot-sticky-col={rowHeaderIdx + (config.values_axis === "rows" ? 1 : 0)}
+                 title={rowDimHelp || undefined}
+                 data-tooltip={rowDimHelp || undefined}
+                 data-testid={
+@@ -1509,6 +1515,7 @@ export function renderColumnHeaders(
+             className={styles.emptyCorner}
+             rowSpan={cornerFullRowSpan}
+             style={stickyTop}
++            data-pivot-sticky-col="0"
+           />,
+         );
+       }
+@@ -2309,6 +2316,42 @@ function isHierarchyLayout(config: PivotConfigV1): boolean {
+   return config.row_layout === "hierarchy";
+ }
+ 
++/** Column indices include the leading Values column when values are on rows. */
++function rowStickyStyle(index: number, config: PivotConfigV1): React.CSSProperties {
++  const physicalIndex = index + (isValuesOnRows(config) ? 1 : 0);
++  return { left: `var(--pivot-row-sticky-${physicalIndex}, 0px)` };
++}
++
++/** Measure actual header widths (including auto layout and user resizing). */
++export function useRowStickyOffsets(
++  wrapperRef: React.RefObject<HTMLDivElement | null>,
++): void {
++  useEffect(() => {
++    const wrapper = wrapperRef.current;
++    if (!wrapper || typeof ResizeObserver === "undefined") return;
++    const headers = Array.from(
++      wrapper.querySelectorAll<HTMLElement>("[data-pivot-sticky-col]"),
++    );
++    // VirtualScroll renders one header table; only that table carries these markers.
++    const measure = () => {
++      let left = 0;
++      headers.forEach((header, index) => {
++        wrapper.style.setProperty(`--pivot-row-sticky-${index}`, `${left}px`);
++        left += header.getBoundingClientRect().width;
++      });
++    };
++    const observer = new ResizeObserver(measure);
++    headers.forEach((header) => observer.observe(header));
++    measure();
++    return () => {
++      observer.disconnect();
++      headers.forEach((_, index) =>
++        wrapper.style.removeProperty(`--pivot-row-sticky-${index}`),
++      );
++    };
++  });
++}
++
+ function getHierarchyPadding(depth: number): string {
+   return `${Math.max(depth, 0) * HIERARCHY_INDENT_PX}px`;
+ }
+@@ -2338,6 +2381,7 @@ function renderHierarchyRowHeaderCell(
+     leadingToggle?: ReactElement | null;
+     reserveToggleSpace?: boolean;
+     dimIndex?: number;
++    stickyStyle?: React.CSSProperties;
+   },
+ ): ReactElement {
+   return (
+@@ -2345,6 +2389,7 @@ function renderHierarchyRowHeaderCell(
+       key={key}
+       scope="row"
+       className={classes}
++      style={opts?.stickyStyle}
+       data-testid={opts?.dataTestId ?? "pivot-row-header"}
+       rowSpan={opts?.rowSpan && opts.rowSpan > 1 ? opts.rowSpan : undefined}
+       data-dim-index={opts?.dimIndex}
+@@ -2498,6 +2543,7 @@ function renderProjectedRowHeaderCells(
+         {
+           dataTestId: "pivot-row-header",
+           dimIndex: mapping.dimIndex,
++          stickyStyle: rowStickyStyle(0, config),
+           reserveToggleSpace: colIdx > 0,
+           leadingToggle: showTemporalToggle ? (
+             <button
+@@ -2539,7 +2585,8 @@ function renderProjectedRowHeaderCells(
+         <th
+           key={`row-spacer-${colIdx}`}
+           scope="row"
+-          className={`${styles.rowHeaderCell} ${colIdx === 0 ? styles.rowHeaderCellPinned : ""}`}
++          className={`${styles.rowHeaderCell} ${styles.rowHeaderCellPinned}`}
++          style={rowStickyStyle(colIdx, config)}
+           data-testid="pivot-row-header-spacer"
+         />,
+       );
+@@ -2639,7 +2686,7 @@ function renderProjectedRowHeaderCells(
+       mapping.dimIndex === 0 && mapping.hierarchyOffset === 0
+         ? styles.rowHeaderPrimary
+         : styles.rowHeaderSecondary,
+-      colIdx === 0 ? styles.rowHeaderCellPinned : "",
++      styles.rowHeaderCellPinned,
+       isGroupingDim ? styles.groupingDimCell : "",
+       isLeafDim ? styles.leafDimCell : "",
+       showTemporalToggle || showGroupToggle ? styles.groupToggleCell : "",
+@@ -2653,6 +2700,7 @@ function renderProjectedRowHeaderCells(
+         key={`row-header-${colIdx}`}
+         scope="row"
+         className={dimClasses}
++        style={rowStickyStyle(colIdx, config)}
+         data-testid={
+           showGroupToggle
+             ? `pivot-group-toggle-${groupKeyStr}`
+@@ -2773,7 +2821,8 @@ export function renderDataRow(
+         {/* Value field label cell — first column, matches "Values" column header */}
+         <th
+           scope="row"
+-          className={`${styles.rowHeaderCell} ${styles.rowHeaderSecondary}`}
++          className={`${styles.rowHeaderCell} ${styles.rowHeaderSecondary} ${styles.rowHeaderCellPinned}`}
++          style={{ left: 0 }}
+           data-testid="pivot-values-axis-label"
+         >
+           {valFieldLabel}
+@@ -2809,6 +2858,7 @@ export function renderDataRow(
+                 {
+                   reserveToggleSpace: activeDimIdx > 0,
+                   dimIndex: activeDimIdx,
++                  stickyStyle: rowStickyStyle(0, config),
+                 },
+               );
+             })()
+@@ -2820,7 +2870,7 @@ export function renderDataRow(
+                 dimIdx === 0
+                   ? styles.rowHeaderPrimary
+                   : styles.rowHeaderSecondary,
+-                dimIdx === 0 ? styles.rowHeaderCellPinned : "",
++                styles.rowHeaderCellPinned,
+               ]
+                 .filter(Boolean)
+                 .join(" ");
+@@ -2833,6 +2883,7 @@ export function renderDataRow(
+                   key={dimIdx}
+                   scope="row"
+                   className={dimClasses}
++                  style={rowStickyStyle(dimIdx, config)}
+                   data-testid="pivot-row-header"
+                   rowSpan={span > 1 ? span : undefined}
+                   data-dim-index={dimIdx}
+@@ -3061,6 +3112,7 @@ export function renderDataRow(
+                 {
+                   reserveToggleSpace: activeDimIdx > 0,
+                   dimIndex: activeDimIdx,
++                  stickyStyle: rowStickyStyle(0, config),
+                 },
+               );
+             })()
+@@ -3095,7 +3147,7 @@ export function renderDataRow(
+                 dimIdx === 0
+                   ? styles.rowHeaderPrimary
+                   : styles.rowHeaderSecondary,
+-                dimIdx === 0 ? styles.rowHeaderCellPinned : "",
++                styles.rowHeaderCellPinned,
+                 isGroupingDim ? styles.groupingDimCell : "",
+                 isLeafDim ? styles.leafDimCell : "",
+                 showToggle ? styles.groupToggleCell : "",
+@@ -3107,6 +3159,7 @@ export function renderDataRow(
+                   key={dimIdx}
+                   scope="row"
+                   className={dimClasses}
++                  style={rowStickyStyle(dimIdx, config)}
+                   data-testid={
+                     showToggle
+                       ? `pivot-group-toggle-${groupKeyStr}`
+@@ -3477,7 +3530,8 @@ export function renderSubtotalRow(
+         {/* Value field label cell — first column, matches "Values" column header */}
+         <th
+           scope="row"
+-          className={`${styles.rowHeaderCell} ${styles.rowHeaderSecondary}`}
++          className={`${styles.rowHeaderCell} ${styles.rowHeaderSecondary} ${styles.rowHeaderCellPinned}`}
++          style={{ left: 0 }}
+           data-testid="pivot-values-axis-label"
+         >
+           {valFieldLabel}
+@@ -3509,6 +3563,7 @@ export function renderSubtotalRow(
+                 {
+                   dataTestId: "pivot-row-header",
+                   dimIndex: level,
++                  stickyStyle: rowStickyStyle(0, config),
+                   leadingToggle: onToggleGroup ? (
+                     <HierarchyToggleButton
+                       collapsed={isCollapsed}
+@@ -3528,7 +3583,8 @@ export function renderSubtotalRow(
+                   <th
+                     key={`sub-hdr-${dimIdx}`}
+                     scope="row"
+-                    className={`${styles.rowHeaderCell} ${dimIdx === 0 ? styles.rowHeaderPrimary : styles.rowHeaderSecondary} ${dimIdx === 0 ? styles.rowHeaderCellPinned : ""} ${styles.groupingDimCell}`}
++                    className={`${styles.rowHeaderCell} ${dimIdx === 0 ? styles.rowHeaderPrimary : styles.rowHeaderSecondary} ${styles.rowHeaderCellPinned} ${styles.groupingDimCell}`}
++                    style={rowStickyStyle(dimIdx, config)}
+                     data-dim-index={dimIdx}
+                   >
+                     {parentRaw || "(empty)"}
+@@ -3541,7 +3597,8 @@ export function renderSubtotalRow(
+                   <th
+                     key={`sub-hdr-${dimIdx}`}
+                     scope="row"
+-                    className={`${styles.rowHeaderCell} ${dimIdx === 0 ? styles.rowHeaderPrimary : styles.rowHeaderSecondary} ${dimIdx === 0 ? styles.rowHeaderCellPinned : ""} ${styles.subtotalHeaderCell} ${canToggle ? styles.groupToggleCell : ""}`}
++                    className={`${styles.rowHeaderCell} ${dimIdx === 0 ? styles.rowHeaderPrimary : styles.rowHeaderSecondary} ${styles.rowHeaderCellPinned} ${styles.subtotalHeaderCell} ${canToggle ? styles.groupToggleCell : ""}`}
++                    style={rowStickyStyle(dimIdx, config)}
+                     {...(canToggle
+                       ? {
+                           onClick: () => onToggleGroup(groupKeyStr),
+@@ -3742,6 +3799,7 @@ export function renderSubtotalRow(
+                 {
+                   dataTestId: "pivot-row-header",
+                   dimIndex: level,
++                  stickyStyle: rowStickyStyle(0, config),
+                   leadingToggle: onToggleGroup ? (
+                     <HierarchyToggleButton
+                       collapsed={isCollapsed}
+@@ -3765,7 +3823,8 @@ export function renderSubtotalRow(
+                   <th
+                     key={`sub-hdr-${dimIdx}`}
+                     scope="row"
+-                    className={`${styles.rowHeaderCell} ${dimIdx === 0 ? styles.rowHeaderPrimary : styles.rowHeaderSecondary} ${dimIdx === 0 ? styles.rowHeaderCellPinned : ""} ${styles.groupingDimCell}`}
++                    className={`${styles.rowHeaderCell} ${dimIdx === 0 ? styles.rowHeaderPrimary : styles.rowHeaderSecondary} ${styles.rowHeaderCellPinned} ${styles.groupingDimCell}`}
++                    style={rowStickyStyle(dimIdx, config)}
+                     rowSpan={span > 1 ? span : undefined}
+                     data-dim-index={dimIdx}
+                   >
+@@ -3786,7 +3845,8 @@ export function renderSubtotalRow(
+                   <th
+                     key={`sub-hdr-${dimIdx}`}
+                     scope="row"
+-                    className={`${styles.rowHeaderCell} ${dimIdx === 0 ? styles.rowHeaderPrimary : styles.rowHeaderSecondary} ${dimIdx === 0 ? styles.rowHeaderCellPinned : ""} ${styles.subtotalHeaderCell} ${canToggle ? styles.groupToggleCell : ""}`}
++                    className={`${styles.rowHeaderCell} ${dimIdx === 0 ? styles.rowHeaderPrimary : styles.rowHeaderSecondary} ${styles.rowHeaderCellPinned} ${styles.subtotalHeaderCell} ${canToggle ? styles.groupToggleCell : ""}`}
++                    style={rowStickyStyle(dimIdx, config)}
+                     {...(canToggle
+                       ? {
+                           onClick: () => onToggleGroup(groupKeyStr),
+@@ -4200,7 +4260,8 @@ export function renderTotalsRow(
+               {/* Value field label — first column, matches "Values" column header */}
+               <th
+                 scope="row"
+-                className={`${styles.rowHeaderCell} ${styles.rowHeaderSecondary}`}
++                className={`${styles.rowHeaderCell} ${styles.rowHeaderSecondary} ${styles.rowHeaderCellPinned}`}
++                style={{ left: 0 }}
+                 data-testid="pivot-values-axis-label"
+               >
+                 {getRenderedValueLabel(config, valField)}
+@@ -4212,6 +4273,7 @@ export function renderTotalsRow(
+                 <th
+                   scope="row"
+                   className={`${styles.rowHeaderCell} ${styles.rowHeaderCellPinned}`}
++                  style={rowStickyStyle(0, config)}
+                   colSpan={dimColSpan}
+                   rowSpan={
+                     renderedVFs.length > 1 ? renderedVFs.length : undefined
+@@ -4509,6 +4571,8 @@ const TableRenderer: FC<TableRendererProps> = ({
+   onOverflowChange,
+ }): ReactElement => {
+   const wrapperRef = useRef<HTMLDivElement>(null);
++  useRowStickyOffsets(wrapperRef);
++  const menuOverlayRef = useRef<HTMLDivElement>(null);
+   const theadRef = useRef<HTMLTableSectionElement>(null);
+   const prevOverflowRef = useRef(false);
+   const [headerRowOffsets, setHeaderRowOffsets] = useState<number[]>([]);
+@@ -5161,20 +5225,21 @@ const TableRenderer: FC<TableRendererProps> = ({
+     [onValueFilterChange, menuTarget],
+   );
+ 
+-  // Close the header menu on any scroll so the popover does not float
+-  // detached from its anchor cell. The scroll event does not bubble, so we
+-  // listen in the capture phase at the document root to catch scroll on the
+-  // wrapper, any descendant overflow container, or the window itself.
+-  //
+-  // A 150 ms guard delay prevents stale scroll events that were queued
+-  // synchronously during the click-to-open sequence (e.g. scrollIntoView
+-  // followed by click) from immediately re-closing the menu before the user
+-  // has had a chance to interact with it.
++  const menuPlacement = useHeaderMenuPlacement(menuTarget, menuOverlayRef);
++
++  // Close when the table/page scrolls so the popover cannot detach from its
++  // header, but keep it open while scrolling an overflow area inside the menu.
+   useEffect(() => {
+     if (!menuTarget) return;
+-    let listener: (() => void) | null = null;
++    let listener: ((event: Event) => void) | null = null;
+     const timerId = setTimeout(() => {
+-      const onScroll = () => handleCloseMenu();
++      const onScroll = (event: Event) => {
++        const target = event.target;
++        if (target instanceof Node && menuOverlayRef.current?.contains(target)) {
++          return;
++        }
++        handleCloseMenu();
++      };
+       listener = onScroll;
+       document.addEventListener("scroll", onScroll, {
+         passive: true,
+@@ -5471,8 +5536,13 @@ const TableRenderer: FC<TableRendererProps> = ({
+ 
+       {menuTarget && menuPosition && (
+         <div
++          ref={menuOverlayRef}
+           className={styles.headerMenuOverlay}
+-          style={{ top: menuPosition.top, left: menuPosition.left }}
++          style={{
++            ...menuPosition,
++            ...menuPlacement,
++            visibility: menuPlacement ? "visible" : "hidden",
++          }}
+         >
+           <HeaderMenu
+             key={`${menuTarget.dimension}-${menuTarget.axis}`}
+diff --git a/streamlit_pivot/frontend/src/renderers/VirtualizedTableRenderer.test.tsx b/streamlit_pivot/frontend/src/renderers/VirtualizedTableRenderer.test.tsx
+index 58eaec0..dfbd0a3 100644
+--- a/streamlit_pivot/frontend/src/renderers/VirtualizedTableRenderer.test.tsx
++++ b/streamlit_pivot/frontend/src/renderers/VirtualizedTableRenderer.test.tsx
+@@ -55,6 +55,43 @@ beforeEach(() => {
+ });
+ 
+ describe("VirtualizedTableRenderer", () => {
++  it("pins three row dimensions in the header, data, subtotal and totals tables", () => {
++    const config = makeConfig({
++      rows: ["region", "category", "group"],
++      columns: ["year"],
++      values: ["revenue"],
++      show_subtotals: true,
++    });
++    const pivotData = new PivotData(
++      [
++        { region: "US", category: "A", group: "X", year: "2024", revenue: 100 },
++        { region: "US", category: "B", group: "Y", year: "2024", revenue: 200 },
++      ],
++      config,
++    );
++    const { container } = render(
++      <VirtualizedTableRenderer
++        pivotData={pivotData}
++        config={config}
++        containerHeight={400}
++      />,
++    );
++    expect(container.querySelectorAll('[data-pivot-sticky-col]')).toHaveLength(3);
++    const cells = screen
++      .getAllByTestId("pivot-data-row")[0]
++      .querySelectorAll('th[data-testid="pivot-row-header"]');
++    expect(cells).toHaveLength(3);
++    cells.forEach((cell, index) => {
++      expect(cell).toHaveStyle(`left: var(--pivot-row-sticky-${index}, 0px)`);
++    });
++    expect(
++      screen.getAllByTestId("pivot-subtotal-row")[0].querySelectorAll('th[scope="row"]')[1],
++    ).toHaveStyle("left: var(--pivot-row-sticky-1, 0px)");
++    expect(
++      screen.getByTestId("pivot-totals-row").querySelector("th"),
++    ).toHaveAttribute("colspan", "3");
++  });
++
+   it("renders a virtual scroll container", () => {
+     const records = makeRecords(5, 3);
+     const config = makeConfig();
+diff --git a/streamlit_pivot/frontend/src/renderers/VirtualizedTableRenderer.tsx b/streamlit_pivot/frontend/src/renderers/VirtualizedTableRenderer.tsx
+index 2afa074..7e27b7f 100644
+--- a/streamlit_pivot/frontend/src/renderers/VirtualizedTableRenderer.tsx
++++ b/streamlit_pivot/frontend/src/renderers/VirtualizedTableRenderer.tsx
+@@ -49,6 +49,7 @@ import {
+   renderSubtotalRow,
+   renderTemporalParentRow,
+   renderTotalsRow as renderTotalsRowFn,
++  useRowStickyOffsets,
+   HEADER_ROW_HEIGHT,
+   type ColSlot,
+ } from "./TableRenderer";
+@@ -71,6 +72,7 @@ import {
+   toggleCollapsedGroupNode,
+ } from "./collapseState";
+ import { useHeaderMenu } from "./useHeaderMenu";
++import { useHeaderMenuPlacement } from "./useHeaderMenuPlacement";
+ import tableStyles from "./TableRenderer.module.css";
+ import {
+   estimateRowHeaderWidths,
+@@ -142,6 +144,8 @@ const VirtualizedTableRenderer: FC<VirtualizedTableRendererProps> = ({
+     DEFAULT_ROW_HEIGHT;
+ 
+   const wrapperRef = useRef<HTMLDivElement>(null);
++  useRowStickyOffsets(wrapperRef);
++  const menuOverlayRef = useRef<HTMLDivElement>(null);
+   const [measuredHeight, setMeasuredHeight] = useState(containerHeight);
+ 
+   const [columnWidthMap, setColumnWidthMap] = useState<Map<number, number>>(
+@@ -565,20 +569,21 @@ const VirtualizedTableRenderer: FC<VirtualizedTableRendererProps> = ({
+     adaptiveDateGrains,
+   });
+ 
+-  // Close the header menu on any scroll so the popover does not float
+-  // detached from its anchor cell. The scroll event does not bubble, so we
+-  // listen in the capture phase at the document root to catch scroll on the
+-  // wrapper, any descendant overflow container, or the window itself.
+-  //
+-  // A 150 ms guard delay prevents stale scroll events that were queued
+-  // synchronously during the click-to-open sequence (e.g. scrollIntoView
+-  // followed by click) from immediately re-closing the menu before the user
+-  // has had a chance to interact with it.
++  const menuPlacement = useHeaderMenuPlacement(menuTarget, menuOverlayRef);
++
++  // Close when the table/page scrolls so the popover cannot detach from its
++  // header, but keep it open while scrolling an overflow area inside the menu.
+   useEffect(() => {
+     if (!menuTarget) return;
+-    let listener: (() => void) | null = null;
++    let listener: ((event: Event) => void) | null = null;
+     const timerId = setTimeout(() => {
+-      const onScroll = () => handleCloseMenu();
++      const onScroll = (event: Event) => {
++        const target = event.target;
++        if (target instanceof Node && menuOverlayRef.current?.contains(target)) {
++          return;
++        }
++        handleCloseMenu();
++      };
+       listener = onScroll;
+       document.addEventListener("scroll", onScroll, {
+         passive: true,
+@@ -1120,8 +1125,13 @@ const VirtualizedTableRenderer: FC<VirtualizedTableRendererProps> = ({
+ 
+         {menuTarget && menuPosition && (
+           <div
++            ref={menuOverlayRef}
+             className={tableStyles.headerMenuOverlay}
+-            style={{ top: menuPosition.top, left: menuPosition.left }}
++            style={{
++              ...menuPosition,
++              ...menuPlacement,
++              visibility: menuPlacement ? "visible" : "hidden",
++            }}
+           >
+             <HeaderMenu
+               dimension={menuTarget.dimension}
+diff --git a/streamlit_pivot/frontend/src/renderers/useHeaderMenu.ts b/streamlit_pivot/frontend/src/renderers/useHeaderMenu.ts
+index 654e039..7e93d04 100644
+--- a/streamlit_pivot/frontend/src/renderers/useHeaderMenu.ts
++++ b/streamlit_pivot/frontend/src/renderers/useHeaderMenu.ts
+@@ -30,6 +30,7 @@ import {
+   getDrilledDateGrain,
+   getEffectiveDateGrain,
+   getDimensionLabel,
++  getRenderedValueLabel,
+   isPeriodComparisonMode,
+   normalizeToggleList,
+   validatePivotConfigRuntime,
+@@ -273,12 +274,14 @@ export function useHeaderMenu({
+       : undefined;
+ 
+   const menuTitle = menuTarget
+-    ? getDimensionLabel(
+-        config,
+-        menuTarget.dimension,
+-        pivotData.getColumnType(menuTarget.dimension),
+-        adaptiveDateGrains?.[menuTarget.dimension],
+-      )
++    ? menuTarget.axis === "value"
++      ? getRenderedValueLabel(config, menuTarget.dimension)
++      : getDimensionLabel(
++          config,
++          menuTarget.dimension,
++          pivotData.getColumnType(menuTarget.dimension),
++          adaptiveDateGrains?.[menuTarget.dimension],
++        )
+     : undefined;
+ 
+   const menuDateGrain =
+diff --git a/streamlit_pivot/frontend/src/shared/VirtualScroll.test.tsx b/streamlit_pivot/frontend/src/shared/VirtualScroll.test.tsx
+index b11c16b..aa4d148 100644
+--- a/streamlit_pivot/frontend/src/shared/VirtualScroll.test.tsx
++++ b/streamlit_pivot/frontend/src/shared/VirtualScroll.test.tsx
+@@ -326,6 +326,74 @@ describe("VirtualScroll - colgroup injection", () => {
+   });
+ });
+ 
++describe("VirtualScroll - grand total placement", () => {
++  it("uses measured row height when body rows are shorter than the estimate", () => {
++    const original = HTMLTableSectionElement.prototype.getBoundingClientRect;
++    const rect = vi.spyOn(HTMLTableSectionElement.prototype, "getBoundingClientRect")
++      .mockImplementation(function (this: HTMLTableSectionElement) {
++        if (this.tagName === "TBODY") {
++          return { height: this.rows.length * 30 } as DOMRect;
++        }
++        return original.call(this);
++      });
++    try {
++      const { props } = makeProps(3);
++      render(
++        <VirtualScroll
++          {...props}
++          totalRows={1794}
++          renderTotalsRow={() => <tr><td>Grand Total</td></tr>}
++        />,
++      );
++      const content = screen.getByTestId("virtual-scroll-container").firstElementChild!;
++      const body = content.children[1] as HTMLElement;
++      expect(body.style.height).toBe(`${1794 * 30}px`);
++
++      const scrollArea = screen.getByTestId("virtual-scroll-container");
++      Object.defineProperty(scrollArea, "scrollTop", {
++        value: 1794 * 30 - 100,
++        writable: true,
++      });
++      act(() => fireEvent.scroll(scrollArea));
++      expect(screen.getByText("1793-0")).toBeTruthy();
++      const window = body.firstElementChild as HTMLElement;
++      const tbody = window.querySelector("tbody")!;
++      expect(Number.parseFloat(window.style.top) + tbody.rows.length * 30)
++        .toBe(1794 * 30);
++    } finally {
++      rect.mockRestore();
++    }
++  });
++
++  it("keeps the totals after the full virtual body, not at the first visible row", () => {
++    const { props } = makeProps(3);
++    const { container } = render(
++      <VirtualScroll
++        {...props}
++        totalRows={1794}
++        renderTotalsRow={() => (
++          <tr data-testid="pivot-totals-row"><td>Grand Total</td></tr>
++        )}
++      />,
++    );
++    const scrollArea = screen.getByTestId("virtual-scroll-container");
++    const content = scrollArea.firstElementChild as HTMLElement;
++    const virtualBody = content.children[1] as HTMLElement;
++    const totals = screen.getByTestId("pivot-totals-row");
++
++    expect(virtualBody.style.height).toBe(`${1794 * 36}px`);
++    expect(content.firstElementChild).toBe(screen.getByTestId("pivot-table"));
++    expect(virtualBody.contains(totals)).toBe(false);
++    expect(totals.closest("table")?.parentElement).toBe(content.lastElementChild);
++    expect(container.querySelectorAll("[data-testid=vs-cell]").length).toBeLessThan(1794 * 3);
++
++    Object.defineProperty(scrollArea, "scrollTop", { value: 1794 * 36, writable: true });
++    act(() => fireEvent.scroll(scrollArea));
++    expect(screen.getByText("1793-0")).toBeTruthy();
++    expect(screen.getByTestId("pivot-totals-row").textContent).toBe("Grand Total");
++  });
++});
++
+ describe("VirtualScroll - variable column widths (prefix-sum)", () => {
+   it("uses columnWidths to calculate visible range", () => {
+     const { props, headerCalls } = makeProps(20, 120);
+diff --git a/streamlit_pivot/frontend/src/shared/VirtualScroll.tsx b/streamlit_pivot/frontend/src/shared/VirtualScroll.tsx
+index 253085b..c57dae1 100644
+--- a/streamlit_pivot/frontend/src/shared/VirtualScroll.tsx
++++ b/streamlit_pivot/frontend/src/shared/VirtualScroll.tsx
+@@ -23,6 +23,7 @@ import {
+   useState,
+   useCallback,
+   useEffect,
++  useLayoutEffect,
+   useMemo,
+ } from "react";
+ import { COLUMN_VIRTUALIZATION_THRESHOLD } from "../engine/perf";
+@@ -96,9 +97,17 @@ const VirtualScroll: FC<VirtualScrollProps> = ({
+   tableClassName,
+ }): ReactElement => {
+   const scrollRef = useRef<HTMLDivElement>(null);
++  const bodyRef = useRef<HTMLTableSectionElement>(null);
+   const [scrollTop, setScrollTop] = useState(0);
+   const [scrollLeft, setScrollLeft] = useState(0);
+   const [measuredWidth, setMeasuredWidth] = useState(0);
++  const [rowMeasurement, setRowMeasurement] = useState<{
++    requested: number;
++    actual: number;
++  } | null>(null);
++  const actualRowHeight = rowMeasurement?.requested === rowHeight
++    ? rowMeasurement.actual
++    : rowHeight;
+ 
+   const handleScroll = useCallback(() => {
+     const el = scrollRef.current;
+@@ -128,8 +137,29 @@ const VirtualScroll: FC<VirtualScrollProps> = ({
+     return () => observer.disconnect();
+   }, []);
+ 
++  useLayoutEffect(() => {
++    const tbody = bodyRef.current;
++    if (!tbody) return;
++    const measure = () => {
++      const count = tbody.rows.length;
++      if (!count) return;
++      const height = tbody.getBoundingClientRect().height / count;
++      if (!Number.isFinite(height) || height <= 0) return;
++      setRowMeasurement((previous) =>
++        previous?.requested === rowHeight && Math.abs(previous.actual - height) < 0.25
++          ? previous
++          : { requested: rowHeight, actual: height },
++      );
++    };
++    measure();
++    if (typeof ResizeObserver === "undefined") return;
++    const observer = new ResizeObserver(measure);
++    observer.observe(tbody);
++    return () => observer.disconnect();
++  });
++
+   const bodyHeight = containerHeight - headerHeight;
+-  const totalContentHeight = totalRows * rowHeight;
++  const totalContentHeight = totalRows * actualRowHeight;
+ 
+   const colOffsets = useMemo(() => {
+     if (!columnWidths || columnWidths.length === 0) return null;
+@@ -155,11 +185,14 @@ const VirtualScroll: FC<VirtualScrollProps> = ({
+   );
+ 
+   const { startRow, endRow } = useMemo(() => {
+-    const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscanRows);
+-    const visibleCount = Math.ceil(bodyHeight / rowHeight);
++    const start = Math.max(
++      0,
++      Math.min(totalRows, Math.floor(scrollTop / actualRowHeight) - overscanRows),
++    );
++    const visibleCount = Math.ceil(bodyHeight / actualRowHeight);
+     const end = Math.min(totalRows, start + visibleCount + overscanRows * 2);
+     return { startRow: start, endRow: end };
+-  }, [scrollTop, rowHeight, bodyHeight, totalRows, overscanRows]);
++  }, [scrollTop, actualRowHeight, bodyHeight, totalRows, overscanRows]);
+ 
+   const { startCol, endCol } = useMemo(() => {
+     // All three tables are sized to the full virtual width, while the colgroup
+@@ -211,7 +244,6 @@ const VirtualScroll: FC<VirtualScrollProps> = ({
+     >
+       <div
+         style={{
+-          height: totalContentHeight + headerHeight,
+           width: totalContentWidth,
+           minWidth: "100%",
+           position: "relative",
+@@ -237,37 +269,42 @@ const VirtualScroll: FC<VirtualScrollProps> = ({
+ 
+         <div
+           style={{
+-            position: "absolute",
+-            top: headerHeight + startRow * rowHeight,
+-            left: 0,
+-            right: 0,
++            height: totalContentHeight,
++            position: "relative",
+           }}
+         >
+-          <table
+-            role="grid"
+-            className={tableClassName}
++          <div
+             style={{
+-              width: "100%",
+-              borderCollapse: "separate",
+-              borderSpacing: 0,
+-              ...(renderColgroup ? { tableLayout: "fixed" } : undefined),
++              position: "absolute",
++              top: startRow * actualRowHeight,
++              left: 0,
++              right: 0,
+             }}
+           >
+-            {renderColgroup?.(colRange)}
+-            <tbody>
+-              {Array.from({ length: endRow - startRow }, (_, i) =>
+-                renderRow(startRow + i, colRange),
+-              )}
+-            </tbody>
+-          </table>
++            <table
++              role="grid"
++              className={tableClassName}
++              style={{
++                width: "100%",
++                borderCollapse: "separate",
++                borderSpacing: 0,
++                ...(renderColgroup ? { tableLayout: "fixed" } : undefined),
++              }}
++            >
++              {renderColgroup?.(colRange)}
++              <tbody ref={bodyRef}>
++                {Array.from({ length: endRow - startRow }, (_, i) =>
++                  renderRow(startRow + i, colRange),
++                )}
++              </tbody>
++            </table>
++          </div>
+         </div>
+ 
+         {renderTotalsRow && (
+           <div
+             style={{
+-              position: "sticky",
+-              bottom: 0,
+-              zIndex: 2,
++              // Keep totals in normal flow, after the full-height virtual body.
+               backgroundColor: "var(--st-background-color)",
+             }}
+           >
+diff --git a/streamlit_pivot/frontend/src/shared/budgetCheck.test.ts b/streamlit_pivot/frontend/src/shared/budgetCheck.test.ts
+index d60c1d7..d4d06c2 100644
+--- a/streamlit_pivot/frontend/src/shared/budgetCheck.test.ts
++++ b/streamlit_pivot/frontend/src/shared/budgetCheck.test.ts
+@@ -30,7 +30,7 @@ describe("checkRenderBudget", () => {
+   });
+ 
+   it("enables virtualization when cells exceed budget", () => {
+-    const rowCount = 1000;
++    const rowCount = Math.floor(DEFAULT_BUDGETS.maxVisibleCells / 10) + 1;
+     const colCount = 10;
+     const result = checkRenderBudget(rowCount, colCount, 1);
+     expect(rowCount * colCount).toBeGreaterThan(
+@@ -42,8 +42,18 @@ describe("checkRenderBudget", () => {
+     expect(result.dataIntegrityWarnings).toHaveLength(0);
+   });
+ 
++  it("virtualizes a tall, narrow pivot before mounting every row", () => {
++    const result = checkRenderBudget(1794, 10, 1);
++    expect(1794 * 10).toBeLessThan(DEFAULT_BUDGETS.maxVisibleCells);
++    expect(result.needsVirtualization).toBe(true);
++    expect(result.columnsTruncated).toBe(false);
++    expect(result.warnings.some((warning) => warning.includes("500-row DOM budget"))).toBe(true);
++    expect(result.dataIntegrityWarnings).toHaveLength(0);
++    expect(checkRenderBudget(500, 10, 1).needsVirtualization).toBe(false);
++  });
++
+   it("truncates columns when cardinality exceeds limit", () => {
+-    const result = checkRenderBudget(10, 1500, 1);
++    const result = checkRenderBudget(10, DEFAULT_BUDGETS.maxColumnCardinality + 1, 1);
+     expect(result.columnsTruncated).toBe(true);
+     expect(result.truncatedColumnCount).toBe(
+       DEFAULT_BUDGETS.maxColumnCardinality,
+@@ -70,8 +80,9 @@ describe("checkRenderBudget", () => {
+   it("accounts for multiple values in cell count", () => {
+     const result = checkRenderBudget(100, 10, 5);
+     expect(result.needsVirtualization).toBe(false);
+-    const result2 = checkRenderBudget(500, 10, 5);
+-    expect(500 * 10 * 5).toBeGreaterThan(DEFAULT_BUDGETS.maxVisibleCells);
++    const rowCount = Math.floor(DEFAULT_BUDGETS.maxVisibleCells / (10 * 5)) + 1;
++    const result2 = checkRenderBudget(rowCount, 10, 5);
++    expect(rowCount * 10 * 5).toBeGreaterThan(DEFAULT_BUDGETS.maxVisibleCells);
+     expect(result2.needsVirtualization).toBe(true);
+   });
+ });
+diff --git a/streamlit_pivot/frontend/src/shared/budgetCheck.ts b/streamlit_pivot/frontend/src/shared/budgetCheck.ts
+index 3563115..e385a65 100644
+--- a/streamlit_pivot/frontend/src/shared/budgetCheck.ts
++++ b/streamlit_pivot/frontend/src/shared/budgetCheck.ts
+@@ -65,8 +65,11 @@ export function checkRenderBudget(
+     colsAfterHardCap,
+     valueCount,
+   );
++  // A few thousand rows can create a large DOM even with only a handful of
++  // value columns. Limit mounted rows independently of the cell budget.
++  const needsVirtualizationFromRows = rowCount > 500;
+   const needsVirtualization =
+-    needsVirtualizationFromCells || needsColumnVirtualization;
++    needsVirtualizationFromCells || needsVirtualizationFromRows || needsColumnVirtualization;
+ 
+   let columnsTruncated = false;
+   let truncatedColumnCount = colCount;
+@@ -90,6 +93,11 @@ export function checkRenderBudget(
+           `(${DEFAULT_BUDGETS.maxVisibleCells.toLocaleString()}). Virtualization enabled.`,
+       );
+     }
++    if (needsVirtualizationFromRows && !needsVirtualizationFromCells) {
++      warnings.push(
++        `${rowCount.toLocaleString()} rows exceed the 500-row DOM budget. Virtualization enabled.`,
++      );
++    }
+   } else {
+     truncatedColumnCount = colCount;
+     columnsTruncated = false;
+diff --git a/streamlit_pivot/frontend/src/shared/wideColumn.test.ts b/streamlit_pivot/frontend/src/shared/wideColumn.test.ts
+index 00bf510..32746e2 100644
+--- a/streamlit_pivot/frontend/src/shared/wideColumn.test.ts
++++ b/streamlit_pivot/frontend/src/shared/wideColumn.test.ts
+@@ -69,7 +69,7 @@ describe("wide column mode (S1) + virtualization budgets", () => {
+     expect(pd.getColKeys()).toHaveLength(n);
+   });
+ 
+-  it("PivotData keeps full 1001 column keys; render budget caps display at 1000 when wideColumnMode", () => {
++  it("PivotData keeps 1001 column keys without truncating below the current cap", () => {
+     expect(FEATURE_FLAGS.wideColumnMode).toBe(true);
+     const n = 1001;
+     const pd = new PivotData(
+@@ -84,11 +84,10 @@ describe("wide column mode (S1) + virtualization budgets", () => {
+       pd.uniqueColKeyCount,
+       pd.config.values.length,
+     );
+-    expect(budget.columnsTruncated).toBe(true);
+-    expect(budget.truncatedColumnCount).toBe(
+-      DEFAULT_BUDGETS.maxColumnCardinality,
+-    );
+-    expect(DEFAULT_BUDGETS.maxColumnCardinality).toBe(1000);
++    expect(budget.needsColumnVirtualization).toBe(true);
++    expect(budget.columnsTruncated).toBe(false);
++    expect(budget.truncatedColumnCount).toBe(n);
++    expect(DEFAULT_BUDGETS.maxColumnCardinality).toBeGreaterThan(n);
+   });
+ 
+   it("FEATURE_FLAGS.wideColumnMode is enabled", () => {
+@@ -103,8 +102,9 @@ describe("wide column mode (S1) + virtualization budgets", () => {
+   });
+ 
+   it("checkRenderBudget flags cell-based virtualization when cells exceed budget", () => {
+-    const result = checkRenderBudget(600, 10, 1);
+-    expect(600 * 10).toBeGreaterThan(DEFAULT_BUDGETS.maxVisibleCells);
++    const rowCount = Math.floor(DEFAULT_BUDGETS.maxVisibleCells / 10) + 1;
++    const result = checkRenderBudget(rowCount, 10, 1);
++    expect(rowCount * 10).toBeGreaterThan(DEFAULT_BUDGETS.maxVisibleCells);
+     expect(result.needsVirtualization).toBe(true);
+     expect(result.warnings.some((w) => w.includes("DOM budget"))).toBe(true);
+   });
+diff --git a/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.test.tsx b/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.test.tsx
+new file mode 100644
+index 0000000..960e987
+--- /dev/null
++++ b/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.test.tsx
+@@ -0,0 +1,102 @@
++// @vitest-environment jsdom
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import TableRenderer from "./TableRenderer";
++import VirtualizedTableRenderer from "./VirtualizedTableRenderer";
++import { PivotData } from "../engine/PivotData";
++import { makeConfig } from "../test-utils";
++import { computeHeaderMenuPlacement } from "./useHeaderMenuPlacement";
++
++afterEach(() => {
++  cleanup();
++  vi.restoreAllMocks();
++});
++
++describe("computeHeaderMenuPlacement", () => {
++  const viewportWidth = 800;
++  const viewportHeight = 600;
++
++  it("opens below the header when there is room", () => {
++    expect(
++      computeHeaderMenuPlacement(
++        { top: 80, bottom: 110, left: 100 },
++        240,
++        300,
++        viewportWidth,
++        viewportHeight,
++      ),
++    ).toEqual({ top: 110, left: 100, maxHeight: 440 });
++  });
++
++  it("moves left and above near the viewport edges", () => {
++    expect(
++      computeHeaderMenuPlacement(
++        { top: 540, bottom: 570, left: 750 },
++        240,
++        300,
++        viewportWidth,
++        viewportHeight,
++      ),
++    ).toEqual({ top: 240, left: 552, maxHeight: 440 });
++  });
++
++  it("caps the menu to available space and lets its contents scroll", () => {
++    expect(
++      computeHeaderMenuPlacement(
++        { top: 100, bottom: 130, left: 80 },
++        240,
++        440,
++        800,
++        240,
++      ),
++    ).toEqual({ top: 130, left: 80, maxHeight: 102 });
++  });
++
++  it("fits in a viewport narrower than the default menu width", () => {
++    expect(
++      computeHeaderMenuPlacement(
++        { top: 40, bottom: 60, left: 70 },
++        210,
++        200,
++        180,
++        280,
++      ),
++    ).toEqual({ top: 60, left: 8, maxHeight: 212 });
++  });
++});
++
++describe.each(["regular", "virtualized"])("%s header menu overlay", (renderer) => {
++  it("positions the measured menu inside the viewport", () => {
++    vi.stubGlobal("ResizeObserver", class {
++      observe() {}
++      disconnect() {}
++    });
++    vi.spyOn(window, "innerWidth", "get").mockReturnValue(800);
++    vi.spyOn(window, "innerHeight", "get").mockReturnValue(600);
++    const config = makeConfig();
++    const pivotData = new PivotData(
++      [{ region: "US", year: "2024", revenue: 100 }],
++      config,
++    );
++    const props = { pivotData, config, onSortChange: vi.fn() };
++    if (renderer === "regular") {
++      render(<TableRenderer {...props} />);
++    } else {
++      render(<VirtualizedTableRenderer {...props} containerHeight={300} />);
++    }
++    const trigger = screen.getAllByTestId("header-menu-trigger-year")[0];
++    vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue({
++      top: 540,
++      bottom: 570,
++      left: 750,
++    } as DOMRect);
++    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(240);
++    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(300);
++    fireEvent.click(trigger);
++    const overlay = screen.getByTestId("header-menu-year").parentElement as HTMLElement;
++    expect(overlay.style.top).toBe("240px");
++    expect(overlay.style.left).toBe("552px");
++    expect(overlay.style.maxHeight).toBe("440px");
++    expect(overlay.style.visibility).toBe("visible");
++  });
++});
+\ No newline at end of file
+diff --git a/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.ts b/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.ts
+new file mode 100644
+index 0000000..e86c8e7
+--- /dev/null
++++ b/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.ts
+@@ -0,0 +1,85 @@
++import { useLayoutEffect, useState, type RefObject } from "react";
++import type { HeaderMenuTarget } from "./TableRenderer";
++
++const VIEWPORT_MARGIN = 8;
++const MENU_MAX_HEIGHT = 440;
++
++export function computeHeaderMenuPlacement(
++  rect: Pick<DOMRect, "top" | "bottom" | "left">,
++  menuWidth: number,
++  menuHeight: number,
++  viewportWidth: number,
++  viewportHeight: number,
++) {
++  const width = Math.max(0, viewportWidth - 2 * VIEWPORT_MARGIN);
++  const height = Math.max(0, viewportHeight - 2 * VIEWPORT_MARGIN);
++  const left = Math.max(
++    VIEWPORT_MARGIN,
++    Math.min(rect.left, viewportWidth - VIEWPORT_MARGIN - Math.min(menuWidth, width)),
++  );
++  const below = Math.max(
++    0,
++    viewportHeight - VIEWPORT_MARGIN - Math.max(rect.bottom, VIEWPORT_MARGIN),
++  );
++  const above = Math.max(
++    0,
++    Math.min(rect.top, viewportHeight - VIEWPORT_MARGIN) - VIEWPORT_MARGIN,
++  );
++  const openAbove = below < Math.min(menuHeight, MENU_MAX_HEIGHT) && above > below;
++  const maxHeight = Math.min(MENU_MAX_HEIGHT, openAbove ? above : below, height);
++  const top = openAbove
++    ? Math.max(
++        VIEWPORT_MARGIN,
++        Math.min(rect.top, viewportHeight - VIEWPORT_MARGIN) -
++          Math.min(menuHeight, maxHeight),
++      )
++    : Math.max(VIEWPORT_MARGIN, Math.min(rect.bottom, viewportHeight - VIEWPORT_MARGIN));
++  return { top, left, maxHeight };
++}
++
++/** Measure the rendered menu (including any dynamic sections) before painting it. */
++export function useHeaderMenuPlacement(
++  target: HeaderMenuTarget | null,
++  overlayRef: RefObject<HTMLDivElement | null>,
++) {
++  const [placement, setPlacement] = useState<{
++    target: HeaderMenuTarget;
++    position: ReturnType<typeof computeHeaderMenuPlacement>;
++  }>();
++
++  useLayoutEffect(() => {
++    if (!target || !overlayRef.current) return;
++    const overlay = overlayRef.current;
++    const menu = overlay.firstElementChild as HTMLElement | null;
++    const update = () => {
++      if (!menu) return;
++      const position = computeHeaderMenuPlacement(
++        target.rect,
++        menu.offsetWidth,
++        // scrollHeight also accounts for content that was capped by the viewport.
++        Math.min(menu.scrollHeight || menu.offsetHeight, MENU_MAX_HEIGHT),
++        window.innerWidth,
++        window.innerHeight,
++      );
++      setPlacement((previous) =>
++        previous?.target === target &&
++        previous.position.top === position.top &&
++        previous.position.left === position.left &&
++        previous.position.maxHeight === position.maxHeight
++          ? previous
++          : { target, position },
++      );
++    };
++    update();
++    window.addEventListener("resize", update);
++    const observer =
++      typeof ResizeObserver !== "undefined" ? new ResizeObserver(update) : null;
++    if (menu) observer?.observe(menu);
++    return () => {
++      window.removeEventListener("resize", update);
++      observer?.disconnect();
++    };
++  }, [target, overlayRef]);
++
++  return placement?.target === target ? placement.position : undefined;
++}

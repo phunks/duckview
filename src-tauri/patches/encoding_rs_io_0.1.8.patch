@@ -1,5 +1,5 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 452ac62..3a18c45 100644
+index 452ac62..ead61ee 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -93,7 +93,7 @@ extern crate encoding_rs;
@@ -27,7 +27,7 @@ index 452ac62..3a18c45 100644
          }
      }
  
-@@ -176,6 +178,7 @@ impl DecodeReaderBytesBuilder {
+@@ -176,11 +178,14 @@ impl DecodeReaderBytesBuilder {
              decoder: encoding,
              tiny: TinyTranscoder::new(),
              utf8_passthru: self.utf8_passthru,
@@ -35,7 +35,14 @@ index 452ac62..3a18c45 100644
              buf: buffer,
              buflen: 0,
              pos: 0,
-@@ -328,6 +331,14 @@ impl DecodeReaderBytesBuilder {
+             has_detected: has_detected,
+             exhausted: false,
++            byte_offset: 0,
++            physical_line: 1,
+         })
+     }
+ 
+@@ -328,6 +333,14 @@ impl DecodeReaderBytesBuilder {
          self.bom_sniffing = yes;
          self
      }
@@ -50,7 +57,7 @@ index 452ac62..3a18c45 100644
  }
  
  /// An implementation of `io::Read` that transcodes to UTF-8 in a streaming
-@@ -367,6 +378,8 @@ pub struct DecodeReaderBytes<R, B> {
+@@ -367,6 +380,8 @@ pub struct DecodeReaderBytes<R, B> {
      /// the UTF-8 transcoder (which will replace invalid sequences with the
      /// REPLACEMENT CHARACTER).
      utf8_passthru: bool,
@@ -59,7 +66,16 @@ index 452ac62..3a18c45 100644
      /// The internal buffer to store transcoded bytes before they are read by
      /// callers.
      buf: B,
-@@ -428,43 +441,92 @@ impl<R: io::Read, B: AsMut<[u8]>> DecodeReaderBytes<R, B> {
+@@ -378,6 +393,8 @@ pub struct DecodeReaderBytes<R, B> {
+     has_detected: bool,
+     /// Whether the underlying reader has been exhausted or not.
+     exhausted: bool,
++    byte_offset: u64,
++    physical_line: u64,
+ }
+ 
+ impl<R: io::Read, B: AsMut<[u8]>> io::Read for DecodeReaderBytes<R, B> {
+@@ -428,43 +445,102 @@ impl<R: io::Read, B: AsMut<[u8]>> DecodeReaderBytes<R, B> {
          if self.exhausted || buf.is_empty() {
              return Ok(0);
          }
@@ -113,15 +129,25 @@ index 452ac62..3a18c45 100644
 +                    .unwrap()
 +                    .decode_to_utf8_without_replacement(source, buf, false);
 +
++                let consumed_newlines = source[..nread]
++                    .iter()
++                    .filter(|&&byte| byte == b'\n')
++                    .count() as u64;
++
++                self.byte_offset += nread as u64;
++                self.physical_line += consumed_newlines;
 +                self.pos += nread;
 +
 +                if let DecoderResult::Malformed(malformed_len, trailing_len) = result {
 +                    return Err(io::Error::new(
 +                        io::ErrorKind::InvalidData,
 +                        format!(
-+                            "Invalid {} byte sequence (length {malformed_len}, \
-+                                 followed by {trailing_len} consumed byte(s)).",
++                            "Invalid {} byte sequence near physical line {} (byte offset {}, malformed length {}, trailing length {}).",
 +                            self.decoder.as_ref().unwrap().encoding().name(),
++                            self.physical_line,
++                            self.byte_offset.saturating_add(1),
++                            malformed_len,
++                            trailing_len,
 +                        ),
 +                    ));
 +                }
@@ -172,3 +198,27 @@ index 452ac62..3a18c45 100644
              }
          }
      }
+@@ -552,6 +628,23 @@ impl<R: io::Read, B: AsMut<[u8]>> DecodeReaderBytes<R, B> {
+         }
+         Ok(())
+     }
++
++    #[allow(unused)]
++    fn advance_position(&mut self, consumed: &[u8]) {
++        self.byte_offset += consumed.len() as u64;
++        self.physical_line += consumed
++            .iter()
++            .filter(|&&byte| byte == b'\n')
++            .count() as u64;
++    }
++
++    pub fn byte_offset(&self) -> u64 {
++        self.byte_offset
++    }
++
++    pub fn physical_line(&self) -> u64 {
++        self.physical_line
++    }
+ }
+ 
+ impl<R: fmt::Debug, B: fmt::Debug> fmt::Debug for DecodeReaderBytes<R, B> {

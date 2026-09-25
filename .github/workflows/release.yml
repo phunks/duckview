@@ -59,6 +59,9 @@ jobs:
         run: |
           just setup-ext
 
+      - name: Build frontend
+        run: npm run vite:build
+
       - name: Extract crate information
         shell: bash
         run: |
@@ -72,13 +75,20 @@ jobs:
 
       - name: Build application
         shell: bash
-        run: npm run tauri build -- --target ${{ matrix.job.target }}
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            npm run tauri build -- --target ${{ matrix.job.target }}
+          else
+            npm run tauri build -- --target ${{ matrix.job.target }} --no-bundle
+          fi
 
       - name: Rename artifacts
         if: runner.os != 'macOS'
         shell: bash
         run: |
-          mv src-tauri/target/${{ matrix.job.target }}/release/${{ env.PROJECT_NAME }}{,-${{ github.ref_name }}-${{ matrix.job.target }}${{ matrix.job.extension }}}
+          release_directory="src-tauri/target/${{ matrix.job.target }}/release"
+          mv "$release_directory/${PROJECT_NAME}${{ matrix.job.extension }}" \
+            "$release_directory/${PROJECT_NAME}-${GITHUB_REF_NAME}-${{ matrix.job.target }}${{ matrix.job.extension }}"
 
       - name: Package macOS application
         if: runner.os == 'macOS'
@@ -100,7 +110,7 @@ jobs:
           
           tar -C "$release_directory" -czf "$archive_path" \
             "$release_name" \
-            -C "$GITHUB_WORKSPACE" LICENSE
+            -C "$GITHUB_WORKSPACE" LICENSE licenses
 
       - name: Package Windows release
         if: runner.os == 'Windows'
@@ -110,7 +120,7 @@ jobs:
           $releaseDirectory = "src-tauri/target/${{ matrix.job.target }}/release"
           
           Compress-Archive `
-          -Path "$releaseDirectory/$releaseName.exe", "LICENSE" `
+          -Path "$releaseDirectory/$releaseName.exe", "LICENSE", "licenses" `
           -DestinationPath "$releaseDirectory/$releaseName.zip"
 
       - name: Upload Linux release archive
@@ -139,6 +149,7 @@ jobs:
 
   release:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Download release files

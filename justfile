@@ -14,6 +14,15 @@ setup-encoding_rs_io:
         "src-tauri/patches/encoding_rs_io_0.1.8.patch" \
         ""
 
+setup-streamlit_pivot_table:
+    @just --justfile "{{justfile()}}" setup-target \
+        "src/ext/streamlit-pivot-table" \
+        "src/ext/streamlit-pivot-table" \
+        "b4f822d471c82f5f5800078db1fd71f76543b63a" \
+        "https://github.com/streamlit/streamlit-pivot-table.git" \
+        "src/patches/streamlit_pivot_table-0.6.0.patch" \
+        ""
+
 setup-target clone_dir target_dir repo_rev repo_url target_patch sparse_dirs:
     mkdir -p "{{root_dir}}/ext"
     git config --global core.autocrlf false
@@ -40,4 +49,4 @@ reset-target clone_dir target_dir repo_rev target_patch:
     cd "{{root_dir}}/{{target_dir}}" && git apply --check "{{root_dir}}/{{target_patch}}"
     cd "{{root_dir}}/{{target_dir}}" && git apply "{{root_dir}}/{{target_patch}}"
 
-setup-ext: setup-encoding_rs_io
+setup-ext: setup-encoding_rs_io setup-streamlit_pivot_table

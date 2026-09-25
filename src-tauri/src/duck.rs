@@ -7,12 +7,11 @@ use crate::{
     CELL_MAX_CHARS, Condition, FileCache, FilterSpec, MAX_PAGE, SEARCH_CAP, SortSpec, is_numeric,
     normalize_read_only_sql, quote_sql_string,
 };
-use arrow::record_batch::RecordBatch;
 use arrow_ipc::writer::StreamWriter;
-use duckdb::Connection;
 use duckdb::arrow::datatypes::{DataType, SchemaRef};
+use duckdb::Connection;
 use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{State, ipc::Response};
 
 #[derive(Serialize, Clone)]
@@ -41,6 +40,41 @@ pub(crate) struct QueryColumn {
 pub(crate) struct QueryStartResponse {
     pub(crate) query_id: String,
     pub(crate) columns: Vec<QueryColumn>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PivotFilterValuesResponse {
+    pub(crate) values: Vec<String>,
+    pub(crate) exceeds_limit: bool,
+    pub(crate) limit: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PivotRequest {
+    source_name: String,
+    #[serde(default)]
+    rows: Vec<String>,
+    #[serde(default)]
+    cols: Vec<String>,
+    values: Vec<PivotValue>,
+    #[serde(default)]
+    exclusions: HashMap<String, Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PivotValue {
+    #[serde(default)]
+    pub(crate) column: String,
+    pub(crate) aggregation: String,
+    #[serde(default = "default_pivot_numeric_mode")]
+    numeric_mode: String,
+}
+
+fn default_pivot_numeric_mode() -> String {
+    "auto".to_string()
 }
 
 #[derive(Serialize)]
@@ -609,24 +643,221 @@ pub(crate) fn get_duckdb_table_columns(
 }
 
 #[tauri::command]
-pub(crate) fn execute_duckdb_query(
+pub(crate) fn get_duckdb_pivot_filter_values(
     duckdb: State<'_, DuckDbState>,
+    source_name: String,
+    column_name: String,
+    limit: usize,
+) -> Result<PivotFilterValuesResponse, String> {
+    const MAX_PIVOT_FILTER_VALUES: usize = 50_000;
+
+    let source_name = source_name.trim().to_string();
+    let column_name = column_name.trim().to_string();
+
+    if source_name.is_empty() {
+        return Err("A Pivot source table or view is required.".to_string());
+    }
+
+    if column_name.is_empty() {
+        return Err("A Pivot filter column is required.".to_string());
+    }
+
+    if limit == 0 || limit > MAX_PIVOT_FILTER_VALUES {
+        return Err(format!(
+            "Pivot filter value limit must be between 1 and {MAX_PIVOT_FILTER_VALUES}."
+        ));
+    }
+
+    if !duckdb
+        .tables_by_path
+        .lock()
+        .unwrap()
+        .values()
+        .any(|table| table.name == source_name)
+    {
+        return Err(format!("Pivot source \"{source_name}\" is not available."));
+    }
+
+    let source_sql = quote_sql_identifier(&source_name);
+    let column_sql = quote_sql_identifier(&column_name);
+
+    {
+        let describe_sql = format!("DESCRIBE {source_sql}");
+        let connection = duckdb.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare(&describe_sql)
+            .map_err(|error| format!("Could not describe Pivot source: {error}"))?;
+        let mut rows = statement
+            .query([])
+            .map_err(|error| format!("Could not read Pivot source schema: {error}"))?;
+
+        let mut found = false;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("Could not read Pivot source schema: {error}"))?
+        {
+            let name: String = row
+                .get(0)
+                .map_err(|error| format!("Could not read Pivot column name: {error}"))?;
+
+            if name == column_name {
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Err(format!(
+                "Pivot filter field \"{column_name}\" does not exist."
+            ));
+        }
+    }
+
+    let fetch_limit = limit + 1;
+    let sql = format!(
+        "SELECT DISTINCT CAST({column_sql} AS VARCHAR) AS value
+         FROM {source_sql}
+         WHERE {column_sql} IS NOT NULL
+         ORDER BY value
+         LIMIT {fetch_limit}"
+    );
+
+    let connection = duckdb.connection.lock().unwrap();
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| format!("Could not load Pivot filter values: {error}"))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| format!("Could not load Pivot filter values: {error}"))?;
+
+    let mut values = Vec::with_capacity(fetch_limit);
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("Could not read Pivot filter values: {error}"))?
+    {
+        values.push(
+            row.get(0)
+                .map_err(|error| format!("Could not read Pivot filter value: {error}"))?,
+        );
+    }
+
+    let exceeds_limit = values.len() > limit;
+
+    if exceeds_limit {
+        values.clear();
+    }
+
+    Ok(PivotFilterValuesResponse {
+        values,
+        exceeds_limit,
+        limit,
+    })
+}
+
+fn is_duckdb_numeric_type(type_name: &str) -> bool {
+    let type_name = type_name.trim().to_ascii_uppercase();
+
+    matches!(
+        type_name.as_str(),
+        "TINYINT"
+            | "SMALLINT"
+            | "INTEGER"
+            | "INT"
+            | "BIGINT"
+            | "HUGEINT"
+            | "UTINYINT"
+            | "USMALLINT"
+            | "UINTEGER"
+            | "UBIGINT"
+            | "UHUGEINT"
+            | "FLOAT"
+            | "REAL"
+            | "DOUBLE"
+    ) || type_name.starts_with("DECIMAL")
+        || type_name.starts_with("NUMERIC")
+}
+
+fn pivot_numeric_expression(
+    column_sql: &str,
+    type_name: &str,
+    numeric_mode: &str,
+) -> Result<String, String> {
+    match numeric_mode {
+        "auto" if is_duckdb_numeric_type(type_name) => Ok(column_sql.to_string()),
+        "auto" | "strict" => Ok(format!("TRY_CAST({column_sql} AS DOUBLE)")),
+        "japanese_statistics" => Ok(format!(
+            "TRY_CAST(
+                CASE
+                    WHEN TRIM(CAST({column_sql} AS VARCHAR))
+                        IN ('', '-', '－', '―', '–', '・', '…')
+                    THEN NULL
+                    ELSE REPLACE(TRIM(CAST({column_sql} AS VARCHAR)), ',', '')
+                END
+                AS DOUBLE
+            )"
+        )),
+        other => Err(format!("Unsupported Pivot numeric mode: {other}")),
+    }
+}
+
+fn pivot_aggregate_expression(
+    value: &PivotValue,
+    type_name: &str,
+) -> Result<String, String> {
+    let aggregation = value.aggregation.trim().to_ascii_lowercase();
+
+    if value.column.trim().is_empty() {
+        return match aggregation.as_str() {
+            "count" => Ok("COUNT(*)".to_string()),
+            _ => Err(format!(
+                "Pivot aggregation \"{}\" requires a value field.",
+                value.aggregation
+            )),
+        };
+    }
+
+    let column_sql = quote_sql_identifier(&value.column);
+
+    match aggregation.as_str() {
+        "count" => Ok(format!("COUNT({column_sql})")),
+        "count_distinct" => Ok(format!("COUNT(DISTINCT {column_sql})")),
+        "sum" | "avg" | "min" | "max" => {
+            let numeric_sql =
+                pivot_numeric_expression(&column_sql, type_name, &value.numeric_mode)?;
+
+            let function = match aggregation.as_str() {
+                "sum" => "SUM",
+                "avg" => "AVG",
+                "min" => "MIN",
+                _ => "MAX",
+            };
+
+            Ok(format!("{function}({numeric_sql})"))
+        }
+        other => Err(format!("Unsupported Pivot aggregation: {other}")),
+    }
+}
+
+fn create_duckdb_query_session(
+    duckdb: &DuckDbState,
     sql: String,
 ) -> Result<QueryStartResponse, String> {
-    let sql = normalize_read_only_sql(&sql)?;
     let probe_sql = format!("SELECT * FROM ({sql}) AS duckview_result LIMIT 0");
 
     let connection = duckdb.connection.lock().unwrap();
     let mut statement = connection
         .prepare(&probe_sql)
-        .map_err(|e| format!("SQL error: {e}"))?;
+        .map_err(|error| format!("SQL error: {error}"))?;
 
     {
-        let rows = statement.query([]).map_err(|e| format!("SQL error: {e}"))?;
+        let rows = statement
+            .query([])
+            .map_err(|error| format!("SQL error: {error}"))?;
         drop(rows);
     }
 
-    let columns: Vec<_> = statement
+    let columns = statement
         .column_names()
         .iter()
         .map(|name| QueryColumn {
@@ -634,7 +865,7 @@ pub(crate) fn execute_duckdb_query(
             type_name: "value".to_string(),
             numeric: false,
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     drop(statement);
     drop(connection);
@@ -655,6 +886,190 @@ pub(crate) fn execute_duckdb_query(
     Ok(QueryStartResponse { query_id, columns })
 }
 
+#[tauri::command]
+pub(crate) fn execute_duckdb_pivot(
+    duckdb: State<'_, DuckDbState>,
+    request: PivotRequest,
+) -> Result<QueryStartResponse, String> {
+    const MAX_GROUP_COLUMNS: usize = 16;
+    const MAX_VALUES: usize = 8;
+    const MAX_EXCLUSIONS_PER_COLUMN: usize = 5_000;
+
+    let source_name = request.source_name.trim().to_string();
+
+    if source_name.is_empty() {
+        return Err("A Pivot source table or view is required.".to_string());
+    }
+
+    if request.rows.len() + request.cols.len() > MAX_GROUP_COLUMNS {
+        return Err(format!(
+            "A Pivot can contain at most {MAX_GROUP_COLUMNS} row and column fields."
+        ));
+    }
+
+    if request.values.is_empty() {
+        return Err("Add at least one value field to the Pivot.".to_string());
+    }
+
+    if request.values.len() > MAX_VALUES {
+        return Err(format!(
+            "A Pivot can contain at most {MAX_VALUES} value fields."
+        ));
+    }
+
+    if !duckdb
+        .tables_by_path
+        .lock()
+        .unwrap()
+        .values()
+        .any(|table| table.name == source_name)
+    {
+        return Err(format!("Pivot source \"{source_name}\" is not available."));
+    }
+
+    let source_sql = quote_sql_identifier(&source_name);
+    let describe_sql = format!("DESCRIBE {source_sql}");
+
+    let column_types = {
+        let connection = duckdb.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare(&describe_sql)
+            .map_err(|error| format!("Could not describe Pivot source: {error}"))?;
+        let mut rows = statement
+            .query([])
+            .map_err(|error| format!("Could not describe Pivot source: {error}"))?;
+
+        let mut types = HashMap::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("Could not read Pivot source schema: {error}"))?
+        {
+            let name: String = row
+                .get(0)
+                .map_err(|error| format!("Could not read Pivot column name: {error}"))?;
+            let type_name: String = row
+                .get(1)
+                .map_err(|error| format!("Could not read Pivot column type: {error}"))?;
+            types.insert(name, type_name);
+        }
+        types
+    };
+
+    let mut group_columns = request.rows;
+    group_columns.extend(request.cols);
+
+    let mut seen_columns = std::collections::HashSet::new();
+    for column in &group_columns {
+        if !seen_columns.insert(column.as_str()) {
+            return Err(format!("Pivot field \"{column}\" is used more than once."));
+        }
+
+        if !column_types.contains_key(column) {
+            return Err(format!("Pivot field \"{column}\" does not exist."));
+        }
+    }
+
+    let mut projection = group_columns
+        .iter()
+        .map(|column| quote_sql_identifier(column))
+        .collect::<Vec<_>>();
+
+    for (index, value) in request.values.iter().enumerate() {
+        let aggregation = value.aggregation.trim().to_ascii_lowercase();
+        let type_name = if value.column.trim().is_empty() && aggregation == "count" {
+            ""
+        } else {
+            column_types
+                .get(&value.column)
+                .ok_or_else(|| {
+                    format!("Pivot value field \"{}\" does not exist.", value.column)
+                })?
+        };
+
+        let expression = pivot_aggregate_expression(value, type_name)?;
+        projection.push(format!("{expression} AS {}", quote_sql_identifier(&format!(
+            "value_{}",
+            index + 1
+        ))));
+    }
+
+    let mut predicates = Vec::new();
+    for (column, excluded_values) in request.exclusions {
+        if !column_types.contains_key(&column) {
+            return Err(format!("Pivot filter field \"{column}\" does not exist."));
+        }
+
+        if excluded_values.len() > MAX_EXCLUSIONS_PER_COLUMN {
+            return Err(format!(
+                "Pivot filter \"{column}\" contains too many excluded values."
+            ));
+        }
+
+        if excluded_values.is_empty() {
+            continue;
+        }
+
+        let values = excluded_values
+            .iter()
+            .map(|value| quote_sql_string(value))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        predicates.push(format!(
+            "CAST({} AS VARCHAR) NOT IN ({values})",
+            quote_sql_identifier(&column)
+        ));
+    }
+
+    let where_sql = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", predicates.join(" AND "))
+    };
+
+    let group_by_sql = if group_columns.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " GROUP BY {}",
+            group_columns
+                .iter()
+                .map(|column| quote_sql_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    let order_by_sql = if group_columns.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ORDER BY {}",
+            group_columns
+                .iter()
+                .map(|column| quote_sql_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    let sql = format!(
+        "SELECT {} FROM {source_sql}{where_sql}{group_by_sql}{order_by_sql}",
+        projection.join(", "),
+    );
+
+    create_duckdb_query_session(&duckdb, sql)
+}
+
+#[tauri::command]
+pub(crate) fn execute_duckdb_query(
+    duckdb: State<'_, DuckDbState>,
+    sql: String,
+) -> Result<QueryStartResponse, String> {
+    let sql = normalize_read_only_sql(&sql)?;
+    create_duckdb_query_session(&duckdb, sql)
+}
+
 fn format_arrow_cell(formatter: &ArrayFormatter<'_>, data_type: &DataType, row: usize) -> String {
     match data_type {
         DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
@@ -671,13 +1086,27 @@ pub(crate) fn get_duckdb_query_rows_arrow(
     offset: usize,
     limit: usize,
 ) -> Result<Response, String> {
+    Ok(Response::new(get_duckdb_query_rows_arrow_bytes(
+        &duckdb,
+        &query_id,
+        offset,
+        limit,
+    )?))
+}
+
+pub(crate) fn get_duckdb_query_rows_arrow_bytes(
+    duckdb: &DuckDbState,
+    query_id: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
     let limit = limit.min(MAX_PAGE);
 
     let sql = duckdb
         .queries
         .lock()
         .unwrap()
-        .get(&query_id)
+        .get(query_id)
         .map(|query| query.sql.clone())
         .ok_or("Query result is no longer available.")?;
 
@@ -690,43 +1119,24 @@ pub(crate) fn get_duckdb_query_rows_arrow(
         .prepare(&page_sql)
         .map_err(|error| format!("SQL error: {error}"))?;
 
-    let arrow_started = std::time::Instant::now();
-
     let batches = statement
         .query_arrow([])
         .map_err(|error| format!("SQL error: {error}"))?;
 
-    let arrow_iterator_ready = std::time::Instant::now();
-
-    let batches: Vec<RecordBatch> = batches.collect();
-
-    let arrow_batches_ready = std::time::Instant::now();
-
-    eprintln!(
-        "[duckview] DuckDB Arrow: create-iterator={} ms, collect-batches={} ms",
-        arrow_iterator_ready
-            .duration_since(arrow_started)
-            .as_millis(),
-        arrow_batches_ready
-            .duration_since(arrow_iterator_ready)
-            .as_millis(),
-    );
-
-    let schema = batches
-        .first()
-        .map(|batch| batch.schema())
-        .ok_or("Could not determine the Arrow schema for this result.")?;
-
+    let schema = batches.get_schema();
     let mut bytes = Vec::new();
     let ipc_started = std::time::Instant::now();
-
+    let mut batch_count = 0;
+    let mut row_count = 0;
     {
         let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref())
             .map_err(|error| format!("Could not encode Arrow IPC stream: {error}"))?;
 
-        for batch in &batches {
+        for batch in batches {
+            batch_count += 1;
+            row_count += batch.num_rows();
             writer
-                .write(batch)
+                .write(&batch)
                 .map_err(|error| format!("Could not encode Arrow batch: {error}"))?;
         }
 
@@ -737,14 +1147,54 @@ pub(crate) fn get_duckdb_query_rows_arrow(
 
     eprintln!(
         "[duckview] Arrow page: batches={}, rows={}, ipc-encode={} ms, payload={:.2} MiB",
-        batches.len(),
-        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-        // query_finished.duration_since(query_started).as_millis(),
+        batch_count,
+        row_count,
         ipc_started.elapsed().as_millis(),
         bytes.len() as f64 / (1024.0 * 1024.0),
     );
 
-    Ok(Response::new(bytes))
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod arrow_page_tests {
+    use super::*;
+    use arrow_ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    #[test]
+    fn arrow_pages_round_trip_as_ipc_streams() {
+        let duckdb = DuckDbState::new().unwrap();
+        duckdb.queries.lock().unwrap().insert(
+            "test".to_owned(),
+            QuerySession {
+                sql: "SELECT i, i * 2 AS amount FROM range(2500) t(i)".to_owned(),
+                column_count: 2,
+            },
+        );
+
+        for (offset, limit, expected_rows) in [
+            (0, 1000, 1001),
+            (0, 2500, 2500),
+            (2400, 100, 100),
+            (2500, 100, 0),
+        ] {
+            let bytes = get_duckdb_query_rows_arrow_bytes(&duckdb, "test", offset, limit).unwrap();
+            let reader = StreamReader::try_new(Cursor::new(bytes), None).unwrap();
+            assert_eq!(reader.schema().fields().len(), 2);
+            let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(
+                batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                expected_rows
+            );
+            if limit == 2500 {
+                assert!(batches.len() > 1, "expected multiple DuckDB Arrow batches");
+            }
+            if expected_rows > 0 {
+                assert_eq!(batches[0].schema().field(0).name(), "i");
+            }
+        }
+    }
 }
 
 #[tauri::command]

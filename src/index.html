@@ -60,6 +60,17 @@
     </div>
     <div id="appMenuBackdrop" class="app-menu-backdrop"></div>
 
+    <div
+      id="sqlTableContextMenu"
+      class="sql-table-context-menu"
+      role="menu"
+      aria-label="Table actions"
+    ></div>
+    <div
+      id="sqlTableContextMenuBackdrop"
+      class="sql-table-context-menu-backdrop"
+    ></div>
+
     <nav id="tabBar" class="tab-bar hidden" aria-label="Open files"></nav>
 
     <!-- SQL workspace -->
@@ -78,30 +89,30 @@
             <div class="sql-editor-actions">
               <span id="sqlReadOnly" class="sql-read-only">READ ONLY</span>
               <button
-                      id="sqlRunBtn"
-                      class="btn primary"
-                      type="button"
-                      title="Execute SQL at cursor position（⌘↵）"
+                id="sqlRunBtn"
+                class="btn primary"
+                type="button"
+                title="Execute SQL at cursor position（⌘↵）"
               >Run</button>
               <button id="sqlExportBtn" class="btn ghost" type="button" disabled>Export…</button>
             </div>
           </div>
           <div
-                  id="sqlEditor"
-                  class="sql-editor"
-                  aria-label="SQL query"
+            id="sqlEditor"
+            class="sql-editor"
+            aria-label="SQL query"
           ></div>
           <div id="sqlError" class="sql-error hidden"></div>
         </section>
       </section>
 
       <div
-              id="sqlPaneSplitter"
-              class="sql-pane-splitter"
-              role="separator"
-              aria-label="Resize SQL editor and result panes"
-              aria-orientation="horizontal"
-              tabindex="0"
+        id="sqlPaneSplitter"
+        class="sql-pane-splitter"
+        role="separator"
+        aria-label="Resize SQL editor and result panes"
+        aria-orientation="horizontal"
+        tabindex="0"
       ></div>
 
       <section class="sql-result-pane">
@@ -112,15 +123,39 @@
           </div>
         </div>
         <nav
-                id="sqlResultTabs"
-                class="sql-result-tabs hidden"
-                aria-label="SQL query results"
+          id="sqlResultTabs"
+          class="sql-result-tabs hidden"
+          aria-label="SQL query results"
         ></nav>
         <div id="sqlResultBody" class="sql-result-body">
           <div class="sql-result-empty">
             Write a query above, then press <kbd>⌘</kbd><kbd>↵</kbd>.
           </div>
         </div>
+      </section>
+    </main>
+
+    <main id="pivotWorkspace" class="pivot-workspace hidden">
+      <header class="pivot-workspace-head">
+        <div>
+          <div id="pivotTitle" class="sql-pane-title">Pivot</div>
+          <div id="pivotSource" class="pivot-source"></div>
+        </div>
+        <button id="pivotRefreshBtn" class="btn primary" type="button">
+          Refresh
+        </button>
+      </header>
+
+      <section class="pivot-workspace-body">
+        <aside class="pivot-fields-pane hidden" aria-hidden="true">
+          <div class="sql-pane-title">Fields</div>
+          <div id="pivotFields" class="pivot-fields"></div>
+        </aside>
+        <section id="pivotContent" class="pivot-content">
+          <div id="pivotStatus" class="pivot-status"></div>
+          <div id="pivotUiHost" class="pivot-ui-host"></div>
+          <div id="pivotResultHost" class="pivot-result-host"></div>
+        </section>
       </section>
     </main>
 
@@ -240,6 +275,18 @@
         </div>
         <div class="set-row">
           <div class="set-label">
+            <span>Maximum Pivot source rows</span>
+            <small>Client-side Pivot row limit. Higher values use more memory; refresh the Pivot after changing.</small>
+          </div>
+          <select id="setClientPivotRows" class="select">
+            <option value="10000">10,000 rows</option>
+            <option value="50000">50,000 rows</option>
+            <option value="100000">100,000 rows</option>
+            <option value="500000">500,000 rows</option>
+          </select>
+        </div>
+        <div class="set-row">
+          <div class="set-label">
             <span>CSV conversion profile</span>
             <small>Controls memory use, Parquet row groups, and compression.</small>
           </div>
@@ -291,12 +338,12 @@
             <small>For example, https://api.openai.com/v1</small>
           </div>
           <input
-                  id="setAiBaseUrl"
-                  class="settings-text-input"
-                  type="url"
-                  inputmode="url"
-                  spellcheck="false"
-                  autocomplete="url"
+            id="setAiBaseUrl"
+            class="settings-text-input"
+            type="url"
+            inputmode="url"
+            spellcheck="false"
+            autocomplete="url"
           />
         </div>
         <div class="set-row">
@@ -305,11 +352,11 @@
             <small>For example, gpt-5-mini.</small>
           </div>
           <input
-                  id="setAiModel"
-                  class="settings-text-input"
-                  type="text"
-                  spellcheck="false"
-                  autocomplete="off"
+            id="setAiModel"
+            class="settings-text-input"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
           />
         </div>
         <div class="set-row">
@@ -318,13 +365,13 @@
             <small>Optional. Example: http://127.0.0.1:8080</small>
           </div>
           <input
-                  id="setAiProxyUrl"
-                  class="settings-text-input"
-                  type="url"
-                  inputmode="url"
-                  spellcheck="false"
-                  autocomplete="off"
-                  placeholder="No proxy"
+            id="setAiProxyUrl"
+            class="settings-text-input"
+            type="url"
+            inputmode="url"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="No proxy"
           />
         </div>
         <div class="set-row">
@@ -344,12 +391,12 @@
           </div>
           <div class="ai-api-key-controls">
             <input
-                    id="setAiApiKey"
-                    class="settings-text-input ai-api-key-input"
-                    type="password"
-                    spellcheck="false"
-                    autocomplete="new-password"
-                    placeholder="Paste a new key"
+              id="setAiApiKey"
+              class="settings-text-input ai-api-key-input"
+              type="password"
+              spellcheck="false"
+              autocomplete="new-password"
+              placeholder="Paste a new key"
             />
             <button id="saveAiApiKeyBtn" class="btn ghost" type="button">Save</button>
             <button id="deleteAiApiKeyBtn" class="btn ghost" type="button">Remove</button>
@@ -368,20 +415,20 @@
 
     <div id="workspaceDialogBackdrop" class="modal-backdrop"></div>
     <div
-            id="workspaceDialog"
-            class="settings-win workspace-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="workspaceDialogTitle"
+      id="workspaceDialog"
+      class="settings-win workspace-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="workspaceDialogTitle"
     >
       <div class="win-head">
         <h2 id="workspaceDialogTitle">Workspace</h2>
         <button
-                id="workspaceDialogClose"
-                class="icon-btn"
-                type="button"
-                title="Cancel"
-                aria-label="Cancel"
+          id="workspaceDialogClose"
+          class="icon-btn"
+          type="button"
+          title="Cancel"
+          aria-label="Cancel"
         >✕</button>
       </div>
       <div class="win-body">
@@ -389,11 +436,11 @@
         <label id="workspaceDialogInputRow" class="workspace-dialog-input-row">
           <span>Workspace name</span>
           <input
-                  id="workspaceDialogInput"
-                  class="workspace-dialog-input"
-                  type="text"
-                  maxlength="100"
-                  autocomplete="off"
+            id="workspaceDialogInput"
+            class="workspace-dialog-input"
+            type="text"
+            maxlength="100"
+            autocomplete="off"
           />
         </label>
         <div class="workspace-dialog-actions">
@@ -405,20 +452,20 @@
 
     <div id="exportFormatBackdrop" class="modal-backdrop"></div>
     <div
-            id="exportFormatWin"
-            class="settings-win export-format-win"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Export format"
+      id="exportFormatWin"
+      class="settings-win export-format-win"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Export format"
     >
       <div class="win-head">
         <h2>Export result</h2>
         <button
-                id="exportFormatClose"
-                class="icon-btn"
-                type="button"
-                title="Close"
-                aria-label="Close"
+          id="exportFormatClose"
+          class="icon-btn"
+          type="button"
+          title="Close"
+          aria-label="Close"
         >✕</button>
       </div>
       <div class="win-body">
@@ -427,39 +474,39 @@
         </p>
         <div class="export-format-options">
           <button
-                  id="exportParquetBtn"
-                  class="btn primary"
-                  type="button"
+            id="exportParquetBtn"
+            class="btn primary"
+            type="button"
           >Parquet</button>
           <button
-                  id="exportCsvBtn"
-                  class="btn ghost"
-                  type="button"
+            id="exportCsvBtn"
+            class="btn ghost"
+            type="button"
           >CSV UTF-8</button>
           <button
-                  id="exportExcelCsvBtn"
-                  class="btn ghost"
-                  type="button"
+            id="exportExcelCsvBtn"
+            class="btn ghost"
+            type="button"
           >CSV UTF-8 (Excel)</button>
         </div>
       </div>
     </div>
 
     <div
-            id="csvImportWin"
-            class="settings-win csv-import-win"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="csvImportTitle"
+      id="csvImportWin"
+      class="settings-win csv-import-win"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="csvImportTitle"
     >
       <div class="win-head">
         <h2 id="csvImportTitle">Import CSV</h2>
         <button
-                id="csvImportClose"
-                class="icon-btn"
-                type="button"
-                title="Cancel"
-                aria-label="Cancel"
+          id="csvImportClose"
+          class="icon-btn"
+          type="button"
+          title="Cancel"
+          aria-label="Cancel"
         >✕</button>
       </div>
       <div class="win-body">
@@ -504,21 +551,21 @@
 
     <div id="csvImportErrorBackdrop" class="modal-backdrop"></div>
     <div
-            id="csvImportErrorWin"
-            class="settings-win csv-import-error-win"
-            role="alertdialog"
-            aria-modal="true"
-            aria-labelledby="csvImportErrorTitle"
-            aria-describedby="csvImportErrorMessage"
+      id="csvImportErrorWin"
+      class="settings-win csv-import-error-win"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="csvImportErrorTitle"
+      aria-describedby="csvImportErrorMessage"
     >
       <div class="win-head">
         <h2 id="csvImportErrorTitle">CSV import failed</h2>
         <button
-                id="csvImportErrorClose"
-                class="icon-btn"
-                type="button"
-                title="Close"
-                aria-label="Close"
+          id="csvImportErrorClose"
+          class="icon-btn"
+          type="button"
+          title="Close"
+          aria-label="Close"
         >✕</button>
       </div>
       <div class="win-body">
@@ -527,9 +574,9 @@
           need to adjust the import settings or inspect the source file.
         </p>
         <pre
-                id="csvImportErrorMessage"
-                class="csv-import-error-message"
-                tabindex="0"
+          id="csvImportErrorMessage"
+          class="csv-import-error-message"
+          tabindex="0"
         ></pre>
         <div class="csv-import-actions">
           <button id="csvImportErrorCopyBtn" class="btn ghost" type="button">

@@ -2,7 +2,18 @@ import * as monacoApi from "monaco-editor";
 import "monaco-editor/esm/vs/basic-languages/monaco.contribution";
 import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
 import { writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
-import { tableFromIPC } from "@apache-arrow/ts";
+import { tableFromIPC } from "apache-arrow";
+import { lockResultColumnWidths, resizeResultColumn } from "./sql/resultColumnWidths.js";
+import { resultWindow } from "./sql/resultWindow.js";
+import { abbreviateFieldLabel } from "./pivot/labels.ts";
+import { drilldownViewName, drilldownViewSql } from "./pivot/drilldownView.ts";
+import { savedPivotTabs, restoredPivotDefinitions } from "./pivot/workspaceSnapshot.js";
+import { clientPivotRowLimit, clientPivotSourceSql, fetchClientPivotSource, DEFAULT_CLIENT_PIVOT_ROWS } from "./pivot/clientSource.js";
+import {
+  clientPivotRangeError,
+  selectedStandalonePivotValues,
+} from "./pivot/numericSafety.ts";
+
 import { format } from "sql-formatter";
 import {
   LanguageIdEnum,
@@ -164,7 +175,9 @@ function arrowTableToRows(table, limit) {
 let ROW_H = 30; // updated by the density setting
 const HEADER_H = 34;
 const GUTTER_W = 66;
-const PAGE = 200; // rows in one vertical page
+// SQL result pages use the Arrow custom protocol, so amortize its fixed request
+// cost across a larger batch while remaining below the backend's 10,000-row cap.
+const PAGE = 2_000; // rows in one SQL result page
 const COLUMN_PAGE = 64; // Parquet columns read in one projection
 const BUFFER = 8; // extra rows rendered above/below the viewport
 const COLUMN_BUFFER = 3; // columns rendered just outside the horizontal viewport
@@ -191,6 +204,17 @@ const sqlTitle = $("sqlTitle");
 const sqlTables = $("sqlTables");
 const sqlEditorEl = $("sqlEditor");
 const sqlEditorPane = $("sqlEditorPane");
+
+const pivotWorkspace = $("pivotWorkspace");
+const pivotTitle = $("pivotTitle");
+const pivotSource = $("pivotSource");
+const pivotRefreshBtn = $("pivotRefreshBtn");
+const pivotFields = $("pivotFields");
+const pivotContent = $("pivotContent");
+const pivotStatus = $("pivotStatus");
+const pivotUiHost = $("pivotUiHost");
+const pivotResultHost = $("pivotResultHost");
+
 const sqlPaneSplitter = $("sqlPaneSplitter");
 const sqlRunBtn = $("sqlRunBtn");
 const sqlExportBtn = $("sqlExportBtn");
@@ -244,6 +268,8 @@ const csvImportErrorCopyBtn = $("csvImportErrorCopyBtn");
 const appMenuBtn = $("appMenuBtn");
 const appMenu = $("appMenu");
 const appMenuBackdrop = $("appMenuBackdrop");
+const sqlTableContextMenu = $("sqlTableContextMenu");
+const sqlTableContextMenuBackdrop = $("sqlTableContextMenuBackdrop");
 const menuOpenBtn = $("menuOpenBtn");
 const menuSettingsBtn = $("menuSettingsBtn");
 const menuNewWorkspaceBtn = $("menuNewWorkspaceBtn");
@@ -265,6 +291,7 @@ const setFont = $("setFont");
 const setAutoFit = $("setAutoFit");
 const setCase = $("setCase");
 const setDuckDbMemoryLimit = $("setDuckDbMemoryLimit");
+const setClientPivotRows = $("setClientPivotRows");
 const setCsvImportMaxSize = $("setCsvImportMaxSize");
 const setCsvMaxLineSize = $("setCsvMaxLineSize");
 const setCsvConversionProfile = $("setCsvConversionProfile");
@@ -312,6 +339,7 @@ let rafPending = false;
 let pendingCsvImportPath = null;
 let sqlPaneResizeState = null;
 let workspaceDialogResolve = null;
+let sqlTableContextMenuState = null;
 
 // Wait until scroll input has settled before reading Parquet pages. This avoids
 // queuing expensive requests for every intermediate scrollbar position.
@@ -324,8 +352,12 @@ let sqlCompletionTables = [];
 let pendingSqlEditorValue = null;
 const sqlTableColumns = new Map();
 const sqlTableColumnRequests = new Map();
+const pivotFilterValueRequests = new Map();
 let aiInlineSuggestion = null;
 let aiSuggestionRequestId = 0;
+
+let pivotReactHandle = null;
+let pivotReactMountToken = 0;
 
 const SQL_KEYWORDS = [
   "SELECT",
@@ -391,6 +423,7 @@ function emptyWorkspaceSnapshot() {
   return {
     parquetPaths: [],
     sqlTabs: [],
+    pivotTabs: [],
     savedViews: [],
     activeTabRef: null,
   };
@@ -631,6 +664,7 @@ function workspaceSnapshot() {
   const parquetPaths = [];
   const sqlTabs = [];
   let activeTabRef = null;
+  const pivots = savedPivotTabs(tabs.values(), activeTabId);
 
   for (const tab of tabs.values()) {
     if (tab.kind === "parquet") {
@@ -657,8 +691,9 @@ function workspaceSnapshot() {
   return {
     parquetPaths,
     sqlTabs,
+    pivotTabs: pivots.pivotTabs,
     savedViews: Array.from(workspaceViews.values()),
-    activeTabRef,
+    activeTabRef: pivots.activeTabRef ?? activeTabRef,
   };
 }
 
@@ -713,7 +748,42 @@ async function saveWorkspaceAs() {
   showToast(`Workspace “${workspace.name}” created.`);
 }
 
+function pivotFilterCacheKey(sourceName, columnName, limit) {
+  return `${sourceName}\u0000${columnName}\u0000${limit}`;
+}
+
+async function getPivotFilterValues(sourceName, columnName) {
+  const limit = Number.isInteger(settings?.pivotFilterValueLimit)
+      ? settings.pivotFilterValueLimit
+      : 500;
+  const cacheKey = pivotFilterCacheKey(sourceName, columnName, limit);
+
+  if (!pivotFilterValueRequests.has(cacheKey)) {
+    const request = invoke("get_duckdb_pivot_filter_values", {
+      sourceName,
+      columnName,
+      limit,
+    })
+        .catch((error) => ({
+          values: [],
+          exceedsLimit: true,
+          limit,
+          error: String(error),
+        }))
+        .finally(() => {
+          pivotFilterValueRequests.delete(cacheKey);
+        });
+
+    pivotFilterValueRequests.set(cacheKey, request);
+  }
+
+  return pivotFilterValueRequests.get(cacheKey);
+}
+
 function resetWorkspaceUi() {
+  pivotReactMountToken++;
+  pivotReactHandle?.unmount();
+  pivotReactHandle = null;
   activeTabId = null;
   currentPath = null;
   fileMeta = null;
@@ -731,6 +801,7 @@ function resetWorkspaceUi() {
   sqlCompletionTables = [];
   sqlTableColumns.clear();
   sqlTableColumnRequests.clear();
+  pivotFilterValueRequests.clear();
 
   rows.innerHTML = "";
   headerRow.innerHTML = "";
@@ -741,6 +812,7 @@ function resetWorkspaceUi() {
   emptyEl.classList.remove("hidden");
   tableWrap.classList.add("hidden");
   sqlWorkspace.classList.add("hidden");
+  pivotWorkspace.classList.add("hidden");
   statusBar.classList.add("hidden");
   tabBar.classList.add("hidden");
   metaBtn.classList.add("hidden");
@@ -971,6 +1043,15 @@ async function restoreWorkspaceSnapshot(saved) {
     sqlTabIds.push(tab.id);
   }
 
+  const pivotTabIds = new Map();
+  for (const item of restoredPivotDefinitions(snapshot)) {
+    const tab = createPivotTab({ name: item.sourceName, is_view: item.sourceIsView });
+    tab.title = item.title;
+    tab.standaloneConfig = item.standaloneConfig;
+    tabs.set(tab.id, tab);
+    pivotTabIds.set(item.index, tab.id);
+  }
+
   let tabToActivate = null;
   if (activeRef?.kind === "parquet") {
     tabToActivate = tabs.get(parquetTabIds.get(activeRef.path) || "");
@@ -980,12 +1061,19 @@ async function restoreWorkspaceSnapshot(saved) {
       activeRef.index >= 0
   ) {
     tabToActivate = tabs.get(sqlTabIds[activeRef.index] || "");
+  } else if (
+      activeRef?.kind === "pivot" &&
+      Number.isInteger(activeRef.index) &&
+      activeRef.index >= 0
+  ) {
+    tabToActivate = tabs.get(pivotTabIds.get(activeRef.index) || "");
   }
 
   tabToActivate =
       tabToActivate ||
       tabs.get(parquetTabIds.values().next().value || "") ||
-      tabs.get(sqlTabIds[0] || "");
+      tabs.get(sqlTabIds[0] || "") ||
+      tabs.get(pivotTabIds.values().next().value || "");
 
   if (tabToActivate) {
     restoreTabState(tabToActivate);
@@ -1068,6 +1156,68 @@ function createSqlTab() {
     resultStatus: "Run a query to see results.",
     editorPaneHeight: null,
   };
+}
+
+function createPivotTab(source) {
+  return {
+    id: `pivot-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    kind: "pivot",
+    title: `Pivot: ${source.name}`,
+    sourceName: source.name,
+    sourceIsView: Boolean(source.is_view),
+    columns: null,
+    config: {
+      rows: [],
+      cols: [],
+      vals: [],
+      aggregatorName: "Count",
+      exclusions: {},
+    },
+    queryId: null,
+    arrowTable: null,
+    resultColumns: null,
+    rows: null,
+    hasMore: false,
+    loading: false,
+    error: null,
+    dirty: true,
+  };
+}
+
+function openPivotTab(source) {
+  const tab = createPivotTab(source);
+  tabs.set(tab.id, tab);
+  if (activeTab()) saveActiveTabState();
+  restoreTabState(tab);
+  queueWorkspaceSave();
+}
+
+async function loadPivotSource(tab) {
+  if (tab.loading) return;
+  tab.loading = true;
+  tab.error = null;
+  tab.arrowTable = null;
+  if (activeTabId === tab.id) renderPivotTab(tab);
+
+  try {
+    const sources = await invoke("list_duckdb_tables");
+    if (!sources.some((source) => source.name === tab.sourceName)) {
+      throw new Error(`Pivot source “${tab.sourceName}” is not available. Restore its file or View, then refresh.`);
+    }
+    if (tabs.get(tab.id) !== tab) return;
+    tab.columns = await invoke("get_duckdb_table_columns", {
+      tableName: tab.sourceName,
+    });
+    if (tabs.get(tab.id) !== tab) return;
+    await refreshStandalonePivotData(tab);
+  } catch (error) {
+    if (tabs.get(tab.id) === tab) {
+      tab.error = `Could not load Pivot source: ${error}`;
+    }
+  } finally {
+    tab.loading = false;
+    if (tabs.get(tab.id) === tab && activeTabId === tab.id) renderPivotTab(tab);
+  }
 }
 
 function sqlIdentifier(fileName) {
@@ -2022,43 +2172,154 @@ function viewNameFromLeadingSqlComment(sql) {
   return lastComment;
 }
 
-async function fetchSqlResultPage(queryId, offset) {
+async function fetchSqlResultPage(queryId, offset, limit = PAGE) {
+  const pageSize = Math.min(Math.max(1, limit), PAGE);
+  const requestUrl =
+      `pivot-data://localhost/query/${encodeURIComponent(queryId)}` +
+      `?offset=${offset}&limit=${pageSize}`;
   const ipcStartedAt = performance.now();
 
-  const ipcBuffer = await invoke("get_duckdb_query_rows_arrow", {
-    queryId,
-    offset,
-    limit: PAGE,
-  });
+  const response = await fetch(requestUrl);
 
+  if (!response.ok) {
+    const message = await response.text().catch(() => "");
+    throw new Error(
+        message ||
+        `Could not load query data: ${response.status} ${response.statusText}`,
+    );
+  }
+
+  const ipcBuffer = await response.arrayBuffer();
   const ipcReceivedAt = performance.now();
   const decodeStartedAt = performance.now();
 
-  const arrowTable = tableFromIPC(
-      ipcBuffer instanceof Uint8Array
-          ? ipcBuffer
-          : new Uint8Array(ipcBuffer),
-  );
-
-  const hasMore = arrowTable.numRows > PAGE;
-  const rows = arrowTableToRows(arrowTable, PAGE);
+  const arrowTable = tableFromIPC(new Uint8Array(ipcBuffer));
+  const hasMore = arrowTable.numRows > pageSize;
+  const rows = arrowTableToRows(arrowTable, pageSize);
 
   const decodeFinishedAt = performance.now();
 
-  console.info("Arrow IPC timing (ms)", {
+  console.info("Pivot data protocol timing (ms)", {
+    queryId,
     offset,
     rows: rows.length,
-    invokeTotal: Math.round(ipcReceivedAt - ipcStartedAt),
+    contentType: response.headers.get("content-type"),
+    fetchAndRead: Math.round(ipcReceivedAt - ipcStartedAt),
     arrowDecodeAndPreview: Math.round(decodeFinishedAt - decodeStartedAt),
     payloadMiB: Number(
-        (
-            (ipcBuffer.byteLength ?? ipcBuffer.length ?? 0) /
-            (1024 * 1024)
-        ).toFixed(2)
+        (ipcBuffer.byteLength / (1024 * 1024)).toFixed(2),
     ),
   });
 
   return { rows, offset, hasMore };
+}
+
+async function fetchAllPivotResultRows(queryId, maxRows = 50_000) {
+  const rows = [];
+  let offset = 0;
+
+  while (rows.length < maxRows) {
+    const page = await fetchSqlResultPage(
+        queryId,
+        offset,
+        Math.min(PAGE, maxRows - rows.length),
+    );
+
+    rows.push(...page.rows);
+    offset += page.rows.length;
+
+    if (!page.hasMore) {
+      return rows;
+    }
+
+    if (!page.rows.length) {
+      throw new Error("Pivot result paging ended unexpectedly.");
+    }
+  }
+
+  throw new Error(
+      `Pivot result exceeds the ${maxRows.toLocaleString()} row display limit. ` +
+      "Reduce the Pivot dimensions or filter the source with a SQL View.",
+  );
+}
+
+async function refreshStandalonePivotData(pivotTab) {
+  pivotTab.loading = true;
+  pivotTab.error = null;
+
+  if (activeTabId === pivotTab.id) {
+    updatePivotStatus(pivotTab);
+  }
+
+  try {
+    const rangeReport = await invoke("validate_duckdb_client_pivot_values", {
+      sourceName: pivotTab.sourceName,
+      values: selectedStandalonePivotValues(pivotTab),
+    });
+
+    const unsafeRange = rangeReport.find(
+        (range) =>
+            range.checked &&
+            (range.unsafeValueCount > 0 || range.unsafeSum),
+    );
+
+    if (unsafeRange) {
+      throw new Error(clientPivotRangeError(unsafeRange));
+    }
+
+    const start = await invoke("execute_duckdb_query", {
+      sql: clientPivotSourceSql(quoteSqlIdentifier(pivotTab.sourceName)),
+    });
+
+    const { fetchArrowQueryPage } = await import(
+        "./data/arrowIpcConnector.ts"
+        );
+
+    const arrowTable = await fetchClientPivotSource(
+        start.query_id, settings.clientPivotRows, fetchArrowQueryPage,
+    );
+
+    pivotTab.queryId = start.query_id;
+    pivotTab.arrowTable = arrowTable;
+    pivotTab.resultColumns = start.columns;
+    pivotTab.hasMore = false;
+    pivotTab.dirty = false;
+
+    console.info(
+        "Pivot Arrow total_value",
+        arrowTable.getChild("total_value")?.type?.toString(),
+        Array.from({ length: Math.min(arrowTable.numRows, 5) }, (_, index) => {
+          const value = arrowTable.getChild("total_value")?.get(index);
+          return {
+            index,
+            time: arrowTable.getChild("time_display")?.get(index),
+            cat03_name: arrowTable.getChild("cat03_name")?.get(index),
+            value,
+            valueType: typeof value,
+            stringValue: String(value),
+          };
+        }),
+    );
+
+    console.table(
+        Array.from({ length: Math.min(arrowTable.numRows, 5) }, (_, index) => ({
+          cat03_name: arrowTable.getChild("cat03_name")?.get(index),
+          time_display: arrowTable.getChild("time_display")?.get(index),
+          total_value: arrowTable.getChild("total_value")?.get(index),
+        })),
+    );
+
+    console.info("React Pivot Arrow source", {
+      sourceName: pivotTab.sourceName,
+      queryId: start.query_id,
+      rows: arrowTable.numRows,
+      columns: arrowTable.numCols,
+    });
+  } catch (error) {
+    if (tabs.get(pivotTab.id) === pivotTab) pivotTab.error = String(error);
+  } finally {
+    pivotTab.loading = false;
+  }
 }
 
 async function loadMoreSqlRows() {
@@ -2554,10 +2815,20 @@ function saveActiveTabState() {
 }
 
 function restoreTabState(tab) {
+  if (activeTabId && activeTabId !== tab.id) {
+    pivotReactMountToken++;
+    pivotReactHandle?.unmount();
+    pivotReactHandle = null;
+  }
   activeTabId = tab.id;
 
   if (tab.kind === "sql") {
     restoreSqlTab(tab);
+  } else if (tab.kind === "pivot") {
+    restorePivotTab(tab);
+    if (!tab.columns && !tab.loading && !tab.error) {
+      void loadPivotSource(tab);
+    }
   } else {
     restoreParquetTab(tab);
   }
@@ -2582,11 +2853,12 @@ function restoreParquetTab(tab) {
   document.title = `DuckView — ${fileMeta.file_name}${tab.missing ? " (Missing)" : ""}`;
   emptyEl.classList.add("hidden");
   sqlWorkspace.classList.add("hidden");
+  pivotWorkspace.classList.add("hidden");
   tableWrap.classList.remove("hidden");
   statusBar.classList.remove("hidden");
+  tabBar.classList.remove("hidden");
   metaBtn.classList.remove("hidden");
   advBtn.classList.toggle("hidden", tab.missing);
-  tabBar.classList.remove("hidden");
 
   syncAdvancedUiFromFilterState();
   computeColWidths();
@@ -2610,11 +2882,12 @@ function restoreSqlTab(tab) {
   document.title = `DuckView — ${tab.title}`;
   emptyEl.classList.add("hidden");
   tableWrap.classList.add("hidden");
+  pivotWorkspace.classList.add("hidden");
   statusBar.classList.add("hidden");
+  tabBar.classList.remove("hidden");
   metaBtn.classList.add("hidden");
   advBtn.classList.add("hidden");
   sqlWorkspace.classList.remove("hidden");
-  tabBar.classList.remove("hidden");
 
   applySqlPaneHeight(tab);
 
@@ -2632,6 +2905,201 @@ function restoreSqlTab(tab) {
     applySqlPaneHeight(tab);
     sqlEditor?.focus();
   });
+}
+
+function updatePivotStatus(tab) {
+  pivotStatus.className = "pivot-status";
+
+  if (tab.error) {
+    pivotStatus.classList.add("error");
+    pivotStatus.textContent = tab.error;
+    return;
+  }
+
+  if (tab.loading) {
+    pivotStatus.textContent = "Running aggregation in DuckDB…";
+    return;
+  }
+
+  if (tab.dirty) {
+    pivotStatus.classList.add("dirty");
+    pivotStatus.textContent =
+        "Pivot configuration changed. Refresh to run it in DuckDB.";
+    return;
+  }
+
+  if (tab.queryId) {
+    pivotStatus.textContent =
+        "Showing an aggregated DuckDB result. Change fields, then refresh to update it.";
+    return;
+  }
+
+  pivotStatus.textContent =
+      "Drag fields into Rows, Columns, and Values, then refresh with DuckDB.";
+}
+
+async function mountStandalonePivotForTab(tab) {
+  const mountToken = ++pivotReactMountToken;
+
+  pivotUiHost.replaceChildren();
+  pivotResultHost.replaceChildren();
+
+  const host = document.createElement("div");
+  host.className = "pivot-react-host";
+  pivotResultHost.appendChild(host);
+
+  try {
+    const { mountStandalonePivot } = await import(
+        "./pivot/StandalonePivot.tsx"
+        );
+
+    if (mountToken !== pivotReactMountToken || activeTabId !== tab.id) {
+      return;
+    }
+
+    pivotReactHandle?.unmount();
+
+    pivotReactHandle = mountStandalonePivot(host, {
+      dataframe: tab.arrowTable ?? undefined,
+      initialConfig: tab.standaloneConfig,
+      instanceKey: `duckview-pivot-${tab.id}`,
+      onWarning(message) {
+        if (activeTabId === tab.id) showToast(message);
+      },
+      onCreateDrilldownView(event, payload, config, columnTypes, adaptiveDateGrains) {
+        if (activeTabId !== tab.id) return;
+        event.preventDefault();
+        event.stopPropagation();
+        sqlTableContextMenuState = { pivotTab: tab, payload, config, columnTypes, adaptiveDateGrains };
+        sqlTableContextMenu.replaceChildren();
+        appendSqlTableContextMenuItem("Create View", (state) => {
+          void createDrilldownView(state);
+        });
+        positionSqlTableContextMenu(event);
+      },
+      onConfigChange(nextConfig) {
+        if (activeTabId !== tab.id) {
+          return;
+        }
+
+        tab.standaloneConfig = nextConfig;
+        tab.dirty = true;
+        queueWorkspaceSave();
+
+        pivotStatus.className = "pivot-status dirty";
+        pivotStatus.textContent =
+            "React Pivot configuration changed. Refresh to reload the source.";
+
+        console.info("Standalone Pivot config changed", {
+          pivotTabId: tab.id,
+          config: nextConfig,
+        });
+      },
+    });
+
+    if (activeTabId === tab.id) {
+      pivotStatus.className = "pivot-status";
+      pivotStatus.textContent = tab.arrowTable
+          ? `React Pivot · ${tab.arrowTable.numRows.toLocaleString()} Arrow rows loaded.`
+          : "React Pivot standalone preview — fixed Arrow data.";
+    }
+  } catch (error) {
+    if (activeTabId !== tab.id) {
+      return;
+    }
+
+    tab.error = `Could not mount standalone React Pivot: ${error}`;
+    updatePivotStatus(tab);
+    pivotResultHost.replaceChildren();
+  }
+}
+
+function renderPivotTab(tab) {
+  pivotTitle.textContent = tab.title;
+  pivotSource.textContent =
+      `${tab.sourceIsView ? "View" : "Table"}: ${tab.sourceName}`;
+  pivotRefreshBtn.disabled = tab.loading;
+
+  pivotFields.innerHTML = "";
+
+  for (const column of tab.columns || []) {
+    const field = document.createElement("div");
+    field.className = "pivot-field";
+    field.title = `${column.name} (${column.type})`;
+
+    const name = document.createElement("span");
+    name.textContent = abbreviateFieldLabel(column.name);
+    name.title = column.name;
+
+    const type = document.createElement("span");
+    type.className = "pivot-field-type";
+    type.textContent = column.type;
+
+    field.append(name, type);
+    pivotFields.appendChild(field);
+  }
+
+  updatePivotStatus(tab);
+
+  if (!tab.columns && !tab.error) {
+    pivotReactMountToken++;
+    pivotReactHandle?.unmount();
+    pivotReactHandle = null;
+    pivotUiHost.innerHTML =
+        '<div class="pivot-empty">Loading Pivot fields…</div>';
+    pivotResultHost.innerHTML = "";
+    return;
+  }
+
+  if (tab.error) {
+    pivotUiHost.innerHTML = "";
+    pivotReactMountToken++;
+    pivotReactHandle?.unmount();
+    pivotReactHandle = null;
+    pivotResultHost.replaceChildren();
+    return;
+  }
+
+  if (!tab.arrowTable) {
+    pivotReactMountToken++;
+    pivotReactHandle?.unmount();
+    pivotReactHandle = null;
+    pivotUiHost.innerHTML = tab.loading
+        ? '<div class="pivot-empty">Loading Pivot source…</div>'
+        : "";
+    pivotResultHost.replaceChildren();
+    return;
+  }
+
+  void mountStandalonePivotForTab(tab);
+}
+
+function restorePivotTab(tab) {
+  currentPath = null;
+  fileMeta = null;
+  editingEl = null;
+
+  document.title = `DuckView — ${tab.title}`;
+  emptyEl.classList.add("hidden");
+  tableWrap.classList.add("hidden");
+  sqlWorkspace.classList.add("hidden");
+  statusBar.classList.add("hidden");
+  metaBtn.classList.add("hidden");
+  advBtn.classList.add("hidden");
+  pivotWorkspace.classList.remove("hidden");
+  tabBar.classList.remove("hidden");
+
+  renderPivotTab(tab);
+
+  pivotRefreshBtn.disabled = tab.loading;
+  pivotRefreshBtn.title = "Reload source data into React Pivot.";
+  pivotRefreshBtn.onclick = async () => {
+    if (tab.loading) {
+      return;
+    }
+
+    await loadPivotSource(tab);
+  };
 }
 
 function applySqlPaneHeight(tab) {
@@ -2835,12 +3303,9 @@ async function renderSqlTables() {
           insertSqlText(completionInsertText(table.name));
         });
 
-        if (table.is_view && savedView) {
-          button.addEventListener("contextmenu", (event) => {
-            event.preventDefault();
-            void copySqlToClipboard(savedView.sql, `View “${table.name}”`);
-          });
-        }
+        button.addEventListener("contextmenu", (event) => {
+          openSqlTableContextMenu(event, table, savedView);
+        });
 
         if (!table.is_view) {
           sqlTables.appendChild(button);
@@ -2878,24 +3343,117 @@ async function renderSqlTables() {
 }
 
 function insertSqlText(text) {
-  const tab = activeTab();
-  if (!tab || tab.kind !== "sql" || !sqlEditor) return;
+  if (!sqlEditor) return;
 
   const selection = sqlEditor.getSelection();
   if (!selection) return;
 
-  sqlEditor.executeEdits("duckview-insert-table-name", [
-    {
-      range: selection,
-      text,
-      forceMoveMarkers: true,
-    },
-  ]);
-
-  tab.sql = sqlEditorValue();
-  queueWorkspaceSave();
+  sqlEditor.executeEdits("duckview-insert-sql-table-name", [{
+    range: selection,
+    text,
+    forceMoveMarkers: true,
+  }]);
   sqlEditor.focus();
 }
+
+function closeSqlTableContextMenu() {
+  sqlTableContextMenuState = null;
+  sqlTableContextMenu.innerHTML = "";
+  sqlTableContextMenu.classList.remove("open");
+  sqlTableContextMenuBackdrop.classList.remove("open");
+}
+
+function appendSqlTableContextMenuItem(label, action, { danger = false } = {}) {
+  const item = document.createElement("button");
+  item.className = "sql-table-context-menu-item";
+  item.type = "button";
+  item.role = "menuitem";
+  item.textContent = label;
+  item.classList.toggle("danger", danger);
+
+  item.addEventListener("click", () => {
+    const state = sqlTableContextMenuState;
+    closeSqlTableContextMenu();
+
+    if (state) {
+      void action(state);
+    }
+  });
+
+  sqlTableContextMenu.appendChild(item);
+}
+
+function appendSqlTableContextMenuSeparator() {
+  const separator = document.createElement("div");
+  separator.className = "sql-table-context-menu-separator";
+  separator.setAttribute("role", "separator");
+  sqlTableContextMenu.appendChild(separator);
+}
+
+function positionSqlTableContextMenu(event) {
+  sqlTableContextMenu.classList.add("open");
+  sqlTableContextMenuBackdrop.classList.add("open");
+  const margin = 8;
+  const { width, height } = sqlTableContextMenu.getBoundingClientRect();
+  sqlTableContextMenu.style.left = `${Math.max(margin, Math.min(event.clientX, window.innerWidth - width - margin))}px`;
+  sqlTableContextMenu.style.top = `${Math.max(margin, Math.min(event.clientY, window.innerHeight - height - margin))}px`;
+}
+
+async function createDrilldownView({ pivotTab, payload, config, columnTypes, adaptiveDateGrains }) {
+  try {
+    const columns = await invoke("get_duckdb_table_columns", { tableName: pivotTab.sourceName });
+    const sql = drilldownViewSql(pivotTab.sourceName, payload, config, columnTypes, columns.map((column) => column.name), adaptiveDateGrains);
+    const name = drilldownViewName(pivotTab.sourceName, payload.filters, config);
+    const savedView = await invoke("restore_duckdb_view", { viewName: name, sql });
+    workspaceViews.set(savedView.name, { name: savedView.name, sql });
+    queueWorkspaceSave();
+    if (activeTab()?.kind === "sql") await renderSqlTables();
+    showToast(`Created View “${savedView.name}” from ${pivotTab.sourceName}.`);
+  } catch (error) {
+    showToast(`Could not create drill-down View: ${error}`);
+  }
+}
+
+function openSqlTableContextMenu(event, table, savedView = null) {
+  event.preventDefault();
+
+  sqlTableContextMenuState = { table, savedView };
+  sqlTableContextMenu.innerHTML = "";
+
+  appendSqlTableContextMenuItem("Open Pivot in New Tab", ({ table: source }) => {
+    void openPivotTab(source);
+  });
+
+  appendSqlTableContextMenuItem("Insert Name into SQL", ({ table: source }) => {
+    insertSqlText(completionInsertText(source.name));
+  });
+
+  if (table.is_view && savedView) {
+    appendSqlTableContextMenuSeparator();
+
+    appendSqlTableContextMenuItem("Open View Result", ({ table: source }) => {
+      void openViewResult(source.name);
+    });
+
+    appendSqlTableContextMenuItem("Copy View SQL", ({ savedView: view }) => {
+      void copySqlToClipboard(view.sql, `View “${view.name}”`);
+    });
+
+    appendSqlTableContextMenuItem("Delete View", ({ table: source }) => {
+      void removeWorkspaceView(source.name);
+    }, { danger: true });
+  }
+
+  positionSqlTableContextMenu(event);
+}
+
+sqlTableContextMenuBackdrop.addEventListener("pointerdown", closeSqlTableContextMenu);
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeSqlTableContextMenu();
+  }
+});
 
 function selectSqlResult(tab, key) {
   if (!tab.results.has(key)) return;
@@ -3026,6 +3584,11 @@ function renderSqlResultTabs(tab) {
 
 function renderActiveSqlResult(tab) {
   const result = activeSqlResult(tab);
+  if (sqlResultBody.dataset.resultId !== result?.id) {
+    sqlResultBody.scrollTop = 0;
+    sqlResultBody.scrollLeft = 0;
+    delete sqlResultBody.dataset.resultId;
+  }
 
   if (!result) {
     sqlResultTitle.textContent = "Result";
@@ -3054,6 +3617,7 @@ function renderActiveSqlResult(tab) {
 }
 
 function renderSqlPlaceholder() {
+  delete sqlResultBody.dataset.resultId;
   sqlResultBody.innerHTML =
       '<div class="sql-result-empty">Write a query above, then press <kbd>⌘</kbd><kbd>↵</kbd>.</div>';
 }
@@ -3064,17 +3628,25 @@ function renderSqlResults(result) {
     return;
   }
 
+  const rowCount = result.rows?.length ?? 0;
+  const { start, end, top, bottom } = resultWindow(
+      rowCount, sqlResultBody.scrollTop, sqlResultBody.clientHeight,
+  );
+  const colspan = result.columns.length + 1;
   let html = '<table class="sql-result-grid"><thead><tr>';
-  html += '<th class="sql-row-number" title="Row number">#</th>';
+  html += '<th class="sql-row-number" title="Row number">#<span class="sql-result-resize" data-column="0" role="separator" aria-label="Resize row number column" aria-orientation="vertical" tabindex="0"></span></th>';
 
-  for (const column of result.columns) {
-    html += `<th title="${escapeHtml(column.type || "value")}">${escapeHtml(column.name)}</th>`;
+  for (const [index, column] of result.columns.entries()) {
+    html += `<th title="${escapeHtml(column.type || "value")}">${escapeHtml(column.name)}<span class="sql-result-resize" data-column="${index + 1}" role="separator" aria-label="Resize ${escapeHtml(column.name)} column" aria-orientation="vertical" tabindex="0"></span></th>`;
   }
 
   html += "</tr></thead><tbody>";
 
-  for (const [rowIndex, row] of (result.rows || []).entries()) {
-    html += "<tr>";
+  if (top) html += `<tr class="sql-result-spacer"><td colspan="${colspan}" style="height:${top}px"></td></tr>`;
+
+  for (let rowIndex = start; rowIndex < end; rowIndex++) {
+    const row = result.rows[rowIndex];
+    html += `<tr class="${rowIndex % 2 ? "sql-result-even" : ""}">`;
     html += `<td class="sql-row-number">${(rowIndex + 1).toLocaleString()}</td>`;
 
     for (const value of row) {
@@ -3089,13 +3661,18 @@ function renderSqlResults(result) {
     html += "</tr>";
   }
 
+  if (bottom) html += `<tr class="sql-result-spacer"><td colspan="${colspan}" style="height:${bottom}px"></td></tr>`;
+
   if (result.loadingMore) {
-    const colspan = result.columns.length + 1;
     html += `<tr class="sql-result-loading"><td colspan="${colspan}">Loading more rows…</td></tr>`;
   }
 
   html += "</tbody></table>";
   sqlResultBody.innerHTML = html;
+  lockResultColumnWidths(result, sqlResultBody.querySelector(".sql-result-grid"));
+  sqlResultBody.dataset.resultId = result.id;
+  sqlResultBody.dataset.windowStart = String(start);
+  sqlResultBody.dataset.windowEnd = String(end);
 }
 
 function sqlStringLiteral(value) {
@@ -3117,6 +3694,9 @@ async function copyCellValueToClipboard(value) {
 }
 
 function renderTabs() {
+  // Rebuilding the tabs replaces the scrolling element's children, which
+  // otherwise resets its horizontal position (notably when a tab is closed).
+  const previousScrollLeft = tabBar.scrollLeft;
   tabBar.innerHTML = "";
 
   for (const tab of tabs.values()) {
@@ -3127,9 +3707,12 @@ function renderTabs() {
     el.setAttribute("role", "button");
     el.tabIndex = 0;
 
-    const title = tab.kind === "sql" ? tab.title : tab.meta.file_name;
+    const title =
+        tab.kind === "sql" || tab.kind === "pivot"
+            ? tab.title
+            : tab.meta.file_name;
     el.title =
-        tab.kind === "sql"
+        tab.kind === "sql" || tab.kind === "pivot"
             ? title
             : tab.missing
                 ? `${tab.path}\n(file not found — open Info to relink)`
@@ -3172,11 +3755,7 @@ function renderTabs() {
   tabBar.appendChild(addSql);
 
   requestAnimationFrame(() => {
-    tabBar.querySelector(".file-tab.active")?.scrollIntoView({
-      behavior: "smooth",
-      block: "nearest",
-      inline: "nearest",
-    });
+    tabBar.scrollLeft = previousScrollLeft;
   });
 }
 
@@ -4042,6 +4621,7 @@ const DEFAULT_SETTINGS = {
   font: "default",
   autoFit: true,
   duckDbMemoryLimitMiB: 2048,
+  clientPivotRows: DEFAULT_CLIENT_PIVOT_ROWS,
   csvImportMaxSizeGiB: 4,
   csvMaxLineSizeMiB: 8,
   csvConversionProfile: "auto",
@@ -4058,6 +4638,7 @@ function loadSettings() {
   try {
     const raw = localStorage.getItem("duckview.settings");
     if (raw) settings = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    settings.clientPivotRows = clientPivotRowLimit(settings.clientPivotRows);
   } catch (_) {
     /* ignore corrupt settings */
   }
@@ -4162,6 +4743,7 @@ function initSettingsControls() {
   setFont.value = settings.font;
   setAutoFit.checked = settings.autoFit;
   setDuckDbMemoryLimit.value = String(settings.duckDbMemoryLimitMiB);
+  setClientPivotRows.value = String(settings.clientPivotRows);
   setCsvImportMaxSize.value = String(settings.csvImportMaxSizeGiB);
   setCsvMaxLineSize.value = String(settings.csvMaxLineSizeMiB);
   setCsvConversionProfile.value = settings.csvConversionProfile;
@@ -4198,6 +4780,11 @@ function initSettingsControls() {
     settings.duckDbMemoryLimitMiB = Number(setDuckDbMemoryLimit.value);
     saveSettings();
     void applyDuckDbMemoryLimit();
+  });
+
+  setClientPivotRows.addEventListener("change", () => {
+    settings.clientPivotRows = clientPivotRowLimit(setClientPivotRows.value);
+    saveSettings();
   });
 
   setCsvImportMaxSize.addEventListener("change", () => {
@@ -4502,16 +5089,74 @@ sqlPaneSplitter.addEventListener("pointercancel", finishSqlPaneResize);
 
 sqlResultBody.addEventListener("contextmenu", (event) => {
   const cell = event.target.closest("td");
-  if (!cell || !sqlResultBody.contains(cell)) return;
+  if (!cell || !sqlResultBody.contains(cell) || cell.closest(".sql-result-spacer")) return;
 
   event.preventDefault();
   void copyCellValueToClipboard(cell.textContent);
+});
+
+sqlResultBody.addEventListener("pointerdown", (event) => {
+  const handle = event.target.closest(".sql-result-resize");
+  const result = activeSqlResult(activeTab());
+  const table = handle?.closest("table");
+  if (!table || !result || sqlResultBody.dataset.resultId !== result.id ||
+      !result.columnWidths || event.button !== 0) return;
+
+  event.preventDefault();
+  const index = Number(handle.dataset.column);
+  const startX = event.clientX;
+  const startWidth = result.columnWidths[index];
+  const previousCursor = document.body.style.cursor;
+  const previousUserSelect = document.body.style.userSelect;
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+
+  const onMove = (moveEvent) => {
+    if (sqlResultBody.dataset.resultId !== result.id || !table.isConnected) {
+      stop();
+      return;
+    }
+    resizeResultColumn(result, table, index, startWidth + moveEvent.clientX - startX);
+  };
+  const stop = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", stop);
+    window.removeEventListener("pointercancel", stop);
+    window.removeEventListener("blur", stop);
+    document.body.style.cursor = previousCursor;
+    document.body.style.userSelect = previousUserSelect;
+  };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", stop);
+  window.addEventListener("pointercancel", stop);
+  window.addEventListener("blur", stop);
+});
+
+sqlResultBody.addEventListener("keydown", (event) => {
+  const handle = event.target.closest(".sql-result-resize");
+  if (!handle || (event.key !== "ArrowLeft" && event.key !== "ArrowRight")) return;
+  const result = activeSqlResult(activeTab());
+  if (!result?.columnWidths || sqlResultBody.dataset.resultId !== result.id) return;
+  event.preventDefault();
+  const index = Number(handle.dataset.column);
+  resizeResultColumn(result, handle.closest("table"), index,
+      result.columnWidths[index] + (event.key === "ArrowRight" ? 10 : -10));
 });
 
 sqlResultBody.addEventListener(
     "scroll",
     () => {
       maybeLoadMoreSqlRows();
+      const result = activeSqlResult(activeTab());
+      if (!result || !result.columns?.length || result.error ||
+          sqlResultBody.dataset.resultId !== result.id) return;
+      const { start, end } = resultWindow(
+          result.rows?.length ?? 0, sqlResultBody.scrollTop, sqlResultBody.clientHeight,
+      );
+      if (start !== Number(sqlResultBody.dataset.windowStart) ||
+          end !== Number(sqlResultBody.dataset.windowEnd)) {
+        renderSqlResults(result);
+      }
     },
     { passive: true },
 );
@@ -4645,31 +5290,6 @@ async function registerNativeFileOpenHandlers() {
     }
   });
 }
-// listen("tauri://drag-enter", () => dropOverlay.classList.add("show"));
-// listen("tauri://drag-over", () => dropOverlay.classList.add("show"));
-// listen("tauri://drag-leave", () => dropOverlay.classList.remove("show"));
-// listen("tauri://drag-drop", async (e) => {
-//   dropOverlay.classList.remove("show");
-//
-//   const paths = (e.payload?.paths || []).filter((path) => {
-//     const lower = path.toLowerCase();
-//     return lower.endsWith(".parquet") || lower.endsWith(".csv");
-//   });
-//
-//   if (!paths.length) {
-//     showToast("Drop one or more .parquet or .csv files.");
-//     return;
-//   }
-//
-//   for (const path of paths) {
-//     await openPath(path);
-//     if (pendingCsvImportPath) break;
-//   }
-// });
-//
-// listen("open-file", (e) => {
-//   if (e.payload) openPath(e.payload);
-// });
 
 // ---- Startup ----------------------------------------------------------------
 loadSettings();
@@ -4699,7 +5319,7 @@ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () 
     try {
       const startup = await invoke("take_startup_file");
       if (startup) {
-        openPath(startup);
+        await openPath(startup);
         return;
       }
     } catch (_) {
