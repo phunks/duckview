@@ -152,7 +152,6 @@
           <div id="pivotFields" class="pivot-fields"></div>
         </aside>
         <section id="pivotContent" class="pivot-content">
-          <div id="pivotStatus" class="pivot-status"></div>
           <div id="pivotUiHost" class="pivot-ui-host"></div>
           <div id="pivotResultHost" class="pivot-result-host"></div>
         </section>
@@ -410,6 +409,13 @@
           Large CSV files can need substantially more memory and temporary disk
           space than their file size.
         </div>
+        <div class="set-row">
+          <div class="set-label">
+            <span>Dismissed notifications</span>
+            <small>Allow previously dismissed warnings and errors to appear again.</small>
+          </div>
+          <button id="resetDismissedToastsBtn" class="btn ghost" type="button">Reset all</button>
+        </div>
       </div>
     </div>
 
@@ -599,8 +605,19 @@
       <div id="loadingText" class="loading-text">Reading…</div>
     </div>
 
-    <!-- Toast -->
-    <div id="toast" class="toast hidden"></div>
+    <!-- Dismissible notices stay below the current workspace header. -->
+    <div id="notificationStack" class="notification-stack hidden">
+      <div id="pivotStatus" class="pivot-status notification hidden" role="status">
+        <span id="pivotStatusMessage" class="notification-message"></span>
+        <button id="pivotStatusDismiss" class="btn ghost hidden" type="button" title="Do not show loaded Pivot status again">Dismiss</button>
+        <button id="pivotStatusClose" class="notification-close" type="button" aria-label="Dismiss Pivot status">×</button>
+      </div>
+      <div id="toast" class="toast notification hidden" role="status">
+        <span id="toastMessage" class="notification-message"></span>
+        <button id="toastDismiss" class="btn ghost hidden" type="button" title="Do not show this type of notification again">Dismiss</button>
+        <button id="toastClose" class="notification-close" type="button" aria-label="Close notification">×</button>
+      </div>
+    </div>
 
     <script type="module" src="/main.js"></script>
   </body>

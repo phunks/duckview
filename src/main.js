@@ -8,7 +8,8 @@ import { resultWindow } from "./sql/resultWindow.js";
 import { abbreviateFieldLabel } from "./pivot/labels.ts";
 import { drilldownViewName, drilldownViewSql } from "./pivot/drilldownView.ts";
 import { savedPivotTabs, restoredPivotDefinitions } from "./pivot/workspaceSnapshot.js";
-import { clientPivotRowLimit, clientPivotSourceSql, fetchClientPivotSource, DEFAULT_CLIENT_PIVOT_ROWS } from "./pivot/clientSource.js";
+import { createNotificationCenter } from "./pivot/notifications.js";
+import { checkClientPivotRowCount, clientPivotPreflightSql, clientPivotRowLimit, clientPivotSourceSql, fetchClientPivotSource, DEFAULT_CLIENT_PIVOT_ROWS } from "./pivot/clientSource.js";
 import {
   clientPivotRangeError,
   selectedStandalonePivotValues,
@@ -211,7 +212,6 @@ const pivotSource = $("pivotSource");
 const pivotRefreshBtn = $("pivotRefreshBtn");
 const pivotFields = $("pivotFields");
 const pivotContent = $("pivotContent");
-const pivotStatus = $("pivotStatus");
 const pivotUiHost = $("pivotUiHost");
 const pivotResultHost = $("pivotResultHost");
 
@@ -232,6 +232,20 @@ const dropOverlay = $("dropOverlay");
 const loading = $("loading");
 const loadingText = $("loadingText");
 const toast = $("toast");
+const notifications = createNotificationCenter({
+  stack: $("notificationStack"),
+  toast,
+  toastMessage: $("toastMessage"),
+  toastClose: $("toastClose"),
+  toastDismiss: $("toastDismiss"),
+  pivotStatus: $("pivotStatus"),
+  pivotMessage: $("pivotStatusMessage"),
+  pivotDismiss: $("pivotStatusDismiss"),
+  pivotClose: $("pivotStatusClose"),
+  anchorFor: () => !pivotWorkspace.classList.contains("hidden")
+    ? pivotWorkspace.querySelector(".pivot-workspace-head")
+    : tabBar.classList.contains("hidden") ? $("toolbar") : tabBar,
+});
 // Advanced filter
 const advBtn = $("advBtn");
 const advBadge = $("advBadge");
@@ -247,6 +261,7 @@ const settingsBtn = $("settingsBtn");
 const settingsWin = $("settingsWin");
 const settingsBackdrop = $("settingsBackdrop");
 const settingsClose = $("settingsClose");
+const resetDismissedToastsBtn = $("resetDismissedToastsBtn");
 const exportFormatWin = $("exportFormatWin");
 const exportFormatBackdrop = $("exportFormatBackdrop");
 const exportFormatClose = $("exportFormatClose");
@@ -731,7 +746,7 @@ async function saveWorkspaceAs() {
               workspace.name.toLocaleLowerCase() === trimmedName.toLocaleLowerCase()
       )
   ) {
-    showToast("A workspace with that name already exists.");
+    showToast("A workspace with that name already exists.", "workspace-name-exists");
     return;
   }
 
@@ -785,6 +800,7 @@ function resetWorkspaceUi() {
   pivotReactHandle?.unmount();
   pivotReactHandle = null;
   activeTabId = null;
+  notifications.setActivePivot(null);
   currentPath = null;
   fileMeta = null;
   totalRows = 0;
@@ -820,6 +836,7 @@ function resetWorkspaceUi() {
 
   closeAdvanced();
   closeMeta();
+  notifications.reposition();
 }
 
 async function clearCurrentWorkspace() {
@@ -881,7 +898,7 @@ async function newWorkspace() {
               workspace.name.toLocaleLowerCase() === trimmedName.toLocaleLowerCase()
       )
   ) {
-    showToast("A workspace with that name already exists.");
+    showToast("A workspace with that name already exists.", "workspace-name-exists");
     return;
   }
 
@@ -1180,7 +1197,6 @@ function createPivotTab(source) {
     hasMore: false,
     loading: false,
     error: null,
-    dirty: true,
   };
 }
 
@@ -1599,7 +1615,7 @@ async function generateSqlFromEditorRequest() {
     showToast("SQL suggestion ready. Press Tab to accept or Esc to dismiss.");
   } catch (error) {
     if (requestId === aiSuggestionRequestId) {
-      showToast(`Could not generate SQL: ${error}`);
+      showToast(`Could not generate SQL: ${error}`, "ai-generation-error");
     }
   } finally {
     if (requestId === aiSuggestionRequestId) {
@@ -2252,6 +2268,18 @@ async function refreshStandalonePivotData(pivotTab) {
   }
 
   try {
+    const { fetchArrowQueryPage } = await import(
+        "./data/arrowIpcConnector.ts"
+    );
+    const quotedSource = quoteSqlIdentifier(pivotTab.sourceName);
+    const countQuery = await invoke("execute_duckdb_query", {
+      sql: clientPivotPreflightSql(quotedSource, settings.clientPivotRows),
+    });
+    const countPage = await fetchArrowQueryPage({
+      queryId: countQuery.query_id, offset: 0, limit: 1,
+    });
+    checkClientPivotRowCount(countPage.table.getChild("row_count")?.get(0), settings.clientPivotRows);
+
     const rangeReport = await invoke("validate_duckdb_client_pivot_values", {
       sourceName: pivotTab.sourceName,
       values: selectedStandalonePivotValues(pivotTab),
@@ -2268,12 +2296,8 @@ async function refreshStandalonePivotData(pivotTab) {
     }
 
     const start = await invoke("execute_duckdb_query", {
-      sql: clientPivotSourceSql(quoteSqlIdentifier(pivotTab.sourceName)),
+      sql: clientPivotSourceSql(quotedSource),
     });
-
-    const { fetchArrowQueryPage } = await import(
-        "./data/arrowIpcConnector.ts"
-        );
 
     const arrowTable = await fetchClientPivotSource(
         start.query_id, settings.clientPivotRows, fetchArrowQueryPage,
@@ -2283,7 +2307,6 @@ async function refreshStandalonePivotData(pivotTab) {
     pivotTab.arrowTable = arrowTable;
     pivotTab.resultColumns = start.columns;
     pivotTab.hasMore = false;
-    pivotTab.dirty = false;
 
     console.info(
         "Pivot Arrow total_value",
@@ -2610,7 +2633,7 @@ async function copyCsvImportError() {
     showToast("CSV import error copied to clipboard.");
   } catch (error) {
     console.warn("Could not copy CSV import error:", error);
-    showToast("Could not copy the CSV import error.");
+    showToast("Could not copy the CSV import error.", "csv-error-copy-failed");
   }
 }
 
@@ -2821,6 +2844,7 @@ function restoreTabState(tab) {
     pivotReactHandle = null;
   }
   activeTabId = tab.id;
+  notifications.setActivePivot(tab.kind === "pivot" ? tab : null);
 
   if (tab.kind === "sql") {
     restoreSqlTab(tab);
@@ -2834,6 +2858,7 @@ function restoreTabState(tab) {
   }
 
   renderTabs();
+  notifications.reposition();
 }
 
 function restoreParquetTab(tab) {
@@ -2908,34 +2933,7 @@ function restoreSqlTab(tab) {
 }
 
 function updatePivotStatus(tab) {
-  pivotStatus.className = "pivot-status";
-
-  if (tab.error) {
-    pivotStatus.classList.add("error");
-    pivotStatus.textContent = tab.error;
-    return;
-  }
-
-  if (tab.loading) {
-    pivotStatus.textContent = "Running aggregation in DuckDB…";
-    return;
-  }
-
-  if (tab.dirty) {
-    pivotStatus.classList.add("dirty");
-    pivotStatus.textContent =
-        "Pivot configuration changed. Refresh to run it in DuckDB.";
-    return;
-  }
-
-  if (tab.queryId) {
-    pivotStatus.textContent =
-        "Showing an aggregated DuckDB result. Change fields, then refresh to update it.";
-    return;
-  }
-
-  pivotStatus.textContent =
-      "Drag fields into Rows, Columns, and Values, then refresh with DuckDB.";
+  notifications.updatePivotStatus(tab);
 }
 
 async function mountStandalonePivotForTab(tab) {
@@ -2963,8 +2961,8 @@ async function mountStandalonePivotForTab(tab) {
       dataframe: tab.arrowTable ?? undefined,
       initialConfig: tab.standaloneConfig,
       instanceKey: `duckview-pivot-${tab.id}`,
-      onWarning(message) {
-        if (activeTabId === tab.id) showToast(message);
+      onWarning(notices) {
+        if (activeTabId === tab.id) notifications.showPivotNotices(notices);
       },
       onCreateDrilldownView(event, payload, config, columnTypes, adaptiveDateGrains) {
         if (activeTabId !== tab.id) return;
@@ -2983,12 +2981,8 @@ async function mountStandalonePivotForTab(tab) {
         }
 
         tab.standaloneConfig = nextConfig;
-        tab.dirty = true;
         queueWorkspaceSave();
-
-        pivotStatus.className = "pivot-status dirty";
-        pivotStatus.textContent =
-            "React Pivot configuration changed. Refresh to reload the source.";
+        updatePivotStatus(tab);
 
         console.info("Standalone Pivot config changed", {
           pivotTabId: tab.id,
@@ -2998,10 +2992,7 @@ async function mountStandalonePivotForTab(tab) {
     });
 
     if (activeTabId === tab.id) {
-      pivotStatus.className = "pivot-status";
-      pivotStatus.textContent = tab.arrowTable
-          ? `React Pivot · ${tab.arrowTable.numRows.toLocaleString()} Arrow rows loaded.`
-          : "React Pivot standalone preview — fixed Arrow data.";
+      updatePivotStatus(tab);
     }
   } catch (error) {
     if (activeTabId !== tab.id) {
@@ -3172,7 +3163,7 @@ async function removeWorkspaceView(viewName) {
       tableName: viewName,
     });
   } catch (error) {
-    showToast(`Could not remove ${viewName}: ${error}`);
+    showToast(`Could not remove ${viewName}: ${error}`, "view-remove-error");
     return;
   }
 
@@ -3208,7 +3199,7 @@ async function copySqlToClipboard(sql, label = "SQL") {
     showToast(`${label} SQL copied to clipboard.`);
   } catch (error) {
     console.warn(`Could not copy ${label} SQL:`, error);
-    showToast(`Could not copy ${label} SQL to the clipboard.`);
+    showToast(`Could not copy ${label} SQL to the clipboard.`, "sql-copy-error");
   }
 }
 
@@ -3290,7 +3281,7 @@ async function renderSqlTables() {
             if (parquetTabId) {
               switchTab(parquetTabId);
             } else {
-              showToast(`The source tab for "${table.name}" is no longer open.`);
+              showToast(`The source tab for "${table.name}" is no longer open.`, "source-tab-closed");
             }
           }, 220);
         });
@@ -3410,7 +3401,7 @@ async function createDrilldownView({ pivotTab, payload, config, columnTypes, ada
     if (activeTab()?.kind === "sql") await renderSqlTables();
     showToast(`Created View “${savedView.name}” from ${pivotTab.sourceName}.`);
   } catch (error) {
-    showToast(`Could not create drill-down View: ${error}`);
+    showToast(`Could not create drill-down View: ${error}`, "drilldown-create-error");
   }
 }
 
@@ -3689,7 +3680,7 @@ async function copyCellValueToClipboard(value) {
     showToast("SQL literal copied to clipboard.");
   } catch (error) {
     console.warn("Could not copy cell value:", error);
-    showToast("Could not copy the cell value to the clipboard.");
+    showToast("Could not copy the cell value to the clipboard.", "cell-copy-error");
   }
 }
 
@@ -3850,12 +3841,8 @@ function setLoading(on, text) {
   loading.classList.toggle("hidden", !on);
 }
 
-let toastTimer = null;
-function showToast(msg) {
-  toast.textContent = msg;
-  toast.classList.remove("hidden");
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toast.classList.add("hidden"), 4800);
+function showToast(msg, warningId = null) {
+  notifications.showToast(msg, warningId);
 }
 
 async function writeTextToClipboard(text) {
@@ -3921,7 +3908,7 @@ async function openParquetPath(path) {
     updateStatus();
     queueWorkspaceSave();
   } catch (e) {
-    showToast("Couldn’t open file: " + e);
+    showToast("Couldn’t open file: " + e, "file-open-error");
   } finally {
     setLoading(false);
   }
@@ -3932,7 +3919,7 @@ async function pickFile() {
     const path = await invoke("pick_file");
     if (path) await openPath(path);
   } catch (e) {
-    showToast(String(e));
+    showToast(String(e), "file-pick-error");
   }
 }
 
@@ -4311,7 +4298,7 @@ async function loadPage(rowPage, columnPage, force = false) {
     return true;
   } catch (error) {
     if (tab.id === activeTabId && token === tab.viewToken) {
-      showToast(String(error));
+      showToast(String(error), "file-view-error");
     }
     return false;
   } finally {
@@ -4438,13 +4425,13 @@ async function relinkActiveParquet() {
   try {
     newPath = await invoke("pick_parquet_file");
   } catch (error) {
-    showToast(String(error));
+    showToast(String(error), "file-relink-pick-error");
     return;
   }
   if (!newPath || newPath === tab.path) return;
 
   if (tabIdByPath.has(newPath) && tabIdByPath.get(newPath) !== tab.id) {
-    showToast("This file is already open in another tab.");
+    showToast("This file is already open in another tab.", "file-already-open");
     return;
   }
 
@@ -4497,7 +4484,7 @@ async function relinkActiveParquet() {
     queueWorkspaceSave();
     showToast("File relinked.");
   } catch (error) {
-    showToast("Couldn’t open file: " + error);
+    showToast("Couldn’t open file: " + error, "file-open-error");
   } finally {
     setLoading(false);
   }
@@ -4657,7 +4644,7 @@ async function applyDuckDbMemoryLimit() {
     });
   } catch (error) {
     console.warn("Could not update DuckDB memory limit:", error);
-    showToast("Could not update the DuckDB memory limit: " + error);
+    showToast("Could not update the DuckDB memory limit: " + error, "duckdb-memory-error");
   }
 }
 
@@ -4717,7 +4704,7 @@ async function saveAiApiKey() {
     setAiApiKey.value = "";
     showToast("AI API key saved securely.");
   } catch (error) {
-    showToast(`Could not save the AI API key: ${error}`);
+    showToast(`Could not save the AI API key: ${error}`, "ai-key-save-error");
   } finally {
     await refreshAiKeyStatus();
   }
@@ -4731,13 +4718,17 @@ async function deleteAiApiKey() {
     setAiApiKey.value = "";
     showToast("AI API key removed.");
   } catch (error) {
-    showToast(`Could not remove the AI API key: ${error}`);
+    showToast(`Could not remove the AI API key: ${error}`, "ai-key-remove-error");
   } finally {
     await refreshAiKeyStatus();
   }
 }
 
 function initSettingsControls() {
+  resetDismissedToastsBtn.addEventListener("click", () => {
+    notifications.resetDismissedToasts();
+    showToast("Dismissed notifications reset.");
+  });
   setTheme.value = settings.theme;
   setDensity.value = settings.density;
   setFont.value = settings.font;
@@ -5300,7 +5291,7 @@ initSqlEditor();
 
 void registerNativeFileOpenHandlers().catch((error) => {
   console.error("Could not register native file handlers:", error);
-  showToast(`Native file handlers are unavailable: ${error}`);
+  showToast(`Native file handlers are unavailable: ${error}`, "native-file-handlers-error");
 });
 
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {

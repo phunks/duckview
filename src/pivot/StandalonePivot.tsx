@@ -14,7 +14,7 @@ import type {
     PivotTableData,
 } from "../ext/streamlit-pivot-table/streamlit_pivot/frontend/src/engine/types";
 import { abbreviateFieldLabel } from "./labels";
-import { watchPivotWarnings } from "./warningToast";
+import { watchPivotWarnings, type PivotNotice } from "./warningToast";
 import React from "react";
 
 export type StandalonePivotMountOptions = {
@@ -22,7 +22,7 @@ export type StandalonePivotMountOptions = {
     initialConfig?: PivotConfigV1;
     instanceKey?: string;
     onConfigChange?: (config: PivotConfigV1) => void;
-    onWarning?: (message: string) => void;
+    onWarning?: (notices: PivotNotice[]) => void;
     onCreateDrilldownView?: (event: React.MouseEvent, payload: CellClickPayload, config: PivotConfigV1, columnTypes: ColumnTypeMap, adaptiveDateGrains?: Record<string, DateGrain>) => void;
 };
 

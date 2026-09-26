@@ -1554,10 +1554,10 @@ index 3822d95..848f424 100644
                  showFilterIndicators &&
                  filters?.[col] &&
 diff --git a/streamlit_pivot/frontend/src/engine/PivotData.test.ts b/streamlit_pivot/frontend/src/engine/PivotData.test.ts
-index 1479673..26804ea 100644
+index 1479673..1357ec0 100644
 --- a/streamlit_pivot/frontend/src/engine/PivotData.test.ts
 +++ b/streamlit_pivot/frontend/src/engine/PivotData.test.ts
-@@ -776,6 +776,97 @@ describe("PivotData - mixed-type sort", () => {
+@@ -776,6 +776,124 @@ describe("PivotData - mixed-type sort", () => {
      // C=50, A=100, B=null(last)
      expect(keys).toEqual(["C", "A", "B"]);
    });
@@ -1591,6 +1591,33 @@ index 1479673..26804ea 100644
 +      ["第20章"],
 +      ["その他"],
 +    ]);
++  });
++
++  it("preserves numeric age ordering when a parent category is also sorted", () => {
++    const ages = ["0歳〜4歳", "5歳〜9歳", "10歳〜14歳", "50歳〜54歳", "100歳以上"];
++    const data: DataRecord[] = ["女", "男"].flatMap((gender) =>
++      [...ages].reverse().map((age) => ({ gender, age, revenue: 1 })),
++    );
++    const ageSort = {
++      by: "regex_number" as const,
++      direction: "asc" as const,
++      dimension: "age",
++      regex_pattern: String.raw`(\d+)`,
++    };
++    for (const direction of ["asc", "desc"] as const) {
++      const pd = new PivotData(data, makeConfig({
++        rows: ["gender", "age"],
++        columns: [],
++        row_sort: [
++          { by: "key", direction, dimension: "gender" },
++          ageSort,
++        ],
++      }));
++      const genders = direction === "asc" ? ["女", "男"] : ["男", "女"];
++      expect(pd.getRowKeys()).toEqual(
++        genders.flatMap((gender) => ages.map((age) => [gender, age])),
++      );
++    }
 +  });
 +
 +  it("sorts captured alphanumeric codes naturally, in either direction", () => {
@@ -1656,7 +1683,7 @@ index 1479673..26804ea 100644
  
  describe("mixedCompare", () => {
 diff --git a/streamlit_pivot/frontend/src/engine/PivotData.ts b/streamlit_pivot/frontend/src/engine/PivotData.ts
-index 669d396..888cbbe 100644
+index 669d396..e52d88c 100644
 --- a/streamlit_pivot/frontend/src/engine/PivotData.ts
 +++ b/streamlit_pivot/frontend/src/engine/PivotData.ts
 @@ -29,6 +29,7 @@ import {
@@ -1801,7 +1828,38 @@ index 669d396..888cbbe 100644
          if (cmp !== 0) return cmp * levelSign;
        }
        return 0;
-@@ -2916,31 +2947,11 @@ export class PivotData {
+@@ -1312,6 +1343,30 @@ export class PivotData {
+       );
+     });
+     if (comparators.length === 1) return comparators[0];
++    // Header sorts belong to individual dimensions. Compare at the first
++    // differing level using that level's sort, rather than letting a parent
++    // key comparator resolve child labels before the child's sort can run.
++    // Keep the existing priority-chain semantics for global/undimensioned
++    // sorts (and for value sorts, which compare aggregates across levels).
++    if (sortConfigs.every((sc) => sc.dimension && sc.by !== "value")) {
++      const byDimension = new Map(
++        sortConfigs.map((sc) => [
++          sc.dimension,
++          this._buildKeyComparator(sc, [sc.dimension!], () => null),
++        ]),
++      );
++      const defaultComparator = this._buildKeyComparator(undefined, [], () => null);
++      return (a, b) => {
++        for (let i = 0; i < Math.max(a.length, b.length); i++) {
++          if (a[i] === b[i]) continue;
++          return (byDimension.get(dimensions[i]) ?? defaultComparator)(
++            [a[i] ?? ""],
++            [b[i] ?? ""],
++          );
++        }
++        return 0;
++      };
++    }
+     return (a, b) => {
+       for (const cmp of comparators) {
+         const result = cmp(a, b);
+@@ -2916,31 +2971,11 @@ export class PivotData {
      const matched: DataRecord[] = [];
      let totalCount = 0;
      const numRows = this._dataSource.numRows;
@@ -3399,6 +3457,206 @@ index 654e039..7e93d04 100644
      : undefined;
  
    const menuDateGrain =
+diff --git a/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.test.tsx b/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.test.tsx
+new file mode 100644
+index 0000000..960e987
+--- /dev/null
++++ b/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.test.tsx
+@@ -0,0 +1,102 @@
++// @vitest-environment jsdom
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import TableRenderer from "./TableRenderer";
++import VirtualizedTableRenderer from "./VirtualizedTableRenderer";
++import { PivotData } from "../engine/PivotData";
++import { makeConfig } from "../test-utils";
++import { computeHeaderMenuPlacement } from "./useHeaderMenuPlacement";
++
++afterEach(() => {
++  cleanup();
++  vi.restoreAllMocks();
++});
++
++describe("computeHeaderMenuPlacement", () => {
++  const viewportWidth = 800;
++  const viewportHeight = 600;
++
++  it("opens below the header when there is room", () => {
++    expect(
++      computeHeaderMenuPlacement(
++        { top: 80, bottom: 110, left: 100 },
++        240,
++        300,
++        viewportWidth,
++        viewportHeight,
++      ),
++    ).toEqual({ top: 110, left: 100, maxHeight: 440 });
++  });
++
++  it("moves left and above near the viewport edges", () => {
++    expect(
++      computeHeaderMenuPlacement(
++        { top: 540, bottom: 570, left: 750 },
++        240,
++        300,
++        viewportWidth,
++        viewportHeight,
++      ),
++    ).toEqual({ top: 240, left: 552, maxHeight: 440 });
++  });
++
++  it("caps the menu to available space and lets its contents scroll", () => {
++    expect(
++      computeHeaderMenuPlacement(
++        { top: 100, bottom: 130, left: 80 },
++        240,
++        440,
++        800,
++        240,
++      ),
++    ).toEqual({ top: 130, left: 80, maxHeight: 102 });
++  });
++
++  it("fits in a viewport narrower than the default menu width", () => {
++    expect(
++      computeHeaderMenuPlacement(
++        { top: 40, bottom: 60, left: 70 },
++        210,
++        200,
++        180,
++        280,
++      ),
++    ).toEqual({ top: 60, left: 8, maxHeight: 212 });
++  });
++});
++
++describe.each(["regular", "virtualized"])("%s header menu overlay", (renderer) => {
++  it("positions the measured menu inside the viewport", () => {
++    vi.stubGlobal("ResizeObserver", class {
++      observe() {}
++      disconnect() {}
++    });
++    vi.spyOn(window, "innerWidth", "get").mockReturnValue(800);
++    vi.spyOn(window, "innerHeight", "get").mockReturnValue(600);
++    const config = makeConfig();
++    const pivotData = new PivotData(
++      [{ region: "US", year: "2024", revenue: 100 }],
++      config,
++    );
++    const props = { pivotData, config, onSortChange: vi.fn() };
++    if (renderer === "regular") {
++      render(<TableRenderer {...props} />);
++    } else {
++      render(<VirtualizedTableRenderer {...props} containerHeight={300} />);
++    }
++    const trigger = screen.getAllByTestId("header-menu-trigger-year")[0];
++    vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue({
++      top: 540,
++      bottom: 570,
++      left: 750,
++    } as DOMRect);
++    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(240);
++    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(300);
++    fireEvent.click(trigger);
++    const overlay = screen.getByTestId("header-menu-year").parentElement as HTMLElement;
++    expect(overlay.style.top).toBe("240px");
++    expect(overlay.style.left).toBe("552px");
++    expect(overlay.style.maxHeight).toBe("440px");
++    expect(overlay.style.visibility).toBe("visible");
++  });
++});
+\ No newline at end of file
+diff --git a/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.ts b/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.ts
+new file mode 100644
+index 0000000..e86c8e7
+--- /dev/null
++++ b/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.ts
+@@ -0,0 +1,85 @@
++import { useLayoutEffect, useState, type RefObject } from "react";
++import type { HeaderMenuTarget } from "./TableRenderer";
++
++const VIEWPORT_MARGIN = 8;
++const MENU_MAX_HEIGHT = 440;
++
++export function computeHeaderMenuPlacement(
++  rect: Pick<DOMRect, "top" | "bottom" | "left">,
++  menuWidth: number,
++  menuHeight: number,
++  viewportWidth: number,
++  viewportHeight: number,
++) {
++  const width = Math.max(0, viewportWidth - 2 * VIEWPORT_MARGIN);
++  const height = Math.max(0, viewportHeight - 2 * VIEWPORT_MARGIN);
++  const left = Math.max(
++    VIEWPORT_MARGIN,
++    Math.min(rect.left, viewportWidth - VIEWPORT_MARGIN - Math.min(menuWidth, width)),
++  );
++  const below = Math.max(
++    0,
++    viewportHeight - VIEWPORT_MARGIN - Math.max(rect.bottom, VIEWPORT_MARGIN),
++  );
++  const above = Math.max(
++    0,
++    Math.min(rect.top, viewportHeight - VIEWPORT_MARGIN) - VIEWPORT_MARGIN,
++  );
++  const openAbove = below < Math.min(menuHeight, MENU_MAX_HEIGHT) && above > below;
++  const maxHeight = Math.min(MENU_MAX_HEIGHT, openAbove ? above : below, height);
++  const top = openAbove
++    ? Math.max(
++        VIEWPORT_MARGIN,
++        Math.min(rect.top, viewportHeight - VIEWPORT_MARGIN) -
++          Math.min(menuHeight, maxHeight),
++      )
++    : Math.max(VIEWPORT_MARGIN, Math.min(rect.bottom, viewportHeight - VIEWPORT_MARGIN));
++  return { top, left, maxHeight };
++}
++
++/** Measure the rendered menu (including any dynamic sections) before painting it. */
++export function useHeaderMenuPlacement(
++  target: HeaderMenuTarget | null,
++  overlayRef: RefObject<HTMLDivElement | null>,
++) {
++  const [placement, setPlacement] = useState<{
++    target: HeaderMenuTarget;
++    position: ReturnType<typeof computeHeaderMenuPlacement>;
++  }>();
++
++  useLayoutEffect(() => {
++    if (!target || !overlayRef.current) return;
++    const overlay = overlayRef.current;
++    const menu = overlay.firstElementChild as HTMLElement | null;
++    const update = () => {
++      if (!menu) return;
++      const position = computeHeaderMenuPlacement(
++        target.rect,
++        menu.offsetWidth,
++        // scrollHeight also accounts for content that was capped by the viewport.
++        Math.min(menu.scrollHeight || menu.offsetHeight, MENU_MAX_HEIGHT),
++        window.innerWidth,
++        window.innerHeight,
++      );
++      setPlacement((previous) =>
++        previous?.target === target &&
++        previous.position.top === position.top &&
++        previous.position.left === position.left &&
++        previous.position.maxHeight === position.maxHeight
++          ? previous
++          : { target, position },
++      );
++    };
++    update();
++    window.addEventListener("resize", update);
++    const observer =
++      typeof ResizeObserver !== "undefined" ? new ResizeObserver(update) : null;
++    if (menu) observer?.observe(menu);
++    return () => {
++      window.removeEventListener("resize", update);
++      observer?.disconnect();
++    };
++  }, [target, overlayRef]);
++
++  return placement?.target === target ? placement.position : undefined;
++}
 diff --git a/streamlit_pivot/frontend/src/shared/VirtualScroll.test.tsx b/streamlit_pivot/frontend/src/shared/VirtualScroll.test.tsx
 index b11c16b..aa4d148 100644
 --- a/streamlit_pivot/frontend/src/shared/VirtualScroll.test.tsx
@@ -3630,7 +3888,7 @@ index 253085b..c57dae1 100644
              }}
            >
 diff --git a/streamlit_pivot/frontend/src/shared/budgetCheck.test.ts b/streamlit_pivot/frontend/src/shared/budgetCheck.test.ts
-index d60c1d7..d4d06c2 100644
+index d60c1d7..d296413 100644
 --- a/streamlit_pivot/frontend/src/shared/budgetCheck.test.ts
 +++ b/streamlit_pivot/frontend/src/shared/budgetCheck.test.ts
 @@ -30,7 +30,7 @@ describe("checkRenderBudget", () => {
@@ -3642,7 +3900,7 @@ index d60c1d7..d4d06c2 100644
      const colCount = 10;
      const result = checkRenderBudget(rowCount, colCount, 1);
      expect(rowCount * colCount).toBeGreaterThan(
-@@ -42,8 +42,18 @@ describe("checkRenderBudget", () => {
+@@ -42,24 +42,40 @@ describe("checkRenderBudget", () => {
      expect(result.dataIntegrityWarnings).toHaveLength(0);
    });
  
@@ -3662,7 +3920,34 @@ index d60c1d7..d4d06c2 100644
      expect(result.columnsTruncated).toBe(true);
      expect(result.truncatedColumnCount).toBe(
        DEFAULT_BUDGETS.maxColumnCardinality,
-@@ -70,8 +80,9 @@ describe("checkRenderBudget", () => {
+     );
+     // Column-cap is data integrity (some columns are hidden) — goes to dataIntegrityWarnings.
+-    expect(
+-      result.dataIntegrityWarnings.some((w) =>
+-        w.includes("Column cardinality"),
+-      ),
+-    ).toBe(true);
++    expect(result.dataIntegrityWarnings).toEqual([
++      `Column cardinality (${DEFAULT_BUDGETS.maxColumnCardinality + 1}) exceeds limit (${DEFAULT_BUDGETS.maxColumnCardinality}). ` +
++        `Showing first ${DEFAULT_BUDGETS.maxColumnCardinality} columns. ` +
++        `Values in omitted columns are not displayed, so the table may appear incomplete.`,
++    ]);
+     // Must NOT appear in informational warnings.
+     expect(result.warnings.some((w) => w.includes("Column cardinality"))).toBe(
+       false,
+     );
+   });
+ 
++  it("does not warn about missing values at the column cap", () => {
++    const result = checkRenderBudget(10, DEFAULT_BUDGETS.maxColumnCardinality, 1);
++    expect(result.columnsTruncated).toBe(false);
++    expect(result.dataIntegrityWarnings).toHaveLength(0);
++  });
++
+   it("does not truncate at 500 columns", () => {
+     const result = checkRenderBudget(10, 500, 1);
+     expect(result.columnsTruncated).toBe(false);
+@@ -70,8 +86,9 @@ describe("checkRenderBudget", () => {
    it("accounts for multiple values in cell count", () => {
      const result = checkRenderBudget(100, 10, 5);
      expect(result.needsVirtualization).toBe(false);
@@ -3675,7 +3960,7 @@ index d60c1d7..d4d06c2 100644
    });
  });
 diff --git a/streamlit_pivot/frontend/src/shared/budgetCheck.ts b/streamlit_pivot/frontend/src/shared/budgetCheck.ts
-index 3563115..e385a65 100644
+index 3563115..b5fd3a9 100644
 --- a/streamlit_pivot/frontend/src/shared/budgetCheck.ts
 +++ b/streamlit_pivot/frontend/src/shared/budgetCheck.ts
 @@ -65,8 +65,11 @@ export function checkRenderBudget(
@@ -3691,7 +3976,17 @@ index 3563115..e385a65 100644
  
    let columnsTruncated = false;
    let truncatedColumnCount = colCount;
-@@ -90,6 +93,11 @@ export function checkRenderBudget(
+@@ -79,7 +82,8 @@ export function checkRenderBudget(
+       // Data integrity: the table is missing columns — always show.
+       dataIntegrityWarnings.push(
+         `Column cardinality (${colCount}) exceeds limit (${maxColCap}). ` +
+-          `Showing first ${maxColCap} columns.`,
++          `Showing first ${maxColCap} columns. ` +
++          `Values in omitted columns are not displayed, so the table may appear incomplete.`,
+       );
+     }
+ 
+@@ -90,6 +94,11 @@ export function checkRenderBudget(
            `(${DEFAULT_BUDGETS.maxVisibleCells.toLocaleString()}). Virtualization enabled.`,
        );
      }
@@ -3744,203 +4039,3 @@ index 00bf510..32746e2 100644
      expect(result.needsVirtualization).toBe(true);
      expect(result.warnings.some((w) => w.includes("DOM budget"))).toBe(true);
    });
-diff --git a/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.test.tsx b/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.test.tsx
-new file mode 100644
-index 0000000..960e987
---- /dev/null
-+++ b/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.test.tsx
-@@ -0,0 +1,102 @@
-+// @vitest-environment jsdom
-+import { afterEach, describe, expect, it, vi } from "vitest";
-+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-+import TableRenderer from "./TableRenderer";
-+import VirtualizedTableRenderer from "./VirtualizedTableRenderer";
-+import { PivotData } from "../engine/PivotData";
-+import { makeConfig } from "../test-utils";
-+import { computeHeaderMenuPlacement } from "./useHeaderMenuPlacement";
-+
-+afterEach(() => {
-+  cleanup();
-+  vi.restoreAllMocks();
-+});
-+
-+describe("computeHeaderMenuPlacement", () => {
-+  const viewportWidth = 800;
-+  const viewportHeight = 600;
-+
-+  it("opens below the header when there is room", () => {
-+    expect(
-+      computeHeaderMenuPlacement(
-+        { top: 80, bottom: 110, left: 100 },
-+        240,
-+        300,
-+        viewportWidth,
-+        viewportHeight,
-+      ),
-+    ).toEqual({ top: 110, left: 100, maxHeight: 440 });
-+  });
-+
-+  it("moves left and above near the viewport edges", () => {
-+    expect(
-+      computeHeaderMenuPlacement(
-+        { top: 540, bottom: 570, left: 750 },
-+        240,
-+        300,
-+        viewportWidth,
-+        viewportHeight,
-+      ),
-+    ).toEqual({ top: 240, left: 552, maxHeight: 440 });
-+  });
-+
-+  it("caps the menu to available space and lets its contents scroll", () => {
-+    expect(
-+      computeHeaderMenuPlacement(
-+        { top: 100, bottom: 130, left: 80 },
-+        240,
-+        440,
-+        800,
-+        240,
-+      ),
-+    ).toEqual({ top: 130, left: 80, maxHeight: 102 });
-+  });
-+
-+  it("fits in a viewport narrower than the default menu width", () => {
-+    expect(
-+      computeHeaderMenuPlacement(
-+        { top: 40, bottom: 60, left: 70 },
-+        210,
-+        200,
-+        180,
-+        280,
-+      ),
-+    ).toEqual({ top: 60, left: 8, maxHeight: 212 });
-+  });
-+});
-+
-+describe.each(["regular", "virtualized"])("%s header menu overlay", (renderer) => {
-+  it("positions the measured menu inside the viewport", () => {
-+    vi.stubGlobal("ResizeObserver", class {
-+      observe() {}
-+      disconnect() {}
-+    });
-+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(800);
-+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(600);
-+    const config = makeConfig();
-+    const pivotData = new PivotData(
-+      [{ region: "US", year: "2024", revenue: 100 }],
-+      config,
-+    );
-+    const props = { pivotData, config, onSortChange: vi.fn() };
-+    if (renderer === "regular") {
-+      render(<TableRenderer {...props} />);
-+    } else {
-+      render(<VirtualizedTableRenderer {...props} containerHeight={300} />);
-+    }
-+    const trigger = screen.getAllByTestId("header-menu-trigger-year")[0];
-+    vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue({
-+      top: 540,
-+      bottom: 570,
-+      left: 750,
-+    } as DOMRect);
-+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(240);
-+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(300);
-+    fireEvent.click(trigger);
-+    const overlay = screen.getByTestId("header-menu-year").parentElement as HTMLElement;
-+    expect(overlay.style.top).toBe("240px");
-+    expect(overlay.style.left).toBe("552px");
-+    expect(overlay.style.maxHeight).toBe("440px");
-+    expect(overlay.style.visibility).toBe("visible");
-+  });
-+});
-\ No newline at end of file
-diff --git a/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.ts b/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.ts
-new file mode 100644
-index 0000000..e86c8e7
---- /dev/null
-+++ b/streamlit_pivot/frontend/src/renderers/useHeaderMenuPlacement.ts
-@@ -0,0 +1,85 @@
-+import { useLayoutEffect, useState, type RefObject } from "react";
-+import type { HeaderMenuTarget } from "./TableRenderer";
-+
-+const VIEWPORT_MARGIN = 8;
-+const MENU_MAX_HEIGHT = 440;
-+
-+export function computeHeaderMenuPlacement(
-+  rect: Pick<DOMRect, "top" | "bottom" | "left">,
-+  menuWidth: number,
-+  menuHeight: number,
-+  viewportWidth: number,
-+  viewportHeight: number,
-+) {
-+  const width = Math.max(0, viewportWidth - 2 * VIEWPORT_MARGIN);
-+  const height = Math.max(0, viewportHeight - 2 * VIEWPORT_MARGIN);
-+  const left = Math.max(
-+    VIEWPORT_MARGIN,
-+    Math.min(rect.left, viewportWidth - VIEWPORT_MARGIN - Math.min(menuWidth, width)),
-+  );
-+  const below = Math.max(
-+    0,
-+    viewportHeight - VIEWPORT_MARGIN - Math.max(rect.bottom, VIEWPORT_MARGIN),
-+  );
-+  const above = Math.max(
-+    0,
-+    Math.min(rect.top, viewportHeight - VIEWPORT_MARGIN) - VIEWPORT_MARGIN,
-+  );
-+  const openAbove = below < Math.min(menuHeight, MENU_MAX_HEIGHT) && above > below;
-+  const maxHeight = Math.min(MENU_MAX_HEIGHT, openAbove ? above : below, height);
-+  const top = openAbove
-+    ? Math.max(
-+        VIEWPORT_MARGIN,
-+        Math.min(rect.top, viewportHeight - VIEWPORT_MARGIN) -
-+          Math.min(menuHeight, maxHeight),
-+      )
-+    : Math.max(VIEWPORT_MARGIN, Math.min(rect.bottom, viewportHeight - VIEWPORT_MARGIN));
-+  return { top, left, maxHeight };
-+}
-+
-+/** Measure the rendered menu (including any dynamic sections) before painting it. */
-+export function useHeaderMenuPlacement(
-+  target: HeaderMenuTarget | null,
-+  overlayRef: RefObject<HTMLDivElement | null>,
-+) {
-+  const [placement, setPlacement] = useState<{
-+    target: HeaderMenuTarget;
-+    position: ReturnType<typeof computeHeaderMenuPlacement>;
-+  }>();
-+
-+  useLayoutEffect(() => {
-+    if (!target || !overlayRef.current) return;
-+    const overlay = overlayRef.current;
-+    const menu = overlay.firstElementChild as HTMLElement | null;
-+    const update = () => {
-+      if (!menu) return;
-+      const position = computeHeaderMenuPlacement(
-+        target.rect,
-+        menu.offsetWidth,
-+        // scrollHeight also accounts for content that was capped by the viewport.
-+        Math.min(menu.scrollHeight || menu.offsetHeight, MENU_MAX_HEIGHT),
-+        window.innerWidth,
-+        window.innerHeight,
-+      );
-+      setPlacement((previous) =>
-+        previous?.target === target &&
-+        previous.position.top === position.top &&
-+        previous.position.left === position.left &&
-+        previous.position.maxHeight === position.maxHeight
-+          ? previous
-+          : { target, position },
-+      );
-+    };
-+    update();
-+    window.addEventListener("resize", update);
-+    const observer =
-+      typeof ResizeObserver !== "undefined" ? new ResizeObserver(update) : null;
-+    if (menu) observer?.observe(menu);
-+    return () => {
-+      window.removeEventListener("resize", update);
-+      observer?.disconnect();
-+    };
-+  }, [target, overlayRef]);
-+
-+  return placement?.target === target ? placement.position : undefined;
-+}

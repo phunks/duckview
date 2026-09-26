@@ -2,6 +2,8 @@ import { tableFromArrays } from "apache-arrow";
 import { describe, expect, it, vi } from "vitest";
 import {
   clientPivotRowLimit,
+  clientPivotPreflightSql,
+  checkClientPivotRowCount,
   clientPivotSourceSql,
   DEFAULT_CLIENT_PIVOT_ROWS,
   fetchClientPivotSource,
@@ -19,6 +21,14 @@ function fetchRows(totalRows) {
 }
 
 describe("client Pivot source row limit", () => {
+  it("counts at most limit plus one rows before loading Arrow pages", () => {
+    expect(clientPivotPreflightSql('"my ""view"""', 500_000))
+      .toBe('SELECT COUNT(*) AS row_count FROM (SELECT 1 FROM "my ""view""" LIMIT 500001) AS pivot_source');
+    expect(() => checkClientPivotRowCount(500_000n, 500_000)).not.toThrow();
+    expect(() => checkClientPivotRowCount(500_001n, 500_000))
+      .toThrow("exceeds the 500,000 row client-side limit");
+    expect(() => checkClientPivotRowCount(null, 500_000)).toThrow("Could not count Pivot source rows");
+  });
   it("orders all projected fields before paging a grouped SQL view", () => {
     expect(clientPivotSourceSql('"deaths ""by year"""'))
       .toBe('SELECT * FROM "deaths ""by year""" ORDER BY ALL');

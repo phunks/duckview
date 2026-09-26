@@ -331,15 +331,7 @@ body {
 }
 
 .pivot-status {
-  margin-bottom: 12px;
-  color: var(--text-dim);
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.pivot-status.dirty {
-  color: var(--accent);
-  font-weight: 600;
+  color: var(--text);
 }
 
 .pivot-status.error {
@@ -1429,24 +1421,67 @@ body {
 .loading-text { color: #fff; font-size: 13px; font-weight: 600; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.toast {
+.notification-stack {
   position: fixed;
-  bottom: 40px;
-  left: 50%;
-  transform: translateX(-50%);
+  right: 12px;
   z-index: 80;
-  background: #d64545;
-  color: #fff;
-  padding: 10px 18px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  max-height: calc(100vh - 12px);
+  overflow-y: auto;
+  pointer-events: none;
+}
+
+.notification {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  width: max-content;
+  max-width: min(420px, calc(100vw - 24px));
+  padding: 10px 12px;
   border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
   font-size: 13px;
-  font-weight: 550;
+  line-height: 1.5;
   box-shadow: var(--shadow);
-  max-width: 70vw;
+  pointer-events: auto;
+}
+
+.notification-message {
   white-space: pre-line;
+  overflow-wrap: anywhere;
   user-select: text;
   -webkit-user-select: text;
 }
+
+.notification-close {
+  flex: 0 0 auto;
+  border: 0;
+  padding: 0 3px;
+  background: transparent;
+  color: inherit;
+  font-size: 19px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.notification-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.toast .btn, .pivot-status .btn {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 3px 7px;
+}
+
+.toast { border-left: 3px solid #d64545; }
+.pivot-status.error { border-left: 3px solid #d64545; }
 
 /* ---------- Advanced filter button + badge ---------- */
 #advBtn { position: relative; padding: 5px 9px; }

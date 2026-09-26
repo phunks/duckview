@@ -12,6 +12,23 @@ export function clientPivotSourceSql(quotedSourceName) {
   return `SELECT * FROM ${quotedSourceName} ORDER BY ALL`;
 }
 
+// Only count enough rows to tell whether the configured limit is exceeded.
+export function clientPivotPreflightSql(quotedSourceName, rowLimit) {
+  const limit = clientPivotRowLimit(rowLimit);
+  return `SELECT COUNT(*) AS row_count FROM (SELECT 1 FROM ${quotedSourceName} LIMIT ${limit + 1}) AS pivot_source`;
+}
+
+export function checkClientPivotRowCount(rowCount, rowLimit) {
+  const limit = clientPivotRowLimit(rowLimit);
+  if (rowCount == null) throw new Error("Could not count Pivot source rows.");
+  if (BigInt(rowCount) > BigInt(limit)) {
+    throw new Error(
+        `This Pivot source exceeds the ${limit.toLocaleString()} ` +
+        "row client-side limit. Increase the limit in Settings or filter the source with a SQL View.",
+    );
+  }
+}
+
 export function clientPivotRowLimit(value) {
   const limit = Number(value);
   return CLIENT_PIVOT_ROW_LIMITS.includes(limit)
@@ -38,10 +55,7 @@ export async function fetchClientPivotSource(queryId, rowLimit, fetchPage) {
     if (!page.hasMore) return pages[0].concat(...pages.slice(1));
     if (!page.table.numRows || rowCount === limit) {
       if (rowCount === limit) {
-        throw new Error(
-            `This Pivot source exceeds the ${limit.toLocaleString()} ` +
-            "row client-side limit. Increase the limit in Settings or filter the source with a SQL View.",
-        );
+        checkClientPivotRowCount(limit + 1, limit);
       }
       throw new Error("Pivot source paging ended unexpectedly.");
     }
